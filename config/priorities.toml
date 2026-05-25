@@ -1,0 +1,304 @@
+# mgd priority configuration
+# Each [[apps]] entry is checked in order — first match wins.
+# pattern: Rust regex matched against the process name (from /proc/pid/status)
+# priority: 0–100, higher = kill sooner
+#   0–19   CRITICAL  never touched (compositor, audio, session daemons)
+#   20–39  HIGH      last resort only (active IDEs, databases, video calls)
+#   40–59  NORMAL    standard desktop apps
+#   60–79  LOW       background services, freeze/checkpoint early
+#   80–100 EXPENDABLE kill first, no ceremony
+
+[defaults]
+priority = 50
+
+# ── CRITICAL (10) ────────────────────────────────────────────────────────────
+# Kernel threads (zero RSS — plan() skips them anyway, but classified for display)
+
+[[apps]]
+name    = "kernel-workers"
+pattern = "^(kworker|ksoftirqd|migration|kswapd|oom_reaper|kthreadd|kcompactd|khugepaged|kauditd|watchdogd|rcu_)"
+priority = 10
+
+[[apps]]
+name    = "irq-threads"
+pattern = "^irq/"
+priority = 10
+
+[[apps]]
+name    = "kernel-threads"
+pattern = "^(jbd2/|btrfs-|jfs)"
+priority = 10
+
+[[apps]]
+name    = "systemd-core"
+pattern = "^(systemd|systemd-journald|systemd-journal|systemd-logind|systemd-udevd|systemd-resolve|systemd-hostnam|systemd-machine|systemd-userdbd|systemd-userwor|kthreadd)$"
+priority = 10
+
+[[apps]]
+name    = "compositor"
+pattern = "^(kwin_wayland|kwin_wayland_wr|kwin_x11|Xwayland|xdg-desktop-por|xdg-desktop-portal|xdg-desktop-portal-kde|xdg-document-po|xdg-permission-)$"
+priority = 10
+
+[[apps]]
+name    = "audio"
+pattern = "^(pipewire|pipewire-pulse|wireplumber|pulseaudio|rtkit-daemon|passimd)$"
+priority = 10
+
+[[apps]]
+name    = "kde-session"
+pattern = "^(plasmashell|kded6|kded5|ksmserver|kscreenlocker_greet|startplasma-way|xembedsniproxy|xwaylandvideobr|xsettingsd)$"
+priority = 10
+
+[[apps]]
+name    = "dbus"
+pattern = "^(dbus-broker|dbus-broker-lau)$"
+priority = 10
+
+[[apps]]
+name    = "network-critical"
+pattern = "^(NetworkManager|wpa_supplicant|avahi-daemon)$"
+priority = 10
+
+[[apps]]
+name    = "polkit"
+pattern = "^(polkitd|polkit-kde-auth)$"
+priority = 10
+
+[[apps]]
+name    = "input-method"
+pattern = "^(ibus-daemon|ibus-dconf|ibus-engine-sim|ibus-extension-|ibus-portal|ibus-ui-gtk3|ibus-x11|ibus-)$"
+priority = 10
+
+# ── HIGH (30–42) ─────────────────────────────────────────────────────────────
+
+[[apps]]
+name    = "jetbrains-ides"
+pattern = "^(rustrover|webstorm|idea|clion|goland|pycharm|rider)$"
+priority = 35
+
+[[apps]]
+name    = "databases"
+pattern = "^(postgres|postgresql|mariadbd|mysqld|mongod|redis-server)$"
+priority = 35
+
+[[apps]]
+name    = "editors"
+pattern = "^(code|code-oss|zed|zeditor|Typora)$"
+priority = 38
+
+[[apps]]
+name    = "claude"
+pattern = "^(claude|kiro-cli|kiro-cli-chat)$"
+priority = 40
+
+[[apps]]
+name    = "video-calls"
+pattern = "^(zoom|teams|skypeforlinux)$"
+priority = 42
+
+# ── NORMAL (45–58) ───────────────────────────────────────────────────────────
+
+[[apps]]
+name    = "browsers-main"
+pattern = "^(firefox|chromium|chrome|brave|librewolf)$"
+priority = 45
+
+[[apps]]
+name    = "container-infra"
+pattern = "^(dockerd|containerd|containerd-shim)$"
+priority = 45
+
+[[apps]]
+name    = "media-production"
+pattern = "^(obs|obs-studio|vlc|mpv|celluloid)$"
+priority = 47
+
+[[apps]]
+name    = "creative"
+pattern = "^(gimp|inkscape|krita|blender)$"
+priority = 47
+
+[[apps]]
+name    = "office"
+pattern = "^(libreoffice|soffice)$"
+priority = 48
+
+[[apps]]
+name    = "remote-desktop"
+pattern = "^(anydesk|remmina|tigervnc)$"
+priority = 48
+
+[[apps]]
+name    = "text-editors"
+pattern = "^(kate|kwrite|gedit|gnome-text-editor)$"
+priority = 50
+
+[[apps]]
+name    = "file-managers"
+pattern = "^(dolphin|nautilus|thunar)$"
+priority = 50
+
+[[apps]]
+name    = "terminals"
+pattern = "^(konsole|alacritty|kitty|gnome-terminal|wezterm|foot|cosmic-term)$"
+priority = 50
+
+[[apps]]
+name    = "kwallet"
+pattern = "^kwalletd"
+priority = 52
+
+[[apps]]
+name    = "document-viewers"
+pattern = "^(okular|gwenview|eog|evince)$"
+priority = 52
+
+[[apps]]
+name    = "mail"
+pattern = "^(thunderbird|kmail)$"
+priority = 52
+
+[[apps]]
+name    = "dev-runtimes"
+pattern = "^(node|python|python3|bun|uv|ruby|java)$"
+priority = 55
+
+[[apps]]
+name    = "messaging"
+pattern = "^(telegram-desktop|discord|slack|signal-desktop)$"
+priority = 55
+
+[[apps]]
+name    = "kde-settings"
+pattern = "^(systemsettings|org_kde_powerde|kaccess|kdeconnectd|kunifiedpush-di)$"
+priority = 55
+
+[[apps]]
+name    = "screenshot"
+pattern = "^(spectacle|flameshot)$"
+priority = 58
+
+# ── LOW (60–79) ──────────────────────────────────────────────────────────────
+
+[[apps]]
+name    = "krunner"
+pattern = "^(krunner|baloorunner)$"
+priority = 65
+
+[[apps]]
+name    = "kde-activity"
+pattern = "^kactivitymanage$"
+priority = 68
+
+[[apps]]
+name    = "browser-helpers"
+pattern = "^(plasma-browser-|WebExtensions)$"
+priority = 68
+
+[[apps]]
+name    = "power-thermal"
+pattern = "^(thermald|tuned|tuned-ppd|intel_lpmd|iio-sensor-prox)$"
+priority = 10
+
+[[apps]]
+name    = "bluetooth"
+pattern = "^(bluetoothd|obexd|ModemManager)$"
+priority = 70
+
+[[apps]]
+name    = "package-managers"
+pattern = "^(plasma-discover|gnome-software|packagekitd|dnf|rpm|zypper|apt|fwupd|snapd)$"
+priority = 75
+
+[[apps]]
+name    = "file-indexers"
+pattern = "^(baloo_file|baloo_file_extractor|localsearch-3|localsearch-ext|tracker-miner-fs|tracker-extract-3)$"
+priority = 78
+
+[[apps]]
+name    = "akonadi"
+pattern = "^akonadi"
+priority = 72
+
+[[apps]]
+name    = "activity-logging"
+pattern = "^(zeitgeist-datahub|zeitgeist-fts)$"
+priority = 75
+
+[[apps]]
+name    = "steam"
+pattern = "^(steam|steamwebhelper)$"
+priority = 72
+
+[[apps]]
+name    = "printing"
+pattern = "^(cupsd|cups)$"
+priority = 72
+
+[[apps]]
+name    = "jetbrains-toolbox"
+pattern = "^(jetbrains-toolb|jetbrainsd|fsnotifier)$"
+priority = 70
+
+[[apps]]
+name    = "gvfs"
+pattern = "^gvfs"
+priority = 72
+
+[[apps]]
+name    = "speech"
+pattern = "^(speech-dispatch|sd_|sd-pam)$"
+priority = 75
+
+# ── EXPENDABLE (80–95) ───────────────────────────────────────────────────────
+
+# Firefox/Chromium renderer sub-processes (sandboxed, high memory, safe to kill)
+[[apps]]
+name    = "browser-isolated"
+pattern = "^(Isolated|Isolated Servic|Isolated Web Co|Privileged Cont|Socket Process|RDD Process|Utility Process|Web Content|WebExtensions|file:// Content|cef_server)$"
+priority = 80
+
+[[apps]]
+name    = "ai-inference"
+pattern = "^full-line-infer$"
+priority = 85
+
+[[apps]]
+name    = "build-orchestrators"
+pattern = "^(cargo|make|cmake|ninja|gradle|mvn)$"
+priority = 70
+
+[[apps]]
+name    = "compiler-workers"
+pattern = "^(rustc|cc1|c\\+\\+|ld|lld|mold)$"
+priority = 85
+
+[[apps]]
+name    = "crash-reporters"
+pattern = "^(abrt-applet|abrtd|abrt-dbus|abrt-dump-journ|crashhelper|drkonqi-coredum)$"
+priority = 88
+
+[[apps]]
+name    = "game-overlay"
+pattern = "^(gameoverlayui|reaper|fossilize_replay)$"
+priority = 88
+
+[[apps]]
+name    = "msedge"
+pattern = "^(msedge|microsoft-edge)$"
+priority = 90
+
+[[apps]]
+name    = "update-notifiers"
+pattern = "^(update-notifier|update-manager|DiscoverNotifie)$"
+priority = 90
+
+[[apps]]
+name    = "monitoring-scripts"
+pattern = "^(memwatch\\.sh|psimon)$"
+priority = 85
+
+[[apps]]
+name    = "docker-proxy"
+pattern = "^docker-proxy$"
+priority = 88

@@ -1,6 +1,7 @@
 use std::io;
 use std::time::Duration;
 use std::thread;
+use std::fs;
 
 #[derive(Debug)]
 #[allow(dead_code)]
@@ -13,6 +14,9 @@ pub struct KillResult {
 /// Send SIGTERM — graceful shutdown request.
 /// Gives the process 5 seconds to clean up before SIGKILL.
 pub fn terminate(pid: u32) -> KillResult {
+    // Record start time before SIGTERM to detect PID reuse before SIGKILL
+    let original_start = read_start_time(pid);
+
     let result = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
 
     if result != 0 {
@@ -32,8 +36,22 @@ pub fn terminate(pid: u32) -> KillResult {
         }
     }
 
+    // If the PID was reused by a different process, don't SIGKILL the wrong victim
+    if original_start.is_some() && read_start_time(pid) != original_start {
+        return KillResult { pid, success: true, error: None };
+    }
+
     // Still alive after 5s — escalate to SIGKILL
     kill(pid)
+}
+
+/// Read the process start time from /proc/pid/stat to detect PID reuse.
+/// starttime is field 22 (1-based), which is index 19 after the "(comm) " prefix.
+fn read_start_time(pid: u32) -> Option<u64> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // stat format: "pid (comm) state ..." — comm may contain spaces, parse past closing ')'
+    let after_comm = stat.splitn(2, ") ").nth(1)?;
+    after_comm.split_whitespace().nth(19).and_then(|s| s.parse().ok())
 }
 
 /// Send SIGKILL — immediate forced termination.

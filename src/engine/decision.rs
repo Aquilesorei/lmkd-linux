@@ -54,33 +54,10 @@ pub struct Decision {
     pub reason: String,
 }
 
-/// Priority tier based on process name
-/// Returns 0-100 (higher = kill first)
+/// Priority tier based on process name — delegates to loaded config.
+/// Returns 0–100 (higher = kill first).
 pub fn default_priority(name: &str) -> u8 {
-    match name {
-        // SYSTEM / CRITICAL - never touch
-        "systemd" | "kthreadd" | "kwin_wayland" |
-        "pipewire" | "wireplumber" | "plasmashell" => 10,
-
-        // HIGH - only last resort
-        "rustrover" | "webstorm" | "idea" => 35,
-        "firefox" | "chromium" | "chrome" => 45,
-        "claude"                           => 40,
-
-        // NORMAL
-        "kate" | "dolphin" | "konsole"    => 50,
-
-        "msedge" | "microsoft-edge" => 90,
-        // LOW
-        "plasma-discover" | "baloo_file"
-        | "krunner"                        => 75,
-
-        // EXPENDABLE - kill first
-        "Isolated"                         => 80,
-        "full-line-infer"                  => 85,
-
-        _ => 50, // default NORMAL
-    }
+    crate::config::get().priority_for(name)
 }
 
 /// Calculate how much RAM we need to free (in KB)

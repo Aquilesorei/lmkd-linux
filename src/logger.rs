@@ -86,16 +86,13 @@ impl LogEntry {
 }
 
 fn timestamp_now() -> String {
-    // Use /proc/uptime for simple timestamp without chrono dependency
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
-    let secs = now.as_secs();
-    // UTC — no chrono dependency, acceptable since logs include date in filename
-    let hours = (secs % 86400) / 3600;
-    let mins = (secs % 3600) / 60;
-    let secs = secs % 60;
-    format!("{:02}:{:02}:{:02}", hours, mins, secs)
+    let secs = now.as_secs() as libc::time_t;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    unsafe { libc::localtime_r(&secs, &mut tm) };
+    format!("{:02}:{:02}:{:02}", tm.tm_hour, tm.tm_min, tm.tm_sec)
 }
 
 fn dirs_home() -> PathBuf {

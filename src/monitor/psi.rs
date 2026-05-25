@@ -136,7 +136,7 @@ pub fn pressure_level(p: &MemoryPressure) -> PressureLevel {
         x if x >= 70.0 => PressureLevel::Emergency,
         x if x >= 50.0 => PressureLevel::Critical,
         x if x >= 25.0 => PressureLevel::High,
-        x if x >= 0.01 => PressureLevel::Elevated,
+        x if x > 0.01  => PressureLevel::Elevated,
         _               => PressureLevel::Normal,
     }
 }

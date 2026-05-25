@@ -1,5 +1,6 @@
 use std::process::Command;
 use std::fs;
+use std::io;
 use std::path::PathBuf;
 
 #[derive(Debug)]
@@ -26,7 +27,6 @@ pub fn checkpoint(pid: u32, name: &str) -> CheckpointResult {
         .join(format!(".local/share/mgd/snapshots/{}_{}", pid, name));
 
     if let Err(e) = fs::create_dir_all(&snapshot_dir) {
-        // Fall back — can't create dir
         return CheckpointResult {
             pid,
             success: false,
@@ -35,11 +35,23 @@ pub fn checkpoint(pid: u32, name: &str) -> CheckpointResult {
         };
     }
 
+    let snapshot_dir_str = match snapshot_dir.to_str() {
+        Some(s) => s.to_string(),
+        None => {
+            return CheckpointResult {
+                pid,
+                success: false,
+                snapshot_dir: None,
+                error: Some("snapshot path contains non-UTF8 characters".to_string()),
+            };
+        }
+    };
+
     let output = Command::new("criu")
         .args([
             "dump",
             "--tree", &pid.to_string(),
-            "--images-dir", snapshot_dir.to_str().unwrap_or("/tmp"),
+            "--images-dir", &snapshot_dir_str,
             "--shell-job",
             "--leave-stopped",  // stop process after dump (we kill it next)
             "--ext-unix-sk",
@@ -51,7 +63,19 @@ pub fn checkpoint(pid: u32, name: &str) -> CheckpointResult {
     match output {
         Ok(out) if out.status.success() => {
             // CRIU succeeded — now kill the process (state is saved)
-            unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+            let kill_ret = unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+            if kill_ret != 0 {
+                let errno = io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                // ESRCH = process already gone, which is fine
+                if errno != libc::ESRCH {
+                    return CheckpointResult {
+                        pid,
+                        success: false,
+                        snapshot_dir: None,
+                        error: Some(format!("CRIU succeeded but SIGKILL failed: {}", io::Error::last_os_error())),
+                    };
+                }
+            }
             CheckpointResult {
                 pid,
                 success: true,
@@ -91,10 +115,20 @@ pub fn restore(snapshot_dir: &PathBuf) -> RestoreResult {
         };
     }
 
+    let snapshot_dir_str = match snapshot_dir.to_str() {
+        Some(s) => s.to_string(),
+        None => {
+            return RestoreResult {
+                success: false,
+                error: Some("snapshot path contains non-UTF8 characters".to_string()),
+            };
+        }
+    };
+
     let output = Command::new("criu")
         .args([
             "restore",
-            "--images-dir", snapshot_dir.to_str().unwrap_or("/tmp"),
+            "--images-dir", &snapshot_dir_str,
             "--shell-job",
             "--restore-detached",
         ])

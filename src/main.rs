@@ -1,3 +1,4 @@
+mod config;
 mod monitor;
 mod engine;
 mod executor;
@@ -22,7 +23,7 @@ fn main() {
                 if result.success {
                     println!("✓ Frozen PID {pid} — resume with: mgd unfreeze {pid}");
                 } else {
-                    eprintln!("✗ Failed: {}", result.error.unwrap());
+                    eprintln!("✗ Failed: {}", result.error.unwrap_or_default());
                 }
             }
             "unfreeze" => {
@@ -30,7 +31,7 @@ fn main() {
                 if result.success {
                     println!("✓ Unfrozen PID {pid}");
                 } else {
-                    eprintln!("✗ Failed: {}", result.error.unwrap());
+                    eprintln!("✗ Failed: {}", result.error.unwrap_or_default());
                 }
             }
             _ => eprintln!("Usage:\n  mgd freeze <pid>\n  mgd unfreeze <pid>"),
@@ -68,7 +69,7 @@ fn main() {
         procs.sort_by(|a, b| b.rss_kb.cmp(&a.rss_kb));
 
         let (total_rss, total_swap) = procs.iter()
-            .fold((0u64, 0u64), |(r, s), p| (r + p.rss_kb, s + p.swap_kb));
+            .fold((0u64, 0u64), |(r, s), p| (r.saturating_add(p.rss_kb), s.saturating_add(p.swap_kb)));
 
         println!(
             "RAM: {:.0}MB used / {:.0}MB total | Swap: {:.0}MB | \
@@ -104,11 +105,17 @@ fn main() {
                 let result = executor::freezer::unfreeze(pid);
                 if result.success {
                     println!("  ✓ Unfroze PID {pid}");
+                    registry.remove(pid);
                 } else {
-                    println!("  ✗ Failed to unfreeze PID {pid}: {}",
-                             result.error.unwrap_or_default());
+                    let proc_gone = !std::path::Path::new(&format!("/proc/{pid}")).exists();
+                    if proc_gone {
+                        println!("  ~ PID {pid} already gone, removing from registry");
+                        registry.remove(pid);
+                    } else {
+                        println!("  ✗ Failed to unfreeze PID {pid}: {}",
+                                 result.error.unwrap_or_default());
+                    }
                 }
-                registry.remove(pid);
             }
         }
 
