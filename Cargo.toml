@@ -2,5 +2,20 @@
 name = "lmkd-linux"
 version = "0.1.0"
 edition = "2024"
+description = "Proactive low-memory killer daemon for Linux desktop"
+repository = "https://github.com/Aquilesorei/lmkd-linux"
+license = "GPL-2.0"
+authors = ["Caleb Zongo <your@email.com>"]
+
+[[bin]]
+name = "mgd"
+path = "src/main.rs"
 
 [dependencies]
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
+strip = true      # strip debug symbols, smaller binary
+lto = true        # link-time optimization, faster runtime
+codegen-units = 1 # slower compile, faster binary
