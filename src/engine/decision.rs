@@ -44,6 +44,7 @@ impl std::fmt::Display for Action {
     }
 }
 
+#[allow(dead_code)]
 pub struct Decision {
     pub pid: u32,
     pub name: String,

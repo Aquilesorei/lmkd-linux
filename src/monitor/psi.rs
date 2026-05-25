@@ -2,6 +2,7 @@ use std::fs;
 use std::num::ParseFloatError;
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct MemoryPressure {
     pub some_avg10: f64,
     pub some_avg60: f64,
@@ -169,9 +170,9 @@ mod tests {
              full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n"
         ).unwrap();
 
-        p.some_avg10 = 5.0;
+        p.some_avg10 = 0.005;
         assert_eq!(pressure_level(&p), PressureLevel::Normal);
-        p.some_avg10 = 15.0;
+        p.some_avg10 = 5.0;
         assert_eq!(pressure_level(&p), PressureLevel::Elevated);
         p.some_avg10 = 30.0;
         assert_eq!(pressure_level(&p), PressureLevel::High);

@@ -1,11 +1,13 @@
 mod monitor;
 mod engine;
 mod executor;
+mod logger;
 
 use std::thread;
 use std::time::Duration;
 use engine::decision::Action;
 use executor::registry::FrozenRegistry;
+use crate::logger::{LogEntry, Logger};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -41,7 +43,7 @@ fn main() {
 
     // Registry tracks what we froze so we can unfreeze later
     let mut registry = FrozenRegistry::new();
-
+    let log = Logger::new();
     loop {
         let pressure = match monitor::psi::read_pressure() {
             Ok(p) => p,
@@ -65,8 +67,8 @@ fn main() {
         let mut procs = monitor::process::list_processes();
         procs.sort_by(|a, b| b.rss_kb.cmp(&a.rss_kb));
 
-        let total_rss: u64  = procs.iter().map(|p| p.rss_kb).sum();
-        let total_swap: u64 = procs.iter().map(|p| p.swap_kb).sum();
+        let (total_rss, total_swap) = procs.iter()
+            .fold((0u64, 0u64), |(r, s), p| (r + p.rss_kb, s + p.swap_kb));
 
         println!(
             "RAM: {:.0}MB used / {:.0}MB total | Swap: {:.0}MB | \
@@ -129,32 +131,49 @@ fn main() {
                 let result_str = match d.action {
                     Action::Freeze => {
                         let r = executor::freezer::freeze(d.pid);
-                        if r.success {
+                        let result = if r.success {
                             registry.add(d.pid, &d.name);
-                            "✓ frozen".to_string()
+                            "frozen".to_string()
                         } else {
-                            format!("✗ {}", r.error.unwrap_or_default())
-                        }
+                            format!("freeze_failed: {}", r.error.unwrap_or_default())
+                        };
+                        log.log(&LogEntry::new("FREEZE", d.pid, &d.name, d.rss_mb, &result));
+                        format!("✓ {result}")
                     }
                     Action::Terminate => {
                         let r = executor::killer::terminate(d.pid);
-                        if r.success { "✓ terminated".to_string() }
-                        else { format!("✗ {}", r.error.unwrap_or_default()) }
+                        let result = if r.success {
+                            "terminated".to_string()
+                        } else {
+                            format!("terminate_failed: {}", r.error.unwrap_or_default())
+                        };
+                        log.log(&LogEntry::new("TERMINATE", d.pid, &d.name, d.rss_mb, &result));
+                        format!("✓ {result}")
                     }
                     Action::Kill => {
                         let r = executor::killer::kill(d.pid);
-                        if r.success { "✓ killed".to_string() }
-                        else { format!("✗ {}", r.error.unwrap_or_default()) }
+                        let result = if r.success {
+                            "killed".to_string()
+                        } else {
+                            format!("kill_failed: {}", r.error.unwrap_or_default())
+                        };
+                        log.log(&LogEntry::new("KILL", d.pid, &d.name, d.rss_mb, &result));
+                        format!("✓ {result}")
                     }
                     Action::Checkpoint => {
-                        // Fall back to freeze until CRIU is implemented
-                        let r = executor::freezer::freeze(d.pid);
-                        if r.success {
-                            registry.add(d.pid, &d.name);
-                            "✓ frozen (checkpoint pending)".to_string()
+                        let r = executor::checkpoint::checkpoint(d.pid, &d.name);
+                        let result = if r.success {
+                            format!("checkpointed → {:?}", r.snapshot_dir.unwrap())
                         } else {
-                            format!("✗ {}", r.error.unwrap_or_default())
-                        }
+                            let kr = executor::killer::kill(d.pid);
+                            if kr.success {
+                                "killed (CRIU failed)".to_string()
+                            } else {
+                                format!("kill_failed: {}", kr.error.unwrap_or_default())
+                            }
+                        };
+                        log.log(&LogEntry::new("CHECKPOINT", d.pid, &d.name, d.rss_mb, &result));
+                        result
                     }
                     Action::None => "skipped".to_string(),
                 };

@@ -1,3 +1,4 @@
 pub mod freezer;
-pub(crate) mod killer;
+pub mod killer;
 pub mod registry;
+pub mod checkpoint;

@@ -11,6 +11,7 @@ pub struct Process {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub enum ProcError {
     Io(std::io::Error),
     Parse(String),
@@ -37,19 +38,18 @@ pub fn list_processes() -> Vec<Process> {
         return vec![];
     };
 
-    let vec1 = entries
+    entries
         .filter_map(|e| e.ok())
         .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok().map(|pid| (pid, e.path())))
         .filter_map(|(pid, path)| read_process(pid, &path).ok())
-        .collect();
-    vec1
+        .collect()
 }
 
 fn read_process(pid: u32, path: &Path) -> Result<Process, ProcError> {
     let status = fs::read_to_string(path.join("status"))?;
 
     let name = parse_status_field(&status, "Name:")
-        .unwrap_or("unknown".to_string());
+        .unwrap_or_else(|| "unknown".to_string());
 
     let rss_kb = parse_status_kb(&status, "VmRSS:")
         .unwrap_or(0);

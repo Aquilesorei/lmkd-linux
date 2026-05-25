@@ -2,6 +2,7 @@ use std::io;
 
 /// Result of a freeze/unfreeze operation
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct FreezeResult {
     pub pid: u32,
     pub action: FreezeAction,
@@ -10,6 +11,7 @@ pub struct FreezeResult {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub enum FreezeAction {
     Freeze,
     Unfreeze,

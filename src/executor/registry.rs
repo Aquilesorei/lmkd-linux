@@ -45,6 +45,7 @@ impl FrozenRegistry {
     }
 
     /// Get frozen process info for display
+    #[allow(dead_code)]
     pub fn list(&self) -> Vec<(u32, String, u64)> {
         self.frozen.iter()
             .map(|(pid, (name, ts))| (*pid, name.clone(), *ts))

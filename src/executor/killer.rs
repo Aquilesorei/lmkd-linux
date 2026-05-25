@@ -3,6 +3,7 @@ use std::time::Duration;
 use std::thread;
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct KillResult {
     pub pid: u32,
     pub success: bool,
@@ -53,7 +54,7 @@ pub fn kill(pid: u32) -> KillResult {
 }
 
 /// Check if a process still exists
-pub fn process_exists(pid: u32) -> bool {
+fn process_exists(pid: u32) -> bool {
     // kill(pid, 0) = check if process exists without sending a signal
     let result = unsafe { libc::kill(pid as i32, 0) };
     result == 0
