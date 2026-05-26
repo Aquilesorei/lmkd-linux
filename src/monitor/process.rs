@@ -1,5 +1,8 @@
 use std::fs;
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
+
+use crate::error::MgdError;
 
 #[derive(Debug)]
 pub struct Process {
@@ -10,30 +13,29 @@ pub struct Process {
     pub oom_score: i32,
 }
 
-#[derive(Debug)]
-#[allow(dead_code)]
-pub enum ProcError {
-    Io(std::io::Error),
-    Parse(String),
-}
+/// Returns true if a process belongs to our user session and we can signal it.
+/// Combines UID ownership check with cgroup placement (user.slice).
+fn is_user_managed(pid: u32) -> bool {
+    let our_uid = unsafe { libc::geteuid() };
 
-impl From<std::io::Error> for ProcError {
-    fn from(e: std::io::Error) -> Self {
-        ProcError::Io(e)
+    let proc_dir = format!("/proc/{pid}");
+    let uid_matches = match fs::metadata(&proc_dir) {
+        Ok(meta) => meta.uid() == our_uid,
+        Err(_) => return false,
+    };
+    if !uid_matches {
+        return false;
     }
+
+    let Ok(cgroup) = fs::read_to_string(format!("/proc/{pid}/cgroup")) else {
+        return false;
+    };
+    cgroup.lines().any(|line| line.contains("/user.slice/") || line.contains("/user@"))
 }
 
-impl std::fmt::Display for ProcError {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        match self {
-            ProcError::Io(e) => write!(f, "IO: {e}"),
-            ProcError::Parse(s) => write!(f, "Parse: {s}"),
-        }
-    }
-}
-
-/// Read all user processes from /proc
+/// Read all user processes from /proc, excluding ourselves and system processes
 pub fn list_processes() -> Vec<Process> {
+    let own_pid = std::process::id();
     let Ok(entries) = fs::read_dir("/proc") else {
         return vec![];
     };
@@ -41,11 +43,12 @@ pub fn list_processes() -> Vec<Process> {
     entries
         .filter_map(|e| e.ok())
         .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok().map(|pid| (pid, e.path())))
+        .filter(|(pid, _)| *pid != own_pid && is_user_managed(*pid))
         .filter_map(|(pid, path)| read_process(pid, &path).ok())
         .collect()
 }
 
-fn read_process(pid: u32, path: &Path) -> Result<Process, ProcError> {
+fn read_process(pid: u32, path: &Path) -> Result<Process, MgdError> {
     let status = fs::read_to_string(path.join("status"))?;
 
     let name = parse_status_field(&status, "Name:")

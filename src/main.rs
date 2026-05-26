@@ -1,14 +1,24 @@
 mod config;
+mod error;
 mod monitor;
 mod engine;
 mod executor;
 mod logger;
+mod output;
 mod responder;
 mod recovery;
+mod util;
 
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use executor::registry::{FrozenRegistry, CheckpointRegistry};
+
+static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+pub fn should_shutdown() -> bool {
+    SHUTDOWN.load(Ordering::Relaxed)
+}
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -41,6 +51,13 @@ fn main() {
     let frozen = Arc::new(Mutex::new(FrozenRegistry::new()));
     let checkpointed = Arc::new(Mutex::new(CheckpointRegistry::new()));
 
+    // Install signal handler: SIGINT sets the atomic flag.
+    // AtomicBool::store with Relaxed compiles to a single `mov` on x86/ARM —
+    // async-signal-safe in practice on all Linux targets.
+    unsafe {
+        libc::signal(libc::SIGINT, handle_sigint as *const () as libc::sighandler_t);
+    }
+
     let f1 = Arc::clone(&frozen);
     let c1 = Arc::clone(&checkpointed);
     let responder = thread::spawn(move || responder::run(f1, c1));
@@ -49,25 +66,36 @@ fn main() {
     let c2 = Arc::clone(&checkpointed);
     let recovery = thread::spawn(move || recovery::run(f2, c2));
 
-    responder.join().unwrap();
-    recovery.join().unwrap();
+    // Block until both actors exit (they check should_shutdown() each iteration)
+    let _ = responder.join();
+    let _ = recovery.join();
+
+    // Final unfreeze sweep — no race: both actors are done, no new freezes possible
+    shutdown_unfreeze(&frozen);
 }
 
-pub fn read_meminfo() -> (u64, u64) {
-    let Ok(content) = std::fs::read_to_string("/proc/meminfo") else {
-        return (0, 0);
-    };
-    let mut total = 0u64;
-    let mut available = 0u64;
-    for line in content.lines() {
-        if line.starts_with("MemTotal:") {
-            total = line.split_whitespace().nth(1)
-                .and_then(|s| s.parse().ok()).unwrap_or(0);
-        }
-        if line.starts_with("MemAvailable:") {
-            available = line.split_whitespace().nth(1)
-                .and_then(|s| s.parse().ok()).unwrap_or(0);
+/// Unfreeze all processes still in the registry after both actors have stopped.
+fn shutdown_unfreeze(frozen: &Arc<Mutex<FrozenRegistry>>) {
+    let reg = frozen.lock().unwrap();
+    let entries: Vec<(u32, u64)> = reg.frozen_pids().into_iter()
+        .map(|pid| (pid, reg.start_time(pid)))
+        .collect();
+    drop(reg); // release lock before I/O
+
+    if entries.is_empty() { return; }
+
+    output::locked_print("\n[shutdown] Unfreezing all frozen processes...");
+    for (pid, st) in &entries {
+        let r = executor::freezer::unfreeze_checked(*pid, *st);
+        if r.success {
+            output::locked_print(&format!("  ✓ Unfroze PID {pid}"));
+        } else {
+            output::locked_eprint(&format!("  ✗ PID {pid}: {}", r.error.unwrap_or_default()));
         }
     }
-    (available, total)
+    output::locked_print("[shutdown] Done.");
+}
+
+extern "C" fn handle_sigint(_: libc::c_int) {
+    SHUTDOWN.store(true, Ordering::Relaxed);
 }

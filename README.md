@@ -8,16 +8,36 @@ The Linux kernel swaps processes out on memory spikes but never actively reclaim
 
 ## How it works
 
-Reads `/proc/pressure/memory` every 2 seconds. When stall time crosses a threshold, calculates the RAM deficit and works through processes from least to most important until enough is freed.
+Reads `/proc/pressure/memory` every 5 seconds. When stall time crosses a threshold, calculates the RAM deficit and works through processes from least to most important until enough is freed.
 
 ```
-ELEVATED  (avg10 > 10%)  →  SIGSTOP low-priority processes
-HIGH      (avg10 > 25%)  →  SIGSTOP + SIGTERM expendable processes
-CRITICAL  (avg10 > 50%)  →  CRIU checkpoint or kill
-EMERGENCY (avg10 > 70%)  →  SIGKILL anything non-critical
+ELEVATED  (avg10 ≥ 5%)   →  SIGSTOP low-priority processes
+HIGH      (avg10 ≥ 25%)  →  SIGSTOP + SIGTERM expendable processes
+CRITICAL  (avg10 ≥ 50%)  →  CRIU checkpoint or kill
+EMERGENCY (avg10 ≥ 70%)  →  SIGKILL anything non-critical
 ```
+
+If `full_avg10 ≥ 20%` (all tasks stalled), the daemon jumps straight to Critical regardless of `some_avg10`.
 
 Processes are never killed above their priority tier. The compositor and audio server are hardcoded untouchable. Frozen processes are tracked and automatically resumed when pressure drops.
+
+## Stress test
+
+Real memory pressure event on a 16GB system:
+
+- **t+0s** — Pressure crossed Elevated. mgd froze 27 low-priority processes
+  in one cycle (browser tabs, file indexers, notifier daemons, IDE helpers).
+  Compositor, audio, and foreground IDE untouched.
+- **t+15s** — Pressure escalated. CRIU checkpoint attempted on a runaway
+  process, fell back to kill when CRIU failed.
+- **t+30–40s** — New heavy processes spawned mid-incident (cargo, cef_server)
+  were caught and frozen as they appeared.
+- **t+51s** — Killed the actual memory hog (a runaway node process, 580 MB).
+  System recovered.
+- **t+71s** — Pressure dropped to Normal. All 30 frozen processes unfrozen
+  in a single cycle. No orphans.
+
+System stayed responsive throughout. No UI freeze, no compositor stutter, no reboot. Daemon RSS: ~6 MB.
 
 ## Priority tiers
 
@@ -60,6 +80,18 @@ mgd unfreeze <pid>     # manually unfreeze
 
 Logs every action to `~/memlogs/mgd_*.log`.
 
+## Security model
+
+mgd runs as a user service and manages only processes owned by your user
+session. System daemons (snapd, fwupd, root-owned services) are skipped
+by design — both because mgd lacks permission to signal them, and because
+its scope is deliberately limited to your session.
+
+Running mgd as root or with elevated capabilities is not recommended and
+not required for normal operation. CRIU checkpointing has reduced
+functionality without CAP_SYS_ADMIN; the daemon falls back to SIGKILL
+when checkpoint fails.
+
 ## Roadmap
 
 - [x] PSI monitoring
@@ -70,7 +102,7 @@ Logs every action to `~/memlogs/mgd_*.log`.
 - [x] Frozen process registry
 - [x] Session logging
 - [x] Systemd user service
-- [ ] TOML config (per-app priorities without recompiling)
+- [x] TOML config (per-app priorities without recompiling)
 - [ ] Wayland compositor focus detection
 - [ ] D-Bus notifications with Restore button
 - [ ] Kernel patches (PSI triggers, proactive swap-in, LRU hints)

@@ -105,7 +105,6 @@ pub fn plan(
     let mut decisions = vec![];
 
     for proc in candidates {
-        // Covered enough — stop here, don't kill more than needed
         if deficit <= 0 {
             break;
         }
@@ -117,8 +116,6 @@ pub fn plan(
             continue;
         }
 
-        // How much of this process is already in swap vs RAM?
-        // If >50% is already in swap, checkpointing is wasteful — just kill it
         let total_memory = proc.rss_kb + proc.swap_kb;
         let swap_ratio = if total_memory > 0 {
             proc.swap_kb as f64 / total_memory as f64
@@ -128,6 +125,11 @@ pub fn plan(
 
         let action = decide_action(level, prio, swap_ratio);
 
+        // Skip no-ops — don't waste a decision slot or count toward deficit
+        if action == Action::None {
+            continue;
+        }
+
         let reason = format!(
             "priority={prio} rss={:.0}MB swap={:.0}MB swap_ratio={:.0}% deficit={:.0}MB",
             proc.rss_kb as f64 / 1024.0,
@@ -136,8 +138,13 @@ pub fn plan(
             deficit as f64 / 1024.0,
         );
 
-        // Reduce deficit by this process's RSS (what we'd free by killing it)
-        deficit -= proc.rss_kb as i64;
+        // Freeze doesn't actually free RAM — only count 25% (kernel may reclaim some)
+        // Kill/Terminate/Checkpoint free the full RSS
+        let freed = match action {
+            Action::Freeze => proc.rss_kb as i64 / 4,
+            _ => proc.rss_kb as i64,
+        };
+        deficit -= freed;
 
         decisions.push(Decision {
             pid: proc.pid,
@@ -195,5 +202,106 @@ fn decide_action(level: &PressureLevel, prio: u8, swap_ratio: f64) -> Action {
 
         // Emergency: no time for grace, kill everything non-critical
         PressureLevel::Emergency => Action::Kill,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn proc(name: &str, rss_kb: u64, swap_kb: u64) -> Process {
+        Process { pid: 1000, name: name.to_string(), rss_kb, swap_kb, oom_score: 0 }
+    }
+
+    #[test]
+    fn normal_pressure_produces_no_decisions() {
+        let procs = vec![proc("firefox", 500_000, 0)];
+        let decisions = plan(&PressureLevel::Normal, &procs, 4_000_000, 16_000_000);
+        assert!(decisions.is_empty());
+    }
+
+    #[test]
+    fn elevated_freezes_low_priority_only() {
+        let procs = vec![proc("baloo_file_extractor", 200_000, 0)];
+        let decisions = plan(&PressureLevel::Elevated, &procs, 1_000_000, 16_000_000);
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].action, Action::Freeze);
+    }
+
+    #[test]
+    fn elevated_skips_normal_tier_entirely() {
+        // "some_app" default priority 50 — no decision emitted at all
+        let procs = vec![proc("some_app", 500_000, 0)];
+        let decisions = plan(&PressureLevel::Elevated, &procs, 1_000_000, 16_000_000);
+        assert!(decisions.is_empty());
+    }
+
+    #[test]
+    fn critical_never_touches_system_tier() {
+        let procs = vec![proc("kwin_wayland", 300_000, 0)];
+        let decisions = plan(&PressureLevel::Critical, &procs, 500_000, 16_000_000);
+        assert!(decisions.is_empty());
+    }
+
+    #[test]
+    fn critical_kills_high_swap_ratio() {
+        let procs = vec![proc("msedge", 100_000, 200_000)];
+        let decisions = plan(&PressureLevel::Critical, &procs, 500_000, 16_000_000);
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].action, Action::Kill);
+    }
+
+    #[test]
+    fn emergency_kills_everything_non_critical() {
+        let procs = vec![proc("firefox", 500_000, 0)];
+        let decisions = plan(&PressureLevel::Emergency, &procs, 500_000, 16_000_000);
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].action, Action::Kill);
+    }
+
+    #[test]
+    fn stops_when_deficit_covered() {
+        let procs = vec![
+            proc("msedge", 2_000_000, 0),
+            proc("msedge", 2_000_000, 0),
+        ];
+        // deficit = 16M*0.15 - 1M = 1.4M KB. First kill (2M) covers it.
+        let decisions = plan(&PressureLevel::Emergency, &procs, 1_000_000, 16_000_000);
+        assert_eq!(decisions.len(), 1);
+    }
+
+    #[test]
+    fn freeze_counts_less_toward_deficit() {
+        // 4 processes at 200MB each. Freeze counts 25% = 50MB each.
+        // deficit = 16M*0.15 - 1M = 1.4M KB = ~1400MB needed
+        // At 50MB credit per freeze, need many more freezes than kills
+        let procs = vec![
+            proc("baloo_file_extractor", 200_000, 0),
+            proc("baloo_file_extractor", 200_000, 0),
+            proc("baloo_file_extractor", 200_000, 0),
+            proc("baloo_file_extractor", 200_000, 0),
+        ];
+        let decisions = plan(&PressureLevel::Elevated, &procs, 1_000_000, 16_000_000);
+        // All 4 should be frozen since 4*50MB = 200MB < 1400MB deficit
+        assert_eq!(decisions.len(), 4);
+    }
+
+    #[test]
+    fn ignores_tiny_processes() {
+        let procs = vec![proc("tiny", 5_000, 0)];
+        let decisions = plan(&PressureLevel::Emergency, &procs, 500_000, 16_000_000);
+        assert!(decisions.is_empty());
+    }
+
+    #[test]
+    fn ram_deficit_positive_when_low() {
+        let deficit = ram_deficit_kb(1_000_000, 16_000_000);
+        assert!(deficit > 0);
+    }
+
+    #[test]
+    fn ram_deficit_negative_when_plenty() {
+        let deficit = ram_deficit_kb(8_000_000, 16_000_000);
+        assert!(deficit < 0);
     }
 }

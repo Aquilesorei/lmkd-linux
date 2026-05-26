@@ -1,55 +1,49 @@
 use std::io;
 
-/// Result of a freeze/unfreeze operation
-#[derive(Debug)]
-#[allow(dead_code)]
-pub struct FreezeResult {
-    pub pid: u32,
-    pub action: FreezeAction,
-    pub success: bool,
-    pub error: Option<String>,
-}
-
-#[derive(Debug)]
-#[allow(dead_code)]
-pub enum FreezeAction {
-    Freeze,
-    Unfreeze,
-}
-
-impl std::fmt::Display for FreezeAction {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        match self {
-            FreezeAction::Freeze   => write!(f, "FREEZE"),
-            FreezeAction::Unfreeze => write!(f, "UNFREEZE"),
-        }
-    }
-}
+use super::{read_start_time, OpResult};
 
 /// Send SIGSTOP to a process — pauses it completely.
-/// The process remains in memory but stops executing.
-/// Reversible with unfreeze().
-pub fn freeze(pid: u32) -> FreezeResult {
-    send_signal(pid, libc::SIGSTOP, FreezeAction::Freeze)
+pub fn freeze(pid: u32) -> OpResult {
+    send_signal(pid, libc::SIGSTOP)
 }
 
 /// Send SIGCONT to a process — resumes a frozen process.
-pub fn unfreeze(pid: u32) -> FreezeResult {
-    send_signal(pid, libc::SIGCONT, FreezeAction::Unfreeze)
+pub fn unfreeze(pid: u32) -> OpResult {
+    send_signal(pid, libc::SIGCONT)
 }
 
-fn send_signal(pid: u32, signal: i32, action: FreezeAction) -> FreezeResult {
-    let result = unsafe { libc::kill(pid as i32, signal) };
-
-    if result == 0 {
-        FreezeResult { pid, action, success: true, error: None }
-    } else {
-        let err = io::Error::last_os_error();
-        FreezeResult {
-            pid,
-            action,
-            success: false,
-            error: Some(err.to_string()),
+/// Unfreeze only if the process start_time still matches what we recorded.
+/// Returns success=true (no-op) if PID was recycled — the original is gone.
+pub fn unfreeze_checked(pid: u32, expected_start_time: u64) -> OpResult {
+    match read_start_time(pid) {
+        Some(st) if st != expected_start_time => {
+            OpResult { pid, success: true, error: None }
         }
+        None => {
+            OpResult { pid, success: true, error: None }
+        }
+        _ => send_signal(pid, libc::SIGCONT),
+    }
+}
+
+/// Freeze only if the PID's start_time matches expectations (not recycled).
+pub fn freeze_checked(pid: u32, expected_start_time: u64) -> OpResult {
+    match read_start_time(pid) {
+        Some(st) if st != expected_start_time => {
+            OpResult { pid, success: false, error: Some("PID recycled — aborting freeze".into()) }
+        }
+        None => {
+            OpResult { pid, success: false, error: Some("process gone".into()) }
+        }
+        _ => send_signal(pid, libc::SIGSTOP),
+    }
+}
+
+fn send_signal(pid: u32, signal: i32) -> OpResult {
+    let result = unsafe { libc::kill(pid as i32, signal) };
+    if result == 0 {
+        OpResult { pid, success: true, error: None }
+    } else {
+        OpResult { pid, success: false, error: Some(io::Error::last_os_error().to_string()) }
     }
 }

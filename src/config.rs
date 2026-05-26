@@ -62,7 +62,7 @@ impl CompiledConfig {
 
 fn load() -> CompiledConfig {
     let (content, path) = try_user_config()
-        .or_else(|| try_system_config())
+        .or_else(try_system_config)
         .unwrap_or_else(|| (BUILTIN_CONFIG.to_string(), None));
 
     match compile(&content) {
@@ -78,8 +78,7 @@ fn load() -> CompiledConfig {
 }
 
 fn try_user_config() -> Option<(String, Option<PathBuf>)> {
-    let path = std::env::var("HOME").ok()
-        .map(|h| PathBuf::from(h).join(".config/mgd/priorities.toml"))?;
+    let path = crate::util::home_dir().join(".config/mgd/priorities.toml");
     let content = std::fs::read_to_string(&path).ok()?;
     Some((content, Some(path)))
 }

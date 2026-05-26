@@ -22,8 +22,7 @@ pub struct RestoreResult {
 /// Checkpoint a process using CRIU — save state to disk and kill it.
 /// Falls back to SIGSTOP if CRIU fails.
 pub fn checkpoint(pid: u32, name: &str) -> CheckpointResult {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    let snapshot_dir = PathBuf::from(home)
+    let snapshot_dir = crate::util::home_dir()
         .join(format!(".local/share/mgd/snapshots/{}_{}", pid, name));
 
     if let Err(e) = fs::create_dir_all(&snapshot_dir) {
@@ -107,7 +106,7 @@ pub fn checkpoint(pid: u32, name: &str) -> CheckpointResult {
 
 /// Restore a previously checkpointed process from disk.
 #[allow(dead_code)]
-pub fn restore(snapshot_dir: &PathBuf) -> RestoreResult {
+pub fn restore(snapshot_dir: &std::path::Path) -> RestoreResult {
     if !snapshot_dir.exists() {
         return RestoreResult {
             success: false,

@@ -20,6 +20,11 @@ pattern = "^(kworker|ksoftirqd|migration|kswapd|oom_reaper|kthreadd|kcompactd|kh
 priority = 10
 
 [[apps]]
+name    = "mgd"
+pattern = "^mgd$"
+priority = 0
+
+[[apps]]
 name    = "irq-threads"
 pattern = "^irq/"
 priority = 10
