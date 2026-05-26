@@ -97,7 +97,9 @@ pub fn plan(
         .collect();
 
     candidates.sort_by(|a, b| {
-        default_priority(&b.name).cmp(&default_priority(&a.name))
+        let pa = default_priority(&a.name);
+        let pb = default_priority(&b.name);
+        pb.cmp(&pa).then(b.rss_kb.cmp(&a.rss_kb))
     });
 
     let mut decisions = vec![];

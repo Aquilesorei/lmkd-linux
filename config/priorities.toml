@@ -46,7 +46,12 @@ priority = 10
 
 [[apps]]
 name    = "kde-session"
-pattern = "^(plasmashell|kded6|kded5|ksmserver|kscreenlocker_greet|startplasma-way|xembedsniproxy|xwaylandvideobr|xsettingsd)$"
+pattern = "^(plasmashell|kded6|kded5|ksmserver|kscreenlocker_greet|startplasma-way|xembedsniproxy|xwaylandvideobr|xsettingsd|sddm)$"
+priority = 10
+
+[[apps]]
+name    = "pinentry"
+pattern = "^pinentry"
 priority = 10
 
 [[apps]]
@@ -73,7 +78,7 @@ priority = 10
 
 [[apps]]
 name    = "jetbrains-ides"
-pattern = "^(rustrover|webstorm|idea|clion|goland|pycharm|rider)$"
+pattern = "^(rustrover|webstorm|idea|clion|goland|pycharm|rider|studio)$"
 priority = 35
 
 [[apps]]
@@ -82,8 +87,13 @@ pattern = "^(postgres|postgresql|mariadbd|mysqld|mongod|redis-server)$"
 priority = 35
 
 [[apps]]
+name    = "virtual-machines"
+pattern = "^(qemu-system-|qemu-kvm|qemu)$"
+priority = 30
+
+[[apps]]
 name    = "editors"
-pattern = "^(code|code-oss|zed|zeditor|Typora)$"
+pattern = "^(code|code-oss|codium|zed|zeditor|cursor|Cursor|windsurf|Windsurf|Typora)$"
 priority = 38
 
 [[apps]]
@@ -100,8 +110,13 @@ priority = 42
 
 [[apps]]
 name    = "browsers-main"
-pattern = "^(firefox|chromium|chrome|brave|librewolf)$"
+pattern = "^(chromium|chrome|brave|librewolf)$"
 priority = 45
+
+[[apps]]
+name    = "firefox"
+pattern = "^firefox$"
+priority = 75
 
 [[apps]]
 name    = "container-infra"
@@ -125,7 +140,7 @@ priority = 48
 
 [[apps]]
 name    = "remote-desktop"
-pattern = "^(anydesk|remmina|tigervnc)$"
+pattern = "^(anydesk|remmina|tigervnc|virt-manager)$"
 priority = 48
 
 [[apps]]
@@ -169,6 +184,11 @@ pattern = "^(telegram-desktop|discord|slack|signal-desktop)$"
 priority = 55
 
 [[apps]]
+name    = "localsend"
+pattern = "^(LocalSend|localsend|localsend_app)$"
+priority = 55
+
+[[apps]]
 name    = "kde-settings"
 pattern = "^(systemsettings|org_kde_powerde|kaccess|kdeconnectd|kunifiedpush-di)$"
 priority = 55
@@ -179,6 +199,41 @@ pattern = "^(spectacle|flameshot)$"
 priority = 58
 
 # ── LOW (60–79) ──────────────────────────────────────────────────────────────
+
+[[apps]]
+name    = "spotify"
+pattern = "^(spotify|Spotify)$"
+priority = 62
+
+[[apps]]
+name    = "tor-browser"
+pattern = "^(torbrowser-laun|tor-browser)$"
+priority = 62
+
+[[apps]]
+name    = "tor-daemon"
+pattern = "^tor$"
+priority = 72
+
+[[apps]]
+name    = "kde-pim"
+pattern = "^(korganizer|kontact|kaddressbook|kmail2|knotes|akregator)$"
+priority = 52
+
+[[apps]]
+name    = "kde-utilities"
+pattern = "^(ark|filelight|kfind|kolourpaint|kcalc|kcolorchooser|kruler|kcharselect)$"
+priority = 65
+
+[[apps]]
+name    = "kde-media"
+pattern = "^(kdenlive|elisa|haruna|kamoso|kwave|kmix)$"
+priority = 60
+
+[[apps]]
+name    = "kde-system"
+pattern = "^(plasma-systemmonitor|ksystemstats|kinfocenter|krdc|krfb|kleopatra|kgpg|kdesu)$"
+priority = 58
 
 [[apps]]
 name    = "krunner"
@@ -199,6 +254,11 @@ priority = 68
 name    = "power-thermal"
 pattern = "^(thermald|tuned|tuned-ppd|intel_lpmd|iio-sensor-prox)$"
 priority = 10
+
+[[apps]]
+name    = "geoclue"
+pattern = "^(geoclue|geoclue-2.0)$"
+priority = 58
 
 [[apps]]
 name    = "bluetooth"
@@ -265,13 +325,18 @@ priority = 85
 
 [[apps]]
 name    = "build-orchestrators"
-pattern = "^(cargo|make|cmake|ninja|gradle|mvn)$"
+pattern = "^(cargo|make|cmake|ninja|gradle|mvn|npm|yarn|pnpm|bun-run)$"
 priority = 70
 
 [[apps]]
 name    = "compiler-workers"
 pattern = "^(rustc|cc1|c\\+\\+|ld|lld|mold)$"
 priority = 85
+
+[[apps]]
+name    = "media-server"
+pattern = "^(rygel|minidlna|jellyfin)$"
+priority = 82
 
 [[apps]]
 name    = "crash-reporters"
