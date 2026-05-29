@@ -4,7 +4,7 @@ use std::path::Path;
 
 use crate::error::MgdError;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Process {
     pub pid: u32,
     pub name: String,

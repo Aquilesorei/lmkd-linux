@@ -1,12 +1,16 @@
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
 use crate::sync_print;
-use crate::engine::decision::{Action, Decision, plan, default_priority};
+use crate::engine::decision::{Action, Decision, plan, get_priority};
 use crate::executor::registry::{FrozenRegistry, CheckpointRegistry};
 use crate::logger::{LogEntry, Logger};
 use crate::monitor;
+use crate::monitor::meminfo::MemInfo;
+use crate::monitor::process::Process;
+use crate::monitor::psi::PressureLevel;
 
 pub fn run(
     frozen: Arc<Mutex<FrozenRegistry>>,
@@ -26,14 +30,22 @@ pub fn run(
         };
 
         let level = monitor::psi::pressure_level(&pressure);
-        let (available_kb, total_kb) = crate::monitor::meminfo::read_meminfo();
+        let meminfo = crate::monitor::meminfo::read_meminfo();
+        let effective_level = escalate_for_swap(&level, &meminfo);
 
         let mut procs = monitor::process::list_processes();
         procs.sort_by_key(|p| std::cmp::Reverse(p.rss_kb));
 
-        print_status(&pressure, &procs, available_kb, total_kb, &frozen);
+        print_status(&pressure, &effective_level, &procs, &meminfo, &frozen);
 
-        let decisions = plan(&level, &procs, available_kb, total_kb);
+        // Fix 1: exclude already-frozen PIDs from plan so their RSS isn't
+        // double-counted toward deficit, which would cause underkill.
+        let frozen_set: HashSet<u32> = frozen.lock().unwrap().frozen_pids().into_iter().collect();
+        let plan_procs: Vec<&Process> = procs.iter()
+            .filter(|p| !frozen_set.contains(&p.pid))
+            .collect();
+
+        let decisions = plan(&effective_level, &plan_procs, meminfo.available_kb, meminfo.total_kb);
         if decisions.is_empty() {
             sync_print!("✓ No action needed.");
         } else {
@@ -50,25 +62,39 @@ pub fn run(
     }
 }
 
+/// Fix 2: escalate pressure level when swap is nearly exhausted.
+/// PSI alone misses pre-OOM state when swap fills slowly — this catches it.
+fn escalate_for_swap(level: &PressureLevel, m: &MemInfo) -> PressureLevel {
+    if m.swap_total_kb < 256 * 1024 || m.swap_used_pct() < 85.0 {
+        return level.clone();
+    }
+    match level {
+        PressureLevel::Normal    => PressureLevel::Elevated,
+        PressureLevel::Elevated  => PressureLevel::High,
+        PressureLevel::High      => PressureLevel::Critical,
+        PressureLevel::Critical  => PressureLevel::Emergency,
+        PressureLevel::Emergency => PressureLevel::Emergency,
+    }
+}
+
 fn print_status(
     pressure: &monitor::psi::MemoryPressure,
+    effective_level: &PressureLevel,
     procs: &[monitor::process::Process],
-    available_kb: u64,
-    total_kb: u64,
+    meminfo: &MemInfo,
     frozen: &Arc<Mutex<FrozenRegistry>>,
 ) {
-    let level = monitor::psi::pressure_level(pressure);
-    let (total_rss, total_swap) = procs.iter()
+    let (total_rss, _) = procs.iter()
         .fold((0u64, 0u64), |(r, s), p| (r.saturating_add(p.rss_kb), s.saturating_add(p.swap_kb)));
     let frozen_count = frozen.lock().unwrap().count();
 
     sync_print!(
-        "\n[responder] [{level}] some avg10={:.2}% | RAM {:.0}/{:.0}MB | Swap {:.0}MB | Avail {:.0}MB | Procs {} | Frozen {}",
+        "\n[responder] [{effective_level}] some avg10={:.2}% | RAM {:.0}/{:.0}MB | Swap {:.0}% | Avail {:.0}MB | Procs {} | Frozen {}",
         pressure.some_avg10,
         total_rss as f64 / 1024.0,
-        total_kb as f64 / 1024.0,
-        total_swap as f64 / 1024.0,
-        available_kb as f64 / 1024.0,
+        meminfo.total_kb as f64 / 1024.0,
+        meminfo.swap_used_pct(),
+        meminfo.available_kb as f64 / 1024.0,
         procs.len(),
         frozen_count,
     );
@@ -83,7 +109,7 @@ fn print_status(
             p.rss_kb as f64 / 1024.0,
             p.swap_kb as f64 / 1024.0,
             p.oom_score,
-            default_priority(&p.name),
+            get_priority(&p.name),
             marker,
         );
     }

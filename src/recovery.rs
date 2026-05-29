@@ -35,8 +35,8 @@ pub fn run(
             continue;
         }
 
-        let (available_kb, _total_kb) = crate::monitor::meminfo::read_meminfo();
-        baseline.observe(available_kb);
+        let meminfo = crate::monitor::meminfo::read_meminfo();
+        baseline.observe(meminfo.available_kb);
 
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
 
@@ -66,7 +66,8 @@ pub fn run(
             }
         }
 
-        let (available_kb, total_kb) = crate::monitor::meminfo::read_meminfo();
+        let meminfo = crate::monitor::meminfo::read_meminfo();
+        let (available_kb, total_kb) = (meminfo.available_kb, meminfo.total_kb);
 
         // Restore one checkpointed process per cycle (lightest first)
         {

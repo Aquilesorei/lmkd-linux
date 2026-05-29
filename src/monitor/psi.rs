@@ -15,7 +15,7 @@ pub struct MemoryPressure {
     pub full_total: u64,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub enum PressureLevel {
     Normal,
     Elevated,

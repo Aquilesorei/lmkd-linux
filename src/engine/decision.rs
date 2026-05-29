@@ -56,7 +56,7 @@ pub struct Decision {
 
 /// Priority tier based on process name — delegates to loaded config.
 /// Returns 0–100 (higher = kill first).
-pub fn default_priority(name: &str) -> u8 {
+pub fn get_priority(name: &str) -> u8 {
     crate::config::get().priority_for(name)
 }
 
@@ -75,7 +75,7 @@ pub fn ram_deficit_kb(available_kb: u64, total_kb: u64) -> i64 {
 /// 4. Stop as soon as deficit is covered — never kill more than needed
 pub fn plan(
     level: &PressureLevel,
-    procs: &[Process],
+    procs: &[&Process],
     available_kb: u64,
     total_kb: u64,
 ) -> Vec<Decision> {
@@ -92,24 +92,24 @@ pub fn plan(
 
     // Sort candidates: highest priority number first (least important first)
     // Filter out tiny processes — not worth the overhead
-    let mut candidates: Vec<&Process> = procs.iter()
+    // We pre-calculate priorities to avoid expensive regex matching during sorting.
+    let mut candidates: Vec<(u8, &Process)> = procs.iter()
         .filter(|p| p.rss_kb > 10 * 1024) // ignore processes using < 10MB
+        .map(|p| (get_priority(&p.name), *p))
         .collect();
 
-    candidates.sort_by(|a, b| {
-        let pa = default_priority(&a.name);
-        let pb = default_priority(&b.name);
-        pb.cmp(&pa).then(b.rss_kb.cmp(&a.rss_kb))
+    candidates.sort_by(|(pa, a), (pb, b)| {
+        pb.cmp(pa)
+            .then(b.rss_kb.cmp(&a.rss_kb))
+            .then(b.oom_score.cmp(&a.oom_score))
     });
 
     let mut decisions = vec![];
 
-    for proc in candidates {
+    for (prio, proc) in candidates {
         if deficit <= 0 {
             break;
         }
-
-        let prio = default_priority(&proc.name);
 
         // Hard rule: never touch SYSTEM or CRITICAL tier (priority <= 19)
         if prio <= 19 {
@@ -216,14 +216,14 @@ mod tests {
     #[test]
     fn normal_pressure_produces_no_decisions() {
         let procs = vec![proc("firefox", 500_000, 0)];
-        let decisions = plan(&PressureLevel::Normal, &procs, 4_000_000, 16_000_000);
+        let decisions = plan(&PressureLevel::Normal, &procs.iter().collect::<Vec<_>>(), 4_000_000, 16_000_000);
         assert!(decisions.is_empty());
     }
 
     #[test]
     fn elevated_freezes_low_priority_only() {
         let procs = vec![proc("baloo_file_extractor", 200_000, 0)];
-        let decisions = plan(&PressureLevel::Elevated, &procs, 1_000_000, 16_000_000);
+        let decisions = plan(&PressureLevel::Elevated, &procs.iter().collect::<Vec<_>>(), 1_000_000, 16_000_000);
         assert_eq!(decisions.len(), 1);
         assert_eq!(decisions[0].action, Action::Freeze);
     }
@@ -232,21 +232,21 @@ mod tests {
     fn elevated_skips_normal_tier_entirely() {
         // "some_app" default priority 50 — no decision emitted at all
         let procs = vec![proc("some_app", 500_000, 0)];
-        let decisions = plan(&PressureLevel::Elevated, &procs, 1_000_000, 16_000_000);
+        let decisions = plan(&PressureLevel::Elevated, &procs.iter().collect::<Vec<_>>(), 1_000_000, 16_000_000);
         assert!(decisions.is_empty());
     }
 
     #[test]
     fn critical_never_touches_system_tier() {
         let procs = vec![proc("kwin_wayland", 300_000, 0)];
-        let decisions = plan(&PressureLevel::Critical, &procs, 500_000, 16_000_000);
+        let decisions = plan(&PressureLevel::Critical, &procs.iter().collect::<Vec<_>>(), 500_000, 16_000_000);
         assert!(decisions.is_empty());
     }
 
     #[test]
     fn critical_kills_high_swap_ratio() {
         let procs = vec![proc("msedge", 100_000, 200_000)];
-        let decisions = plan(&PressureLevel::Critical, &procs, 500_000, 16_000_000);
+        let decisions = plan(&PressureLevel::Critical, &procs.iter().collect::<Vec<_>>(), 500_000, 16_000_000);
         assert_eq!(decisions.len(), 1);
         assert_eq!(decisions[0].action, Action::Kill);
     }
@@ -254,7 +254,7 @@ mod tests {
     #[test]
     fn emergency_kills_everything_non_critical() {
         let procs = vec![proc("firefox", 500_000, 0)];
-        let decisions = plan(&PressureLevel::Emergency, &procs, 500_000, 16_000_000);
+        let decisions = plan(&PressureLevel::Emergency, &procs.iter().collect::<Vec<_>>(), 500_000, 16_000_000);
         assert_eq!(decisions.len(), 1);
         assert_eq!(decisions[0].action, Action::Kill);
     }
@@ -266,7 +266,7 @@ mod tests {
             proc("msedge", 2_000_000, 0),
         ];
         // deficit = 16M*0.15 - 1M = 1.4M KB. First kill (2M) covers it.
-        let decisions = plan(&PressureLevel::Emergency, &procs, 1_000_000, 16_000_000);
+        let decisions = plan(&PressureLevel::Emergency, &procs.iter().collect::<Vec<_>>(), 1_000_000, 16_000_000);
         assert_eq!(decisions.len(), 1);
     }
 
@@ -281,7 +281,7 @@ mod tests {
             proc("baloo_file_extractor", 200_000, 0),
             proc("baloo_file_extractor", 200_000, 0),
         ];
-        let decisions = plan(&PressureLevel::Elevated, &procs, 1_000_000, 16_000_000);
+        let decisions = plan(&PressureLevel::Elevated, &procs.iter().collect::<Vec<_>>(), 1_000_000, 16_000_000);
         // All 4 should be frozen since 4*50MB = 200MB < 1400MB deficit
         assert_eq!(decisions.len(), 4);
     }
@@ -289,7 +289,7 @@ mod tests {
     #[test]
     fn ignores_tiny_processes() {
         let procs = vec![proc("tiny", 5_000, 0)];
-        let decisions = plan(&PressureLevel::Emergency, &procs, 500_000, 16_000_000);
+        let decisions = plan(&PressureLevel::Emergency, &procs.iter().collect::<Vec<_>>(), 500_000, 16_000_000);
         assert!(decisions.is_empty());
     }
 
