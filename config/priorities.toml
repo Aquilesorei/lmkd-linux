@@ -17,6 +17,26 @@
 
 [defaults]
 priority = 50
+
+# ── XDG desktop category fallback ────────────────────────────────────────────
+# Applied when a process isn't matched by any [[apps]] regex.
+# mgd reads /proc/PID/exe to get the untruncated binary name, looks it up in
+# /usr/share/applications/ and ~/.local/share/applications/, and uses the first
+# matching category below. Remove a key to exclude that category from fallback.
+[category_priorities]
+Game        = 30
+Development = 42
+Office      = 52
+Science     = 52
+Education   = 52
+Graphics    = 50
+Network     = 58
+System      = 58
+Settings    = 60
+AudioVideo  = 62
+Audio       = 62
+Video       = 60
+Utility     = 65
 # Keep this many log files in ~/memlogs/ — oldest are deleted on startup.
 # Set to 0 to disable rotation (keep all files forever).
 log_keep = 10

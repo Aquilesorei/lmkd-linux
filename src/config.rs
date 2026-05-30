@@ -1,6 +1,7 @@
 use regex::Regex;
 use serde::Deserialize;
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 // Hot-reloadable config: wrapped in an Arc<RwLock> so SIGHUP can swap it.
@@ -35,6 +36,8 @@ struct RawConfig {
     apps: Vec<AppEntry>,
     #[serde(default)]
     protect: Vec<ProtectEntry>,
+    #[serde(default)]
+    category_priorities: HashMap<String, u8>,
 }
 
 #[derive(Deserialize)]
@@ -86,14 +89,21 @@ pub struct CompiledConfig {
     entries: Vec<(Regex, u8, Option<bool>)>,
     /// Patterns that must never be touched
     protected: Vec<Regex>,
+    /// exe_basename → priority derived from .desktop Categories=
+    desktop_index: HashMap<String, u8>,
     pub config_path: Option<PathBuf>,
 }
 
 impl CompiledConfig {
-    pub fn priority_for(&self, process_name: &str) -> u8 {
+    pub fn priority_for(&self, process_name: &str, exe_basename: Option<&str>) -> u8 {
         for (re, prio, _) in &self.entries {
             if re.is_match(process_name) {
                 return *prio;
+            }
+        }
+        if let Some(exe) = exe_basename {
+            if let Some(&prio) = self.desktop_index.get(exe) {
+                return prio;
             }
         }
         self.default_priority
@@ -171,11 +181,78 @@ fn compile(content: &str) -> Result<CompiledConfig, String> {
         }
     }
 
+    let desktop_index = scan_desktop_files(&raw.category_priorities);
+
     Ok(CompiledConfig {
         default_priority: raw.defaults.priority,
         log_keep: raw.defaults.log_keep,
         entries,
         protected,
+        desktop_index,
         config_path: None,
     })
+}
+
+fn scan_desktop_files(category_priorities: &HashMap<String, u8>) -> HashMap<String, u8> {
+    let mut index = HashMap::new();
+    let home = crate::util::home_dir();
+    // User dirs first so or_insert() first-wins gives user overrides priority over system.
+    let dirs = [
+        home.join(".local/share/applications"),
+        home.join(".local/share/flatpak/exports/share/applications"),
+        PathBuf::from("/usr/share/applications"),
+        PathBuf::from("/var/lib/flatpak/exports/share/applications"),
+    ];
+    for dir in &dirs {
+        let Ok(entries) = std::fs::read_dir(dir) else { continue };
+        for entry in entries.filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("desktop") {
+                continue;
+            }
+            if let Some((exe, prio)) = parse_desktop_file(&path, category_priorities) {
+                index.entry(exe).or_insert(prio);
+            }
+        }
+    }
+    index
+}
+
+fn parse_desktop_file<'a>(path: &Path, category_priorities: &HashMap<String, u8>) -> Option<(String, u8)> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let mut exe_basename: Option<String> = None;
+    // Borrow slices directly from content — no String allocation per category.
+    let mut categories: Vec<&str> = vec![];
+    // Only parse keys from the [Desktop Entry] section; skip [Desktop Action *] etc.
+    let mut in_desktop_entry = false;
+
+    for line in content.lines() {
+        if line.starts_with('[') {
+            in_desktop_entry = line == "[Desktop Entry]";
+            continue;
+        }
+        if !in_desktop_entry {
+            continue;
+        }
+        if line.starts_with("Exec=") && exe_basename.is_none() {
+            let rest = &line["Exec=".len()..];
+            // Use `else { continue }` instead of `?` so a blank Exec= skips only this line.
+            let Some(binary) = rest.split_whitespace().next() else { continue };
+            let Some(name) = Path::new(binary).file_name() else { continue };
+            exe_basename = Some(name.to_string_lossy().into_owned());
+        } else if line.starts_with("Categories=") {
+            categories = line["Categories=".len()..]
+                .split(';')
+                .filter(|s| !s.is_empty())
+                .collect();
+        }
+    }
+
+    let exe = exe_basename?;
+    // Use max priority across all matching categories: the most expendable category wins,
+    // ensuring the process is not under-prioritised due to incidental low-priority categories.
+    let prio = categories.iter()
+        .filter_map(|cat| category_priorities.get(*cat).copied())
+        .max()?;
+    Some((exe, prio))
 }

@@ -115,7 +115,7 @@ fn print_status(
             p.rss_kb as f64 / 1024.0,
             p.swap_kb as f64 / 1024.0,
             p.oom_score,
-            get_priority(&p.name),
+            get_priority(&p.name, p.exe_basename.as_deref()),
             marker,
         );
     }

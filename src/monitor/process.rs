@@ -8,6 +8,8 @@ use crate::error::MgdError;
 pub struct Process {
     pub pid: u32,
     pub name: String,
+    /// Basename of /proc/PID/exe — untruncated, used for .desktop category lookup.
+    pub exe_basename: Option<String>,
     pub rss_kb: u64,
     pub swap_kb: u64,
     pub oom_score: i32,
@@ -65,7 +67,11 @@ fn read_process(pid: u32, path: &Path) -> Result<Process, MgdError> {
         .and_then(|s| s.trim().parse::<i32>().ok())
         .unwrap_or(0);
 
-    Ok(Process { pid, name, rss_kb, swap_kb, oom_score })
+    let exe_basename = fs::read_link(path.join("exe"))
+        .ok()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()));
+
+    Ok(Process { pid, name, exe_basename, rss_kb, swap_kb, oom_score })
 }
 
 fn parse_status_field(status: &str, field: &str) -> Option<String> {

@@ -170,7 +170,6 @@ when checkpoint fails.
 - [x] Process protect list in config (`[[protect]]` entries)
 - [x] Per-process `checkpoint = true/false` override in config
 - [x] Log rotation (`log_keep` in config, default 10 files)
-- [ ] Wayland compositor focus detection
 - [ ] D-Bus notifications with Restore button
 - [ ] Kernel patches (PSI triggers, proactive swap-in, LRU hints)
 
