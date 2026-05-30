@@ -7,9 +7,19 @@
 #   40–59  NORMAL    standard desktop apps
 #   60–79  LOW       background services, freeze/checkpoint early
 #   80–100 EXPENDABLE kill first, no ceremony
+#
+# Per-app optional fields:
+#   checkpoint = true   — always CRIU-checkpoint this process at Critical pressure
+#   checkpoint = false  — never checkpoint, go straight to terminate/kill
+#
+# [[protect]] entries are NEVER touched regardless of pressure.
+# Use for anything not in the priority=0–19 tier that you still want off-limits.
 
 [defaults]
 priority = 50
+# Keep this many log files in ~/memlogs/ — oldest are deleted on startup.
+# Set to 0 to disable rotation (keep all files forever).
+log_keep = 10
 
 # ── CRITICAL (10) ────────────────────────────────────────────────────────────
 # Kernel threads (zero RSS — plan() skips them anyway, but classified for display)

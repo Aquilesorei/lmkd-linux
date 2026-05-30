@@ -60,6 +60,11 @@ pub fn get_priority(name: &str) -> u8 {
     crate::config::get().priority_for(name)
 }
 
+/// Returns true if this process is on the user's protect list.
+pub fn is_protected(name: &str) -> bool {
+    crate::config::get().is_protected(name)
+}
+
 /// Calculate how much RAM we need to free (in KB)
 pub fn ram_deficit_kb(available_kb: u64, total_kb: u64) -> i64 {
     let target_kb = (total_kb as f64 * 0.15) as u64; // want 15% free
@@ -111,8 +116,13 @@ pub fn plan(
             break;
         }
 
-        // Hard rule: never touch SYSTEM or CRITICAL tier (priority <= 19)
+        // Hard rule 1: never touch SYSTEM or CRITICAL tier (priority <= 19)
         if prio <= 19 {
+            continue;
+        }
+
+        // Hard rule 2: never touch user-configured protect list
+        if is_protected(&proc.name) {
             continue;
         }
 
@@ -123,7 +133,9 @@ pub fn plan(
             0.0
         };
 
-        let action = decide_action(level, prio, swap_ratio);
+        // Per-process checkpoint override from config
+        let checkpoint_override = crate::config::get().checkpoint_override(&proc.name);
+        let action = decide_action(level, prio, swap_ratio, checkpoint_override);
 
         // Skip no-ops — don't waste a decision slot or count toward deficit
         if action == Action::None {
@@ -160,8 +172,14 @@ pub fn plan(
 }
 
 /// Decide the action for a single process based on pressure level,
-/// its priority tier, and how much of it is already in swap.
-fn decide_action(level: &PressureLevel, prio: u8, swap_ratio: f64) -> Action {
+/// its priority tier, how much of it is already in swap, and any
+/// per-process checkpoint override from config.
+fn decide_action(
+    level: &PressureLevel,
+    prio: u8,
+    swap_ratio: f64,
+    checkpoint_override: Option<bool>,
+) -> Action {
     match level {
         PressureLevel::Normal => Action::None,
 
@@ -187,6 +205,12 @@ fn decide_action(level: &PressureLevel, prio: u8, swap_ratio: f64) -> Action {
 
         // Critical: start freeing real memory
         PressureLevel::Critical => {
+            // Per-process override takes priority over all heuristics
+            if let Some(cp) = checkpoint_override {
+                return if cp { Action::Checkpoint } else {
+                    if swap_ratio > 0.5 { Action::Kill } else { Action::Terminate }
+                };
+            }
             if swap_ratio > 0.5 {
                 // Already mostly in swap — checkpointing is pointless,
                 // the data is already on disk effectively. Just kill it.

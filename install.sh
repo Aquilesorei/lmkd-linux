@@ -27,8 +27,8 @@ fi
 ok "Dependencies OK"
 
 # ── build ─────────────────────────────────────────────────────────────────────
-echo "Building release binary..."
-cargo build --bin mgd --release 2>&1 | tail -3
+echo "Building release binaries..."
+cargo build --bin mgd --bin mgctl --release 2>&1 | tail -3
 ok "Build complete"
 
 # ── stop existing service if running ─────────────────────────────────────────
@@ -39,9 +39,10 @@ fi
 
 # ── install binary ────────────────────────────────────────────────────────────
 mkdir -p "$BIN_DIR"
-cp target/release/mgd "$BIN_DIR/mgd"
-chmod +x "$BIN_DIR/mgd"
-ok "Binary installed to $BIN_DIR/mgd"
+cp target/release/mgd   "$BIN_DIR/mgd"
+cp target/release/mgctl "$BIN_DIR/mgctl"
+chmod +x "$BIN_DIR/mgd" "$BIN_DIR/mgctl"
+ok "Binaries installed to $BIN_DIR/{mgd,mgctl}"
 
 # ── install service ───────────────────────────────────────────────────────────
 mkdir -p "$SERVICE_DIR"
@@ -59,21 +60,35 @@ else
     ok "Default config installed to $CONFIG_DIR/priorities.toml"
 fi
 
-# ── enable and start ──────────────────────────────────────────────────────────
-systemctl --user enable --now "$SERVICE_NAME"
-ok "Service enabled and started"
+# ── enable + (re)start ───────────────────────────────────────────────────────
+systemctl --user enable "$SERVICE_NAME"
+if systemctl --user is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
+    # Already running — restart to pick up new binary
+    systemctl --user restart "$SERVICE_NAME"
+    ok "Service restarted"
+else
+    systemctl --user start "$SERVICE_NAME"
+    ok "Service started"
+fi
 
 # ── verify ────────────────────────────────────────────────────────────────────
-sleep 0.5
+sleep 1
 if systemctl --user is-active --quiet "$SERVICE_NAME"; then
     ok "mgd is running"
     echo
-    systemctl --user status "$SERVICE_NAME" --no-pager -l | head -20 || true
+    if command -v mgctl >/dev/null 2>&1 || [[ -x "$BIN_DIR/mgctl" ]]; then
+        "$BIN_DIR/mgctl" status || true
+    else
+        systemctl --user status "$SERVICE_NAME" --no-pager -l | head -10 || true
+    fi
 else
     die "Service failed to start — check: journalctl --user -u mgd.service -n 30"
 fi
 
 echo
-echo "To customize priorities: $CONFIG_DIR/priorities.toml"
-echo "To view logs:            journalctl --user -u mgd.service -f"
-echo "To stop:                 systemctl --user stop mgd.service"
+echo "To customize priorities:  $CONFIG_DIR/priorities.toml"
+echo "To reload config live:    mgctl reload     (or: kill -HUP \$(pgrep mgd))"
+echo "To view status:           mgctl status"
+echo "To list frozen processes: mgctl list"
+echo "To view logs:             journalctl --user -u mgd.service -f"
+echo "To stop:                  systemctl --user stop mgd.service"

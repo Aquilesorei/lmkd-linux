@@ -60,8 +60,7 @@ sudo apt install criu      # Debian/Ubuntu
 ```bash
 git clone https://github.com/Aquilesorei/lmkd-linux
 cd lmkd-linux
-cargo build --bin mgd --release
-cp target/release/mgd ~/.local/bin/mgd
+./install.sh
 ```
 
 Run as a systemd user service:
@@ -72,13 +71,76 @@ systemctl --user enable --now mgd.service
 
 ## Usage
 
+### Daemon
 ```bash
-mgd                    # run daemon
-mgd freeze <pid>       # manually freeze a process
-mgd unfreeze <pid>     # manually unfreeze
+mgd          # run daemon (normally via systemd)
 ```
 
+### mgctl — live control CLI
+```bash
+mgctl status              # current pressure level + frozen/checkpointed counts
+mgctl list                # list all currently frozen processes
+mgctl unfreeze firefox    # manually unfreeze by name (substring match)
+mgctl unfreeze 12345      # manually unfreeze by PID
+mgctl reload              # hot-reload config without restarting daemon (SIGHUP)
+```
+
+`mgctl` talks to the running daemon via a Unix domain socket at
+`$XDG_RUNTIME_DIR/mgd.sock` (fallback: `/tmp/mgd-<uid>.sock`).
+
+### Signals
+| Signal | Effect |
+|--------|--------|
+| `SIGINT` / `SIGTERM` | Graceful shutdown — unfreezes all frozen processes first |
+| `SIGHUP` | Hot-reload config on next decision cycle (same as `mgctl reload`) |
+
+systemd sends `SIGTERM` when stopping the service, so frozen processes are
+always cleaned up properly on `systemctl stop mgd`.
+
 Logs every action to `~/memlogs/mgd_*.log`.
+
+## Configuration
+
+Edit `~/.config/mgd/priorities.toml` (falls back to `/etc/mgd/priorities.toml`,
+then built-in defaults).
+
+```toml
+[defaults]
+priority = 50    # default for unrecognised processes
+log_keep = 10    # keep this many log files in ~/memlogs/ (0 = unlimited)
+
+# Custom priority
+[[apps]]
+name    = "my-server"
+pattern = "^my-server$"
+priority = 25
+
+# Force CRIU checkpoint at Critical pressure (never terminate)
+[[apps]]
+name       = "important-app"
+pattern    = "^important-app$"
+priority   = 45
+checkpoint = true
+
+# Never checkpoint this process (too fast to bother saving)
+[[apps]]
+name       = "quick-tool"
+pattern    = "^quick-tool$"
+priority   = 60
+checkpoint = false
+
+# Hard protect — mgd will never touch this process regardless of pressure
+[[protect]]
+name    = "my-vpn"
+pattern = "^(openvpn|wg-quick)$"
+```
+
+After editing, apply without restart:
+```bash
+mgctl reload
+# or
+kill -HUP $(pgrep mgd)
+```
 
 ## Security model
 
@@ -103,6 +165,11 @@ when checkpoint fails.
 - [x] Session logging
 - [x] Systemd user service
 - [x] TOML config (per-app priorities without recompiling)
+- [x] Unix socket IPC (`mgctl status`, `mgctl list`, `mgctl unfreeze`)
+- [x] SIGTERM / SIGHUP handling (graceful shutdown + hot config reload)
+- [x] Process protect list in config (`[[protect]]` entries)
+- [x] Per-process `checkpoint = true/false` override in config
+- [x] Log rotation (`log_keep` in config, default 10 files)
 - [ ] Wayland compositor focus detection
 - [ ] D-Bus notifications with Restore button
 - [ ] Kernel patches (PSI triggers, proactive swap-in, LRU hints)

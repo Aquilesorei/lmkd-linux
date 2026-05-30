@@ -51,7 +51,6 @@ impl FrozenRegistry {
 
     pub fn count(&self) -> usize { self.frozen.len() }
 
-    #[allow(dead_code)]
     pub fn list(&self) -> Vec<(u32, String, u64)> {
         self.frozen.iter()
             .map(|(pid, (name, ts, _))| (*pid, name.clone(), *ts))

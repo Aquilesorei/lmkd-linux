@@ -1,4 +1,4 @@
-use std::fs::{OpenOptions, create_dir_all};
+use std::fs::{OpenOptions, create_dir_all, read_dir};
 use std::io::Write;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -19,6 +19,13 @@ impl Logger {
             .as_secs();
 
         let log_path = log_dir.join(format!("mgd_{ts}.log"));
+
+        // Rotate: remove oldest files if we exceed log_keep
+        let keep = crate::config::get().log_keep;
+        if keep > 0 {
+            // saturating_sub(1): leave room for the file we are about to create
+            rotate_logs(&log_dir, keep.saturating_sub(1));
+        }
 
         Logger { log_path }
     }
@@ -71,4 +78,31 @@ fn timestamp_now() -> String {
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
     unsafe { libc::localtime_r(&secs, &mut tm) };
     format!("{:02}:{:02}:{:02}", tm.tm_hour, tm.tm_min, tm.tm_sec)
+}
+
+/// Keep only the `keep` most-recent `mgd_*.log` files; delete the rest.
+fn rotate_logs(log_dir: &std::path::Path, keep: usize) {
+    let mut log_files: Vec<(u64, PathBuf)> = read_dir(log_dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name();
+            let s = name.to_string_lossy();
+            let ts: u64 = s
+                .strip_prefix("mgd_")?
+                .strip_suffix(".log")?
+                .parse()
+                .ok()?;
+            Some((ts, e.path()))
+        })
+        .collect();
+
+    // Newest first
+    log_files.sort_by(|(a, _), (b, _)| b.cmp(a));
+
+    // Delete everything beyond `keep` (the oldest files)
+    for (_, path) in log_files.into_iter().skip(keep) {
+        let _ = std::fs::remove_file(&path);
+    }
 }

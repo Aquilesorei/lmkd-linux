@@ -5,9 +5,10 @@ mod engine;
 mod executor;
 mod logger;
 mod output;
-mod responder;
+mod evictor;
 mod recovery;
 mod util;
+mod ipc;
 
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -15,63 +16,109 @@ use std::thread;
 use executor::registry::{FrozenRegistry, CheckpointRegistry};
 
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+static RELOAD_CONFIG: AtomicBool = AtomicBool::new(false);
 
 pub fn should_shutdown() -> bool {
     SHUTDOWN.load(Ordering::Relaxed)
 }
 
+pub fn should_reload() -> bool {
+    RELOAD_CONFIG.swap(false, Ordering::Relaxed)
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    if args.len() == 3 {
-        let pid: u32 = match args[2].parse() {
-            Ok(p) => p,
-            Err(_) => { eprintln!("Error: PID must be a number"); return; }
-        };
+
+    // ── CLI subcommands (spawned separately, talk to running daemon via socket) ──
+    if args.len() >= 2 {
         match args[1].as_str() {
-            "freeze" => {
+            // Legacy direct-signal commands (still work without daemon)
+            "freeze" if args.len() == 3 => {
+                let pid: u32 = match args[2].parse() {
+                    Ok(p) => p,
+                    Err(_) => { eprintln!("Error: PID must be a number"); return; }
+                };
                 let r = executor::freezer::freeze(pid);
                 if r.success { println!("✓ Frozen PID {pid}"); }
                 else { eprintln!("✗ Failed: {}", r.error.unwrap_or_default()); }
+                return;
             }
-            "unfreeze" => {
+            "unfreeze" if args.len() == 3 => {
+                let pid: u32 = match args[2].parse() {
+                    Ok(p) => p,
+                    Err(_) => { eprintln!("Error: PID must be a number"); return; }
+                };
                 let r = executor::freezer::unfreeze(pid);
                 if r.success { println!("✓ Unfrozen PID {pid}"); }
                 else { eprintln!("✗ Failed: {}", r.error.unwrap_or_default()); }
+                return;
             }
-            _ => eprintln!("Usage:\n  mgd freeze <pid>\n  mgd unfreeze <pid>"),
+            "freeze" | "unfreeze" => {
+                eprintln!("Usage: mgd {} <pid>", args[1]);
+                return;
+            }
+            other => {
+                eprintln!("mgd: unknown subcommand '{other}'\nUsage: mgd freeze <pid> | mgd unfreeze <pid>");
+                return;
+            }
         }
-        return;
     }
 
-    println!("Memory Guardian v0.2.0 — two-actor architecture");
+    cleanup_orphaned_snapshots();
+
+    println!("Memory Guardian v0.3.0 — two-actor architecture");
     println!("  PressureResponder: 5s poll (freeze/checkpoint/kill)");
     println!("  RecoveryManager:   3s poll (unfreeze/restore)");
+    println!("  IPC socket:        {}", lmkd_linux::socket_path().display());
     println!("Press Ctrl+C to stop\n");
 
     let frozen = Arc::new(Mutex::new(FrozenRegistry::new()));
     let checkpointed = Arc::new(Mutex::new(CheckpointRegistry::new()));
 
-    // Install signal handler: SIGINT sets the atomic flag.
-    // AtomicBool::store with Relaxed compiles to a single `mov` on x86/ARM —
-    // async-signal-safe in practice on all Linux targets.
+    // ── Signal handlers ─────────────────────────────────────────────────────
+    // All three signal handlers are async-signal-safe: they only store to
+    // AtomicBool with Relaxed, which compiles to a single `mov` on x86/ARM.
     unsafe {
-        libc::signal(libc::SIGINT, handle_sigint as *const () as libc::sighandler_t);
+        libc::signal(libc::SIGINT,  handle_sigterm as *const () as libc::sighandler_t);
+        libc::signal(libc::SIGTERM, handle_sigterm as *const () as libc::sighandler_t);
+        libc::signal(libc::SIGHUP,  handle_sighup  as *const () as libc::sighandler_t);
     }
 
+    // ── Actor threads ────────────────────────────────────────────────────────
     let f1 = Arc::clone(&frozen);
     let c1 = Arc::clone(&checkpointed);
-    let responder = thread::spawn(move || responder::run(f1, c1));
+    let responder = thread::spawn(move || evictor::run(f1, c1));
 
     let f2 = Arc::clone(&frozen);
     let c2 = Arc::clone(&checkpointed);
     let recovery = thread::spawn(move || recovery::run(f2, c2));
 
-    // Block until both actors exit (they check should_shutdown() each iteration)
+    let f3 = Arc::clone(&frozen);
+    let c3 = Arc::clone(&checkpointed);
+    let ipc = thread::spawn(move || ipc::run_server(f3, c3));
+
+    // Block until both main actors exit (they check should_shutdown() each iteration)
     let _ = responder.join();
     let _ = recovery.join();
+    let _ = ipc.join();
 
     // Final unfreeze sweep — no race: both actors are done, no new freezes possible
     shutdown_unfreeze(&frozen);
+}
+
+/// Remove any snapshot directories left behind by a previous daemon crash.
+/// CheckpointRegistry is in-memory only — orphaned snapshots would never be cleaned
+/// up otherwise, leaking potentially hundreds of MB across restarts.
+fn cleanup_orphaned_snapshots() {
+    let dir = util::home_dir().join(".local/share/mgd/snapshots");
+    let Ok(entries) = std::fs::read_dir(&dir) else { return };
+    for entry in entries.flatten() {
+        if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            if std::fs::remove_dir_all(entry.path()).is_ok() {
+                output::locked_print(&format!("[startup] Removed orphaned snapshot: {:?}", entry.path()));
+            }
+        }
+    }
 }
 
 /// Unfreeze all processes still in the registry after both actors have stopped.
@@ -96,6 +143,12 @@ fn shutdown_unfreeze(frozen: &Arc<Mutex<FrozenRegistry>>) {
     output::locked_print("[shutdown] Done.");
 }
 
-extern "C" fn handle_sigint(_: libc::c_int) {
+/// SIGINT / SIGTERM → graceful shutdown with unfreeze sweep
+extern "C" fn handle_sigterm(_: libc::c_int) {
     SHUTDOWN.store(true, Ordering::Relaxed);
+}
+
+/// SIGHUP → reload config on next responder cycle
+extern "C" fn handle_sighup(_: libc::c_int) {
+    RELOAD_CONFIG.store(true, Ordering::Relaxed);
 }

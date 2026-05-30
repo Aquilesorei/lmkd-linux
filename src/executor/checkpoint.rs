@@ -22,8 +22,15 @@ pub struct RestoreResult {
 /// Checkpoint a process using CRIU — save state to disk and kill it.
 /// Falls back to SIGSTOP if CRIU fails.
 pub fn checkpoint(pid: u32, name: &str) -> CheckpointResult {
+    // Sanitize comm name: kernel allows '/' in prctl-set names, which would escape
+    // the snapshots directory. Replace any non-alphanumeric char with '_'.
+    let safe_name: String = name
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '_' })
+        .take(32)
+        .collect();
     let snapshot_dir = crate::util::home_dir()
-        .join(format!(".local/share/mgd/snapshots/{}_{}", pid, name));
+        .join(format!(".local/share/mgd/snapshots/{}_{}", pid, safe_name));
 
     if let Err(e) = fs::create_dir_all(&snapshot_dir) {
         return CheckpointResult {

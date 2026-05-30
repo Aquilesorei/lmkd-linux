@@ -20,6 +20,12 @@ pub fn run(
 
     loop {
         if crate::should_shutdown() { return; }
+
+        // SIGHUP: reload config before the next decision cycle
+        if crate::should_reload() {
+            crate::config::reload();
+        }
+
         let pressure = match monitor::psi::read_pressure() {
             Ok(p) => p,
             Err(e) => {
@@ -133,11 +139,12 @@ fn execute_decision(
 }
 
 fn execute_freeze(d: &Decision, frozen: &Arc<Mutex<FrozenRegistry>>) -> String {
-    let st = crate::executor::read_start_time(d.pid);
-    let r = match st {
-        Some(t) => crate::executor::freezer::freeze_checked(d.pid, t),
-        None => crate::executor::freezer::freeze(d.pid),
+    // Read start_time first — if it's gone, abort rather than freeze a recycled PID.
+    let st = match crate::executor::read_start_time(d.pid) {
+        Some(t) => t,
+        None => return "aborted: process vanished before freeze".into(),
     };
+    let r = crate::executor::freezer::freeze_checked(d.pid, st);
     if r.success {
         if frozen.lock().unwrap().add(d.pid, &d.name) {
             "frozen".into()
@@ -151,9 +158,11 @@ fn execute_freeze(d: &Decision, frozen: &Arc<Mutex<FrozenRegistry>>) -> String {
 }
 
 fn execute_terminate(d: &Decision) -> String {
-    let r = crate::executor::killer::terminate(d.pid);
-    if r.success { "terminated".into() }
-    else { format!("fail: {}", r.error.unwrap_or_default()) }
+    // Spawn the blocking SIGTERM→wait→SIGKILL sequence on a background thread so
+    // the responder isn't stalled for up to 5s per process at Critical pressure.
+    let pid = d.pid;
+    std::thread::spawn(move || { crate::executor::killer::terminate(pid); });
+    "terminating (async SIGTERM→SIGKILL)".into()
 }
 
 fn execute_kill(d: &Decision) -> String {

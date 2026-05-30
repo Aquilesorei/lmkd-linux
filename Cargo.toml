@@ -1,15 +1,22 @@
 [package]
 name = "lmkd-linux"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2024"
 description = "Proactive low-memory killer daemon for Linux desktop"
 repository = "https://github.com/Aquilesorei/lmkd-linux"
 license = "GPL-2.0"
 authors = ["Caleb Zongo <your@email.com>"]
 
+[lib]
+path = "src/lib.rs"
+
 [[bin]]
 name = "mgd"
 path = "src/main.rs"
+
+[[bin]]
+name = "mgctl"
+path = "src/mgctl.rs"
 
 [dependencies]
 libc  = "0.2"

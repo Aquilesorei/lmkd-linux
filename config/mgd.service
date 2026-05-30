@@ -6,8 +6,12 @@ PartOf=graphical-session.target
 [Service]
 Type=simple
 ExecStart=%h/.local/bin/mgd
+ExecReload=%h/.local/bin/mgctl reload
 Restart=on-failure
 RestartSec=5
+# Give mgd time to unfreeze all processes before systemd force-kills it
+TimeoutStopSec=10
+KillSignal=SIGTERM
 
 [Install]
 WantedBy=graphical-session.target

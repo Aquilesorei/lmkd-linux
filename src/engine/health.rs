@@ -28,8 +28,8 @@ impl HealthBaseline {
     pub fn safe_to_restore(&self, available_kb: u64, total_kb: u64, process_rss_kb: u64) -> bool {
         let after_kb = available_kb.saturating_sub(process_rss_kb);
         if self.samples < 10 {
-            // Not enough data — use conservative 30% of total
-            after_kb > total_kb * 30 / 100
+            // Not enough data — use conservative 10% of total
+            after_kb > total_kb * 10 / 100
         } else {
             after_kb as f64 > self.avg_available_kb * 0.85
         }
