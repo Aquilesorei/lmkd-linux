@@ -131,10 +131,22 @@ mgctl list                # list all currently frozen processes
 mgctl unfreeze firefox    # manually unfreeze by name (substring match)
 mgctl unfreeze 12345      # manually unfreeze by PID
 mgctl reload              # hot-reload config without restarting daemon (SIGHUP)
+
+mgctl restart             # restart the mgd service
+mgctl start | stop        # start / stop the mgd service
+mgctl service             # systemd unit state (active, PID, uptime, memory)
+mgctl logs                # last 50 daemon log lines
+mgctl logs -f             # follow daemon logs live
 ```
 
-`mgctl` talks to the running daemon via a Unix domain socket at
-`$XDG_RUNTIME_DIR/mgd.sock` (fallback: `/tmp/mgd-<uid>.sock`).
+`status`, `list`, `unfreeze`, and `reload` talk to the running daemon via a Unix
+domain socket at `$XDG_RUNTIME_DIR/mgd.sock` (fallback: `/tmp/mgd-<uid>.sock`).
+The lifecycle commands (`restart`/`start`/`stop`/`service`/`logs`) wrap
+`systemctl --user` / `journalctl --user` — they work even when the daemon is
+down, which the socket commands cannot.
+
+> `mgctl status` is the daemon's live view (pressure, frozen counts); `mgctl
+> service` is the systemd unit view (active state, PID, uptime).
 
 ### Signals
 | Signal | Effect |
