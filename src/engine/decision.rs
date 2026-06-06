@@ -97,20 +97,49 @@ pub fn plan(
     // Sort candidates: highest priority number first (least important first)
     // Filter out tiny processes — not worth the overhead.
     // Include swap in the size check: a mostly-swapped process is still reclaimable.
-    let mut candidates: Vec<(u8, &Process)> = procs.iter()
+    //
+    // GPU-aware ranking (Phase 1, sort-key ONLY): at High+ pressure, factor each
+    // candidate's RESIDENT GPU memory into the sort key. On UMA (Intel Iris Xe)
+    // GPU buffers are backed by system RAM but are absent from VmRSS, so a
+    // GPU-heavy / RSS-light process would otherwise rank too low to be picked.
+    // Gated to High+ for two reasons:
+    //   (1) correctness — below High the evictor only FREEZES (SIGSTOP), which
+    //       does NOT release resident GPU buffers; GPU footprint predicts reclaim
+    //       only on kill, and kills don't happen until High;
+    //   (2) cost — the fdinfo read is per-fd (a browser GPU proc has many fds),
+    //       so we pay it only when it can change a kill decision.
+    //
+    // CRITICAL: the GPU figure feeds the SORT COMPARATOR ONLY. It must never be
+    // credited toward the deficit (below): resident GPU is double-counted across
+    // processes that share buffers with the compositor, so crediting it would
+    // over-estimate freed RAM and make mgd under-kill — the exact failure mgd
+    // exists to prevent. The deficit loop subtracts `proc.rss_kb` and nothing else.
+    let count_gpu = *level >= PressureLevel::High;
+
+    // (priority, sort_footprint_kb, &Process). sort_footprint = rss + gpu(High+);
+    // gpu is read once per candidate here, so plan() never re-reads fdinfo.
+    let mut candidates: Vec<(u8, u64, &Process)> = procs.iter()
         .filter(|p| p.rss_kb + p.swap_kb > 10 * 1024) // ignore processes using < 10MB total
-        .map(|p| (cfg.priority_for(&p.name, p.exe_basename.as_deref()), *p))
+        .map(|p| {
+            let prio = cfg.priority_for(&p.name, p.exe_basename.as_deref());
+            let gpu_kb = if count_gpu {
+                crate::monitor::gpu::process_gpu_kb(p.pid).unwrap_or(0)
+            } else {
+                0
+            };
+            (prio, p.rss_kb.saturating_add(gpu_kb), *p)
+        })
         .collect();
 
-    candidates.sort_by(|(pa, a), (pb, b)| {
+    candidates.sort_by(|(pa, fa, a), (pb, fb, b)| {
         pb.cmp(pa)
-            .then(b.rss_kb.cmp(&a.rss_kb))
+            .then(fb.cmp(fa)) // effective footprint (rss + resident GPU) — SORT ONLY
             .then(b.oom_score.cmp(&a.oom_score))
     });
 
     let mut decisions = vec![];
 
-    for (prio, proc) in candidates {
+    for (prio, _sort_footprint_kb, proc) in candidates {
         if deficit <= 0 {
             break;
         }
@@ -322,6 +351,24 @@ mod tests {
         let procs = vec![proc("tiny", 5_000, 0)];
         let decisions = plan(&PressureLevel::Emergency, &procs.iter().collect::<Vec<_>>(), 500_000, 16_000_000);
         assert!(decisions.is_empty());
+    }
+
+    #[test]
+    fn high_pressure_deficit_credits_rss_only() {
+        // Phase 1 guard: GPU-aware ranking must NOT leak into the deficit. With
+        // no GPU memory available for these synthetic PIDs, behavior at High is
+        // identical to RSS-only: two expendable procs, deficit covered by RSS.
+        // deficit = 16M*0.15 - 1M = 1.4M KB; first 2M terminate covers it.
+        let procs = vec![
+            proc("msedge", 2_000_000, 0),
+            proc("msedge", 2_000_000, 0),
+        ];
+        let decisions = plan(&PressureLevel::High, &procs.iter().collect::<Vec<_>>(), 1_000_000, 16_000_000);
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].action, Action::Terminate);
+        // The single decision credits exactly its RSS (2_000_000 KB / 1024 =
+        // 1953 MB), proving the sort footprint never reached the deficit.
+        assert_eq!(decisions[0].rss_mb as u64, 1953);
     }
 
     #[test]
