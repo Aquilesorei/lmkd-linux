@@ -43,6 +43,19 @@ rss_threshold_mb = 400            # only reap when above this RSS
 idle_check_secs = 60             # CPU-idle sample window before reaping
 cooldown_min = 30                # cooldown floor between reaps
 
+# ── zram compaction ──────────────────────────────────────────────────────────
+# zram keeps swapped-out pages compressed in RAM, but its allocator fragments
+# over time — freed slots aren't coalesced, so the pool holds more RAM than its
+# live data needs. At Elevated pressure (or higher) mgd writes to the zram
+# `compact` sysfs node to repack live objects and release empty pages back to
+# the system, BEFORE freezing or killing any process. Cheap (~100ms) and
+# non-destructive. Needs the opt-in sysfs grant (packaging/mgd-zram.conf, see
+# docs/PRIVILEGE_DESIGN.md §1); without it mgd logs "unavailable" once and skips.
+# Enabled by default.
+[zram]
+compact_on_elevated = true
+min_used_mb = 128                 # skip compaction when the pool holds less
+
 # ── Firefox preventive-memory watcher ────────────────────────────────────────
 # Firefox never releases RSS after tabs close. When enabled, mgd nudges Firefox's
 # internal GC via SIGUSR1 (non-disruptive — Firefox keeps running) once total RSS

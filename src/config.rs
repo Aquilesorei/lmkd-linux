@@ -43,6 +43,8 @@ struct RawConfig {
     #[serde(default)]
     plasma_discover: PlasmaDiscover,
     #[serde(default)]
+    zram: Zram,
+    #[serde(default)]
     firefox: Firefox,
 }
 
@@ -78,6 +80,32 @@ fn default_pd_watch() -> bool { true }
 fn default_pd_threshold() -> u64 { 400 }
 fn default_pd_idle() -> u64 { 60 }
 fn default_pd_cooldown() -> u64 { 30 }
+
+/// Optional zram compaction. When pressure reaches Elevated (or higher), mgd
+/// repacks the zram pool to release fragmented-but-empty pages back to RAM
+/// before touching any process — a cheap (~100ms) system pre-action that needs
+/// no privileged binary, only the opt-in sysfs grant (see PRIVILEGE_DESIGN §1).
+/// Skipped when the pool holds less than `min_used_mb` (not worth the walk).
+/// Enabled by default — it is non-destructive and never touches a process.
+#[derive(Deserialize)]
+struct Zram {
+    #[serde(default = "default_zram_compact")]
+    compact_on_elevated: bool,
+    #[serde(default = "default_zram_min_used")]
+    min_used_mb: u64,
+}
+
+impl Default for Zram {
+    fn default() -> Self {
+        Zram {
+            compact_on_elevated: default_zram_compact(),
+            min_used_mb: default_zram_min_used(),
+        }
+    }
+}
+
+fn default_zram_compact() -> bool { true }
+fn default_zram_min_used() -> u64 { 128 }
 
 /// Optional Firefox preventive-memory watcher. Disabled unless `watch_memory = true`.
 /// Runs only at PressureLevel::Normal — see evictor::check_firefox_memory.
@@ -190,6 +218,11 @@ pub struct CompiledConfig {
     pub pd_idle_check_secs: u64,
     /// Minimum seconds between plasma-discover reaps (cooldown floor).
     pub pd_cooldown_secs: u64,
+    /// zram compaction pre-action — on unless disabled in [zram]. Runs when
+    /// pressure is Elevated or higher, before any process is touched.
+    pub compact_zram_on_elevated: bool,
+    /// Skip zram compaction when the pool holds less than this many MB.
+    pub zram_min_used_mb: u64,
     /// Firefox preventive-memory watcher — off unless enabled in [firefox].
     pub watch_firefox: bool,
     pub firefox_rss_threshold_mb: u64,
@@ -304,6 +337,8 @@ fn compile(content: &str) -> Result<CompiledConfig, String> {
         pd_rss_threshold_mb: raw.plasma_discover.rss_threshold_mb,
         pd_idle_check_secs: raw.plasma_discover.idle_check_secs,
         pd_cooldown_secs: raw.plasma_discover.cooldown_min.saturating_mul(60),
+        compact_zram_on_elevated: raw.zram.compact_on_elevated,
+        zram_min_used_mb: raw.zram.min_used_mb,
         watch_firefox: raw.firefox.watch_memory,
         firefox_rss_threshold_mb: raw.firefox.rss_threshold_mb,
         firefox_gc_cooldown_secs: raw.firefox.gc_cooldown_min.saturating_mul(60),

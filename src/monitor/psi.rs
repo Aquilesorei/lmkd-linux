@@ -15,7 +15,9 @@ pub struct MemoryPressure {
     pub full_total: u64,
 }
 
-#[derive(Debug, PartialEq, Clone)]
+/// Variants are declared in ascending severity order, so the derived
+/// `PartialOrd`/`Ord` lets callers gate on `level >= PressureLevel::Elevated`.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone)]
 pub enum PressureLevel {
     Normal,
     Elevated,
