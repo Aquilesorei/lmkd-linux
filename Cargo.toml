@@ -18,6 +18,13 @@ path = "src/main.rs"
 name = "mgctl"
 path = "src/mgctl.rs"
 
+# Privileged swap-reclaim helper (Phase 3). Built unprivileged; gains
+# CAP_SYS_ADMIN only via `setcap` at install time (opt-in). Self-contained —
+# depends only on libc, takes no argv/env, makes no subprocess.
+[[bin]]
+name = "mgd-zram-reclaim"
+path = "src/bin/mgd-zram-reclaim.rs"
+
 [dependencies]
 libc  = "0.2"
 serde = { version = "1", features = ["derive"] }

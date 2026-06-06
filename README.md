@@ -34,8 +34,9 @@ Real memory pressure event on a 16GB system:
   were caught and frozen as they appeared.
 - **t+51s** — Killed the actual memory hog (a runaway node process, 580 MB).
   System recovered.
-- **t+71s** — Pressure dropped to Normal. All 30 frozen processes unfrozen
-  in a single cycle. No orphans.
+- **t+71s** — Pressure dropped to Normal. The 30 frozen processes were
+  unfrozen in staggered batches (capped per cycle, gated on RAM headroom)
+  over the next few cycles, avoiding a bounce back into pressure. No orphans.
 
 System stayed responsive throughout. No UI freeze, no compositor stutter, no reboot. Daemon RSS: ~6 MB.
 
@@ -68,6 +69,43 @@ Run as a systemd user service:
 cp config/mgd.service ~/.config/systemd/user/
 systemctl --user enable --now mgd.service
 ```
+
+### Optional privileged features (opt-in)
+
+mgd runs fully unprivileged out of the box. A few features need a small OS
+privilege; each is opt-in and granted to a file on disk (not to the daemon —
+`AmbientCapabilities=` does not work for a `--user` service). The `mgd` group
+gates who may use them. Full rationale: [docs/PRIVILEGE_DESIGN.md](docs/PRIVILEGE_DESIGN.md).
+
+```bash
+# one-time: create the group and add yourself (log out/in to take effect)
+sudo groupadd -f mgd
+sudo usermod -aG mgd "$USER"
+```
+
+zram compact (Fix 1 — no capability, sysfs group-write grant):
+```bash
+sudo install -m 0644 packaging/mgd-zram.conf /etc/tmpfiles.d/mgd-zram.conf
+sudo systemd-tmpfiles --create /etc/tmpfiles.d/mgd-zram.conf
+```
+
+CRIU checkpoint/restore without root (two narrow caps on the `criu` binary):
+```bash
+sudo setcap cap_checkpoint_restore,cap_sys_ptrace+ep "$(command -v criu)"
+# optional — only if you want live TCP connections (e.g. browsers) to survive
+# restore; widens the grant by one capability:
+sudo setcap cap_checkpoint_restore,cap_sys_ptrace,cap_net_admin+ep "$(command -v criu)"
+```
+
+> **Caveat:** a distro package update of `criu` **resets its file capabilities**.
+> Re-run the `setcap` above after upgrading criu, or mgd will fall back to
+> SIGKILL again (it logs the criu privilege failure with the exact command to
+> re-run).
+
+> Further grants are documented in `docs/PRIVILEGE_DESIGN.md`. Each step is
+> independent — skipping one disables only that feature; mgd logs it unavailable
+> at startup and continues. `./install.sh --privileged` applies all of these
+> automatically.
 
 ## Usage
 
@@ -149,10 +187,11 @@ session. System daemons (snapd, fwupd, root-owned services) are skipped
 by design — both because mgd lacks permission to signal them, and because
 its scope is deliberately limited to your session.
 
-Running mgd as root or with elevated capabilities is not recommended and
-not required for normal operation. CRIU checkpointing has reduced
-functionality without CAP_SYS_ADMIN; the daemon falls back to SIGKILL
-when checkpoint fails.
+Running mgd as root is not recommended and not required for normal
+operation. CRIU checkpointing works unprivileged once the `criu` binary
+is granted two narrow capabilities (`CAP_CHECKPOINT_RESTORE` +
+`CAP_SYS_PTRACE`) — **no root**. Without that grant the daemon simply
+falls back to SIGKILL when checkpoint fails. See the opt-in setup below.
 
 ## Roadmap
 
@@ -170,7 +209,6 @@ when checkpoint fails.
 - [x] Process protect list in config (`[[protect]]` entries)
 - [x] Per-process `checkpoint = true/false` override in config
 - [x] Log rotation (`log_keep` in config, default 10 files)
-- [ ] Wayland compositor focus detection
 - [ ] D-Bus notifications with Restore button
 - [ ] Kernel patches (PSI triggers, proactive swap-in, LRU hints)
 

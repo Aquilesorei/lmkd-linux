@@ -2,6 +2,62 @@ use std::process::Command;
 use std::fs;
 use std::io;
 use std::path::PathBuf;
+use std::sync::OnceLock;
+
+/// Standard absolute locations for the `criu` binary, probed in order. We never
+/// resolve criu via a `PATH` search: once the binary is capped
+/// (`cap_checkpoint_restore,cap_sys_ptrace+ep`), a PATH lookup would be a
+/// privilege-hijack vector — a `criu` planted earlier in `PATH` would run with
+/// those caps. All candidates are root-controlled absolute paths.
+const CRIU_CANDIDATES: &[&str] = &[
+    "/usr/sbin/criu",
+    "/usr/bin/criu",
+    "/sbin/criu",
+    "/bin/criu",
+    "/usr/local/sbin/criu",
+    "/usr/local/bin/criu",
+];
+
+/// Resolved absolute path to criu (probed once), or None if not installed.
+static CRIU_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
+
+/// Absolute path to the criu binary, resolved once from the fixed candidate
+/// list. None if criu is not installed. Never does a PATH search.
+pub fn criu_path() -> Option<&'static PathBuf> {
+    CRIU_PATH
+        .get_or_init(|| resolve_in(CRIU_CANDIDATES))
+        .as_ref()
+}
+
+/// First candidate path that exists and is executable, or None. Pure (takes the
+/// candidate list) so it is unit-testable without touching global state.
+fn resolve_in(candidates: &[&str]) -> Option<PathBuf> {
+    candidates
+        .iter()
+        .map(PathBuf::from)
+        .find(|p| is_executable(p))
+}
+
+/// True if `path` exists and is executable (access X_OK). No PATH search.
+fn is_executable(path: &std::path::Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(c) = std::ffi::CString::new(path.as_os_str().as_bytes()) else { return false };
+    unsafe { libc::access(c.as_ptr(), libc::X_OK) == 0 }
+}
+
+/// Heuristic: does this criu stderr indicate a privilege/capability shortfall
+/// (as opposed to a process-specific restore failure)? Used to give the user a
+/// targeted "run setcap" hint instead of a generic error. Inference-based so we
+/// avoid a libcap dependency just to read file caps.
+pub fn looks_like_privilege_error(stderr: &str) -> bool {
+    let s = stderr.to_ascii_lowercase();
+    s.contains("operation not permitted")
+        || s.contains("eperm")
+        || s.contains("cap_sys_ptrace")
+        || s.contains("cap_checkpoint_restore")
+        || s.contains("permission denied")
+        || (s.contains("ptrace") && s.contains("denied"))
+}
 
 #[derive(Debug)]
 #[allow(dead_code)]
@@ -53,7 +109,18 @@ pub fn checkpoint(pid: u32, name: &str) -> CheckpointResult {
         }
     };
 
-    let output = Command::new("criu")
+    // Resolve criu by absolute path (never PATH — the binary may be capped).
+    let Some(criu) = criu_path() else {
+        let _ = fs::remove_dir_all(&snapshot_dir);
+        return CheckpointResult {
+            pid,
+            success: false,
+            snapshot_dir: None,
+            error: Some("criu not found (install criu to enable checkpointing)".to_string()),
+        };
+    };
+
+    let output = Command::new(criu)
         .args([
             "dump",
             "--tree", &pid.to_string(),
@@ -93,11 +160,19 @@ pub fn checkpoint(pid: u32, name: &str) -> CheckpointResult {
             // CRIU failed — clean up partial snapshot, caller decides what to do
             let _ = fs::remove_dir_all(&snapshot_dir);
             let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+            let error = if looks_like_privilege_error(&stderr) {
+                format!(
+                    "criu lacks privilege (run: setcap cap_checkpoint_restore,cap_sys_ptrace+ep {}): {stderr}",
+                    criu.display()
+                )
+            } else {
+                stderr
+            };
             CheckpointResult {
                 pid,
                 success: false,
                 snapshot_dir: None,
-                error: Some(stderr),
+                error: Some(error),
             }
         }
         Err(e) => {
@@ -131,7 +206,14 @@ pub fn restore(snapshot_dir: &std::path::Path) -> RestoreResult {
         }
     };
 
-    let output = Command::new("criu")
+    let Some(criu) = criu_path() else {
+        return RestoreResult {
+            success: false,
+            error: Some("criu not found (install criu to enable restore)".to_string()),
+        };
+    };
+
+    let output = Command::new(criu)
         .args([
             "restore",
             "--images-dir", &snapshot_dir_str,
@@ -146,9 +228,18 @@ pub fn restore(snapshot_dir: &std::path::Path) -> RestoreResult {
         }
         Ok(out) => {
             let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+            let error = if looks_like_privilege_error(&stderr) {
+                format!(
+                    "criu restore lacks privilege (run: setcap cap_checkpoint_restore,cap_sys_ptrace+ep {}; \
+                     add cap_net_admin for --tcp-established): {stderr}",
+                    criu.display()
+                )
+            } else {
+                format!("CRIU restore failed: {stderr}")
+            };
             RestoreResult {
                 success: false,
-                error: Some(format!("CRIU restore failed: {stderr}")),
+                error: Some(error),
             }
         }
         Err(e) => {
@@ -157,5 +248,47 @@ pub fn restore(snapshot_dir: &std::path::Path) -> RestoreResult {
                 error: Some(format!("Failed to run criu: {e}")),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_in_finds_first_executable() {
+        // /bin/sh exists and is executable on any POSIX system; a bogus path
+        // before it must be skipped, and the real one returned.
+        let candidates = ["/nonexistent/criu", "/bin/sh"];
+        assert_eq!(resolve_in(&candidates), Some(PathBuf::from("/bin/sh")));
+    }
+
+    #[test]
+    fn resolve_in_none_when_all_absent() {
+        let candidates = ["/nope/a", "/nope/b"];
+        assert_eq!(resolve_in(&candidates), None);
+    }
+
+    #[test]
+    fn resolve_in_respects_order() {
+        // Two real executables — the earlier candidate wins.
+        let candidates = ["/bin/sh", "/bin/cat"];
+        assert_eq!(resolve_in(&candidates), Some(PathBuf::from("/bin/sh")));
+    }
+
+    #[test]
+    fn resolve_in_empty_is_none() {
+        assert_eq!(resolve_in(&[]), None);
+    }
+
+    #[test]
+    fn privilege_error_detection() {
+        assert!(looks_like_privilege_error("Operation not permitted"));
+        assert!(looks_like_privilege_error("can't seize task: Operation not permitted"));
+        assert!(looks_like_privilege_error("Unable to ptrace: permission denied"));
+        assert!(looks_like_privilege_error("requires CAP_SYS_PTRACE"));
+        // A normal restore failure must NOT be flagged as a privilege issue.
+        assert!(!looks_like_privilege_error("Can't restore tcp connection: address in use"));
+        assert!(!looks_like_privilege_error("image file not found"));
     }
 }

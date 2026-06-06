@@ -15,13 +15,30 @@ pub struct MemoryPressure {
     pub full_total: u64,
 }
 
-#[derive(Debug, PartialEq, Clone)]
+/// Variants are declared in ascending severity order, so the derived
+/// `PartialOrd`/`Ord` lets callers gate on `level >= PressureLevel::Elevated`.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone)]
 pub enum PressureLevel {
     Normal,
     Elevated,
     High,
     Critical,
     Emergency,
+}
+
+impl PressureLevel {
+    /// Parse a config trigger level (case-insensitive). Returns None for an
+    /// unrecognised string so the caller can fall back to a default + warn.
+    pub fn parse(s: &str) -> Option<PressureLevel> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "normal" => Some(PressureLevel::Normal),
+            "elevated" => Some(PressureLevel::Elevated),
+            "high" => Some(PressureLevel::High),
+            "critical" => Some(PressureLevel::Critical),
+            "emergency" => Some(PressureLevel::Emergency),
+            _ => None,
+        }
+    }
 }
 
 impl std::fmt::Display for PressureLevel {
@@ -136,6 +153,14 @@ mod tests {
         assert_eq!(p.some_avg10, 0.0);
         assert_eq!(p.some_total, 133033584);
         assert_eq!(p.full_avg300, 0.04);
+    }
+
+    #[test]
+    fn test_parse_pressure_level_str() {
+        assert_eq!(PressureLevel::parse("High"), Some(PressureLevel::High));
+        assert_eq!(PressureLevel::parse("  elevated "), Some(PressureLevel::Elevated));
+        assert_eq!(PressureLevel::parse("EMERGENCY"), Some(PressureLevel::Emergency));
+        assert_eq!(PressureLevel::parse("nonsense"), None);
     }
 
     #[test]

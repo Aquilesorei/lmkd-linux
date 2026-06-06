@@ -17,6 +17,117 @@
 
 [defaults]
 priority = 50
+
+# ── plasmashell GPU-leak watcher (KDE Plasma + Intel UMA) ────────────────────
+# On Intel Iris Xe (unified memory), GPU allocations come from system RAM, and
+# plasmashell is known to leak GPU memory over days of uptime, reducing available
+# RAM. When enabled, mgd reads plasmashell's per-process GPU residency from
+# /proc/PID/fdinfo (no root, no extra tools) and restarts it via kquitapp6+kstart
+# once it crosses the threshold. Disabled by default.
+[plasma]
+watch_gpu_leak = false
+gpu_leak_threshold_mb = 1024      # restart when plasmashell GPU mem exceeds this
+min_restart_interval_min = 30     # cooldown floor: never restart more often
+
+# ── plasma-discover idle-reap watcher ────────────────────────────────────────
+# plasma-discover (KDE's package manager) should be a lightweight background
+# service but accumulates RAM + GPU buffers over time and is non-critical. When
+# enabled, mgd checks it only while the system is calm (Normal pressure): if it
+# is over the RSS threshold AND has burned no CPU across a short sample window
+# (idle), mgd SIGTERMs it. KDE relaunches it on demand, so there is no
+# user-visible cost. Runs on the maintenance thread (the idle sample blocks).
+# Enabled by default.
+[plasma_discover]
+watch_memory = true
+rss_threshold_mb = 400            # only reap when above this RSS
+idle_check_secs = 60             # CPU-idle sample window before reaping
+cooldown_min = 30                # cooldown floor between reaps
+
+# ── zram compaction ──────────────────────────────────────────────────────────
+# zram keeps swapped-out pages compressed in RAM, but its allocator fragments
+# over time — freed slots aren't coalesced, so the pool holds more RAM than its
+# live data needs. At Elevated pressure (or higher) mgd writes to the zram
+# `compact` sysfs node to repack live objects and release empty pages back to
+# the system, BEFORE freezing or killing any process. Cheap (~100ms) and
+# non-destructive. Needs the opt-in sysfs grant (packaging/mgd-zram.conf, see
+# docs/PRIVILEGE_DESIGN.md §1); without it mgd logs "unavailable" once and skips.
+# Enabled by default.
+[zram]
+compact_on_elevated = true
+min_used_mb = 128                 # skip compaction when the pool holds less
+
+# ── proactive swap reclaim (PRIVILEGED, opt-in) ──────────────────────────────
+# After a pressure spike subsides, compressed pages sit in zram even when RAM is
+# free. When the system is calm, mgd can pull them all back by cycling the zram
+# swap device (swapoff/swapon) via the capped helper `mgd-zram-reclaim`. This
+# needs CAP_SYS_ADMIN, so it is PRIVILEGED and OFF by default — enable only after
+# installing the helper (see docs/PRIVILEGE_DESIGN.md §2):
+#   sudo install -m 0750 -o root -g mgd target/release/mgd-zram-reclaim /usr/local/bin/
+#   sudo setcap cap_sys_admin+ep /usr/local/bin/mgd-zram-reclaim
+# All safety gates live in the daemon. The decompressed-headroom gate is the
+# critical one: zram stores COMPRESSED pages that expand 2-3× on the way back
+# into RAM, so mgd refuses to reclaim unless MemAvailable exceeds the estimated
+# decompressed footprint times `decompressed_headroom_mult` — otherwise the
+# reclaim itself could OOM the box. Runs on the maintenance thread.
+[reclaim]
+proactive_swap_reclaim = false    # PRIVILEGED — leave off until helper installed
+threshold_pct = 30                # only reclaim when swap is at least this full
+cooldown_min = 10                 # cooldown floor between reclaim cycles
+min_zram_used_mb = 2048           # skip when the pool holds less compressed RAM
+decompressed_headroom_mult = 1.5  # OOM guard: avail must exceed decompressed × this
+
+# ── page-cache drop before freeze ────────────────────────────────────────────
+# Under pressure the kernel often evicts app pages to swap while keeping file
+# cache (build artifacts, node_modules, browser cache) that won't be read again
+# until the next build. At `trigger_level` pressure or higher, BEFORE freezing
+# any process, mgd advises the kernel to drop page cache for the listed trees
+# via posix_fadvise(DONTNEED). Surgical (only these trees, never a global
+# drop_caches), no privilege (your own files), non-destructive (clean pages drop
+# immediately; dirty pages are written back first — no data loss).
+#
+# Paths support a leading ~ and a single * per path segment (e.g. ~/proj/*/target).
+# `paths` is empty by default, so this is a no-op until you list directories.
+[cache_drop]
+enabled = true
+trigger_level = "High"            # Normal | Elevated | High | Critical | Emergency
+cooldown_min = 5                  # cooldown floor between cache-drop walks
+paths = [
+    # "~/RustroverProjects/*/target",
+    # "~/WebstormProjects/*/node_modules/.cache",
+    # "~/.cache/JetBrains",
+]
+
+# ── Firefox preventive-memory watcher ────────────────────────────────────────
+# Firefox never releases RSS after tabs close. When enabled, mgd nudges Firefox's
+# internal GC via SIGUSR1 (non-disruptive — Firefox keeps running) once total RSS
+# (main + content processes) crosses the threshold. Runs ONLY when the system is
+# healthy (Normal pressure); under any pressure the evictor handles Firefox tabs
+# via the priority system instead. Never restarts Firefox. Disabled by default.
+[firefox]
+watch_memory = false
+rss_threshold_mb = 3072           # trigger GC above this total RSS
+gc_cooldown_min = 15              # cooldown floor between GC attempts
+warn_threshold_mb = 4096          # log a warning above this (no action taken)
+
+# ── XDG desktop category fallback ────────────────────────────────────────────
+# Applied when a process isn't matched by any [[apps]] regex.
+# mgd reads /proc/PID/exe to get the untruncated binary name, looks it up in
+# /usr/share/applications/ and ~/.local/share/applications/, and uses the first
+# matching category below. Remove a key to exclude that category from fallback.
+[category_priorities]
+Game        = 30
+Development = 42
+Office      = 52
+Science     = 52
+Education   = 52
+Graphics    = 50
+Network     = 58
+System      = 58
+Settings    = 60
+AudioVideo  = 62
+Audio       = 62
+Video       = 60
+Utility     = 65
 # Keep this many log files in ~/memlogs/ — oldest are deleted on startup.
 # Set to 0 to disable rotation (keep all files forever).
 log_keep = 10

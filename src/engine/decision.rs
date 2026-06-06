@@ -55,14 +55,10 @@ pub struct Decision {
 }
 
 /// Priority tier based on process name — delegates to loaded config.
+/// Falls back to .desktop category lookup via exe_basename if no regex matches.
 /// Returns 0–100 (higher = kill first).
-pub fn get_priority(name: &str) -> u8 {
-    crate::config::get().priority_for(name)
-}
-
-/// Returns true if this process is on the user's protect list.
-pub fn is_protected(name: &str) -> bool {
-    crate::config::get().is_protected(name)
+pub fn get_priority(name: &str, exe_basename: Option<&str>) -> u8 {
+    crate::config::get().priority_for(name, exe_basename)
 }
 
 /// Calculate how much RAM we need to free (in KB)
@@ -95,12 +91,15 @@ pub fn plan(
         return vec![];
     }
 
+    // Acquire config once for the entire plan() call — avoids O(n) lock cycles.
+    let cfg = crate::config::get();
+
     // Sort candidates: highest priority number first (least important first)
-    // Filter out tiny processes — not worth the overhead
-    // We pre-calculate priorities to avoid expensive regex matching during sorting.
+    // Filter out tiny processes — not worth the overhead.
+    // Include swap in the size check: a mostly-swapped process is still reclaimable.
     let mut candidates: Vec<(u8, &Process)> = procs.iter()
-        .filter(|p| p.rss_kb > 10 * 1024) // ignore processes using < 10MB
-        .map(|p| (get_priority(&p.name), *p))
+        .filter(|p| p.rss_kb + p.swap_kb > 10 * 1024) // ignore processes using < 10MB total
+        .map(|p| (cfg.priority_for(&p.name, p.exe_basename.as_deref()), *p))
         .collect();
 
     candidates.sort_by(|(pa, a), (pb, b)| {
@@ -122,7 +121,7 @@ pub fn plan(
         }
 
         // Hard rule 2: never touch user-configured protect list
-        if is_protected(&proc.name) {
+        if cfg.is_protected(&proc.name) {
             continue;
         }
 
@@ -134,7 +133,7 @@ pub fn plan(
         };
 
         // Per-process checkpoint override from config
-        let checkpoint_override = crate::config::get().checkpoint_override(&proc.name);
+        let checkpoint_override = cfg.checkpoint_override(&proc.name);
         let action = decide_action(level, prio, swap_ratio, checkpoint_override);
 
         // Skip no-ops — don't waste a decision slot or count toward deficit
@@ -150,10 +149,15 @@ pub fn plan(
             deficit as f64 / 1024.0,
         );
 
-        // Freeze doesn't actually free RAM — only count 25% (kernel may reclaim some)
-        // Kill/Terminate/Checkpoint free the full RSS
+        // Freeze frees no RAM directly — SIGSTOP only stops the process from
+        // allocating/re-faulting; any reclaim is indirect and handled by the
+        // kernel later. So it must NOT count toward the deficit, otherwise we'd
+        // believe memory was freed when none was. Expendable processes are still
+        // frozen (to stop the bleeding); we just don't let that close the loop.
+        // Kill/Terminate/Checkpoint free the full RSS within this cycle; the next
+        // 5s cycle re-measures available_kb, so any terminate lag self-corrects.
         let freed = match action {
-            Action::Freeze => proc.rss_kb as i64 / 4,
+            Action::Freeze => 0,
             _ => proc.rss_kb as i64,
         };
         deficit -= freed;
@@ -234,7 +238,7 @@ mod tests {
     use super::*;
 
     fn proc(name: &str, rss_kb: u64, swap_kb: u64) -> Process {
-        Process { pid: 1000, name: name.to_string(), rss_kb, swap_kb, oom_score: 0 }
+        Process { pid: 1000, name: name.to_string(), exe_basename: None, rss_kb, swap_kb, oom_score: 0 }
     }
 
     #[test]
@@ -295,19 +299,22 @@ mod tests {
     }
 
     #[test]
-    fn freeze_counts_less_toward_deficit() {
-        // 4 processes at 200MB each. Freeze counts 25% = 50MB each.
-        // deficit = 16M*0.15 - 1M = 1.4M KB = ~1400MB needed
-        // At 50MB credit per freeze, need many more freezes than kills
+    fn freeze_does_not_count_toward_deficit() {
+        // Freeze frees no RAM, so it never reduces the deficit. Even a tiny
+        // deficit must not stop us short: ALL expendable processes get frozen
+        // ("stop the bleeding"), and the next cycle re-measures whether PSI dropped.
         let procs = vec![
             proc("baloo_file_extractor", 200_000, 0),
             proc("baloo_file_extractor", 200_000, 0),
             proc("baloo_file_extractor", 200_000, 0),
             proc("baloo_file_extractor", 200_000, 0),
         ];
-        let decisions = plan(&PressureLevel::Elevated, &procs.iter().collect::<Vec<_>>(), 1_000_000, 16_000_000);
-        // All 4 should be frozen since 4*50MB = 200MB < 1400MB deficit
+        // available just 1MB below target → tiny deficit a single 200MB process
+        // would have "covered" under the old 25% credit. All 4 must still freeze.
+        let target = 16_000_000 * 15 / 100;
+        let decisions = plan(&PressureLevel::Elevated, &procs.iter().collect::<Vec<_>>(), target as u64 - 1024, 16_000_000);
         assert_eq!(decisions.len(), 4);
+        assert!(decisions.iter().all(|d| d.action == Action::Freeze));
     }
 
     #[test]

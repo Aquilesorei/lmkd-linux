@@ -1,7 +1,8 @@
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::sync_print;
 use crate::engine::decision::{Action, Decision, plan, get_priority};
@@ -12,12 +13,29 @@ use crate::monitor::meminfo::MemInfo;
 use crate::monitor::process::Process;
 use crate::monitor::psi::PressureLevel;
 
+/// Unix-seconds of the last plasmashell restart (0 = never). Cooldown floor state
+/// for the GPU-leak watcher; mirrors the AtomicBool pattern used in main.rs.
+static LAST_PLASMA_RESTART: AtomicU64 = AtomicU64::new(0);
+
+/// Unix-seconds of the last Firefox GC trigger (0 = never). Cooldown floor for the
+/// preventive Firefox watcher.
+static LAST_FIREFOX_GC: AtomicU64 = AtomicU64::new(0);
+
+/// Set once if zram compaction fails with EACCES (the opt-in sysfs grant is
+/// absent). The feature is then disabled for the rest of the session so a
+/// missing grant logs exactly once instead of every pressure cycle.
+static ZRAM_COMPACT_DISABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Unix-seconds of the last page-cache drop (0 = never). Cooldown floor for the
+/// Phase 4 cache-drop pre-action.
+static LAST_CACHE_DROP: AtomicU64 = AtomicU64::new(0);
+
 pub fn run(
     frozen: Arc<Mutex<FrozenRegistry>>,
     checkpointed: Arc<Mutex<CheckpointRegistry>>,
+    log: Arc<Logger>,
 ) {
-    let log = Logger::new();
-
     loop {
         if crate::should_shutdown() { return; }
 
@@ -43,6 +61,22 @@ pub fn run(
         procs.sort_by_key(|p| std::cmp::Reverse(p.rss_kb));
 
         print_status(&pressure, &effective_level, &procs, &meminfo, &frozen);
+
+        // Optional KDE Plasma GPU-leak watcher (gated behind [plasma] config).
+        check_plasma_gpu(&procs, &log);
+
+        // Optional Firefox preventive-memory watcher (gated behind [firefox] config).
+        // Pass effective_level so swap-escalated pressure also suppresses it.
+        check_firefox_memory(&procs, &effective_level, &log);
+
+        // System pre-action: at Elevated+ pressure, repack zram to release
+        // fragmented-but-empty pages back to RAM before touching any process.
+        compact_zram(&effective_level, &log);
+
+        // System pre-action: at High+ pressure, drop stale build/file cache for
+        // configured trees before freezing apps. Runs after zram compact so the
+        // cheaper reclaim happens first; both run before plan().
+        check_cache_drop(&effective_level, &log);
 
         // Fix 1: exclude already-frozen PIDs from plan so their RSS isn't
         // double-counted toward deficit, which would cause underkill.
@@ -83,6 +117,224 @@ fn escalate_for_swap(level: &PressureLevel, m: &MemInfo) -> PressureLevel {
     }
 }
 
+/// KDE Plasma + Intel UMA workaround: plasmashell leaks GPU memory (allocated from
+/// system RAM) over long uptimes. When it crosses the configured threshold and the
+/// cooldown has elapsed, restart it and log the reclaimed memory.
+///
+/// No-op unless `[plasma] watch_gpu_leak = true`. Reads GPU residency from fdinfo
+/// with no elevated privileges.
+fn check_plasma_gpu(procs: &[Process], log: &Logger) {
+    let (threshold_mb, cooldown_secs) = {
+        let cfg = crate::config::get();
+        if !cfg.watch_gpu_leak {
+            return;
+        }
+        (cfg.gpu_leak_threshold_mb, cfg.min_restart_interval_secs)
+    };
+
+    let Some(plasma) = procs.iter().find(|p| p.name == "plasmashell") else { return };
+
+    let Some(gpu_kb) = crate::monitor::gpu::process_gpu_kb(plasma.pid) else { return };
+    let before_mb = gpu_kb / 1024;
+    if before_mb <= threshold_mb {
+        return;
+    }
+
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let last = LAST_PLASMA_RESTART.load(Ordering::Relaxed);
+    if last != 0 && now.saturating_sub(last) < cooldown_secs {
+        return; // cooldown floor not elapsed
+    }
+
+    sync_print!("[plasma] plasmashell GPU mem {before_mb}MB > {threshold_mb}MB threshold — restarting");
+    if let Err(e) = crate::monitor::gpu::restart_plasmashell() {
+        // Don't arm the cooldown on failure, so a transient/missing-binary case
+        // isn't silently muted for the whole interval.
+        sync_print!("[plasma] restart skipped: {e}");
+        log.log(&LogEntry::new("RESTART", plasma.pid, "plasmashell", 0.0, &format!("skipped: {e}")));
+        return;
+    }
+
+    LAST_PLASMA_RESTART.store(now, Ordering::Relaxed);
+
+    // Re-read against the *new* plasmashell instance to report what was reclaimed.
+    let new_procs = crate::monitor::process::list_processes();
+    let new_plasma = new_procs.iter().find(|p| p.name == "plasmashell");
+    let pid = new_plasma.map(|p| p.pid).unwrap_or(plasma.pid);
+    let after_mb = new_plasma
+        .and_then(|p| crate::monitor::gpu::process_gpu_kb(p.pid))
+        .map(|kb| kb / 1024)
+        .unwrap_or(0);
+
+    log.log(&LogEntry::new(
+        "RESTART", pid, "plasmashell", 0.0,
+        &format!("gpu_leak_reclaimed {before_mb}MB→{after_mb}MB"),
+    ));
+}
+
+/// Firefox preventive-memory watcher. Runs ONLY at PressureLevel::Normal — under any
+/// pressure the evictor already manages Firefox content processes via the priority
+/// system, and the two must never act on Firefox concurrently. When healthy and RSS
+/// is high, nudges Firefox's internal GC via SIGUSR1 (non-disruptive, no restart).
+///
+/// No-op unless `[firefox] watch_memory = true`.
+fn check_firefox_memory(procs: &[Process], level: &PressureLevel, log: &Logger) {
+    let (rss_threshold_mb, warn_threshold_mb, cooldown_secs) = {
+        let cfg = crate::config::get();
+        if !cfg.watch_firefox {
+            return;
+        }
+        (cfg.firefox_rss_threshold_mb, cfg.firefox_warn_threshold_mb, cfg.firefox_gc_cooldown_secs)
+    };
+
+    // Preventive maintenance only: bail on any pressure. The evictor handles
+    // Firefox under pressure — never run both on Firefox at once.
+    if *level != PressureLevel::Normal {
+        return;
+    }
+
+    let (total_kb, _pids) = crate::monitor::firefox::firefox_total_rss_kb(procs);
+    let total_mb = total_kb / 1024;
+
+    // Warning is informational and always logged (no cooldown), independent of GC.
+    if total_mb >= warn_threshold_mb {
+        log.log(&LogEntry::new("WARN", 0, "firefox", total_mb as f64, "rss_above_warn_threshold"));
+    }
+
+    if total_mb < rss_threshold_mb {
+        return;
+    }
+
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let last = LAST_FIREFOX_GC.load(Ordering::Relaxed);
+    if last != 0 && now.saturating_sub(last) < cooldown_secs {
+        return; // GC cooldown not elapsed
+    }
+
+    match crate::monitor::firefox::trigger_firefox_gc(procs) {
+        Ok(pid) => {
+            LAST_FIREFOX_GC.store(now, Ordering::Relaxed);
+            log.log(&LogEntry::new("GC", pid, "firefox", total_mb as f64, "gc_triggered"));
+        }
+        Err(e) => {
+            // Don't arm the cooldown on failure.
+            sync_print!("[firefox] GC skipped: {e}");
+            log.log(&LogEntry::new("GC", 0, "firefox", total_mb as f64, &format!("skipped: {e}")));
+        }
+    }
+}
+
+/// zram compaction pre-action. At Elevated pressure or higher, repack the zram
+/// pool so fragmented-but-empty pages return to RAM before any process is
+/// frozen or killed. Cheap (~100ms) and non-destructive — no process touched.
+///
+/// No-op unless `[zram] compact_on_elevated = true`. Skips pools holding less
+/// than `zram_min_used_mb`. The compact sysfs node needs the opt-in tmpfiles
+/// grant; without it the write returns EACCES, and the feature disables itself
+/// for the session after logging once (graceful degrade).
+fn compact_zram(level: &PressureLevel, log: &Logger) {
+    if *level < PressureLevel::Elevated {
+        return;
+    }
+    if ZRAM_COMPACT_DISABLED.load(Ordering::Relaxed) {
+        return;
+    }
+
+    let (enabled, min_used_mb) = {
+        let cfg = crate::config::get();
+        (cfg.compact_zram_on_elevated, cfg.zram_min_used_mb)
+    };
+    if !enabled {
+        return;
+    }
+
+    for device in crate::monitor::zram::zram_devices() {
+        // Gate BEFORE compacting: skip pools too small to be worth the walk.
+        // A device whose used-RAM is unreadable is skipped (can't judge it).
+        let Some(before_mb) = crate::monitor::zram::zram_used_mb(&device) else { continue };
+        if before_mb < min_used_mb {
+            continue;
+        }
+
+        match crate::monitor::zram::compact(&device) {
+            Ok(()) => {
+                let after_mb = crate::monitor::zram::zram_used_mb(&device).unwrap_or(before_mb);
+                let reclaimed = before_mb.saturating_sub(after_mb);
+                sync_print!(
+                    "[zram] compacted {device} — {before_mb}MB→{after_mb}MB used ({reclaimed}MB reclaimed)"
+                );
+                log.log(&LogEntry::new(
+                    "ZRAM", 0, &device, reclaimed as f64,
+                    &format!("compacted {before_mb}MB->{after_mb}MB"),
+                ));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                // Grant absent — disable for the session, log exactly once.
+                ZRAM_COMPACT_DISABLED.store(true, Ordering::Relaxed);
+                sync_print!(
+                    "[zram] compact unavailable ({device}): sysfs grant absent — disabling for \
+                     session. See docs/PRIVILEGE_DESIGN.md §1."
+                );
+                log.log(&LogEntry::new("ZRAM", 0, &device, 0.0, "unavailable: EACCES (grant absent)"));
+                return;
+            }
+            Err(e) => {
+                // Transient/other error — don't disable, just note it.
+                sync_print!("[zram] compact failed on {device}: {e}");
+            }
+        }
+    }
+}
+
+/// Page-cache drop pre-action (Phase 4). At the configured trigger level or
+/// higher, advise the kernel to drop page cache for the configured directory
+/// trees before any process is frozen — surgical, unprivileged, non-destructive
+/// (clean pages only). No-op unless `[cache_drop] enabled = true` with a
+/// non-empty `paths` list. Cooldown-gated so a sustained High spell doesn't
+/// re-walk the trees every 5s.
+fn check_cache_drop(level: &PressureLevel, log: &Logger) {
+    let (trigger, cooldown_secs, paths) = {
+        let cfg = crate::config::get();
+        if !cfg.cache_drop_enabled || cfg.cache_drop_paths.is_empty() {
+            return;
+        }
+        (cfg.cache_drop_trigger.clone(), cfg.cache_drop_cooldown_secs, cfg.cache_drop_paths.clone())
+    };
+
+    if *level < trigger {
+        return;
+    }
+
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let last = LAST_CACHE_DROP.load(Ordering::Relaxed);
+    if last != 0 && now.saturating_sub(last) < cooldown_secs {
+        return;
+    }
+    // Arm cooldown up-front: the walk itself is the cost we're rate-limiting,
+    // so even a zero-byte result shouldn't trigger a re-walk next cycle.
+    LAST_CACHE_DROP.store(now, Ordering::Relaxed);
+
+    let mut total_files = 0usize;
+    let mut total_bytes = 0u64;
+    for r in crate::monitor::cache::drop_caches(&paths) {
+        if r.files_advised > 0 {
+            log.log(&LogEntry::new(
+                "CACHE", 0, &r.pattern,
+                (r.bytes_advised / (1024 * 1024)) as f64,
+                &format!("advised {} files", r.files_advised),
+            ));
+        }
+        total_files += r.files_advised;
+        total_bytes += r.bytes_advised;
+    }
+
+    if total_files > 0 {
+        let mb = total_bytes / (1024 * 1024);
+        sync_print!("[cache] dropped cache for {total_files} files (~{mb}MB advised) before freeze");
+    }
+}
+
+
 fn print_status(
     pressure: &monitor::psi::MemoryPressure,
     effective_level: &PressureLevel,
@@ -115,7 +367,7 @@ fn print_status(
             p.rss_kb as f64 / 1024.0,
             p.swap_kb as f64 / 1024.0,
             p.oom_score,
-            get_priority(&p.name),
+            get_priority(&p.name, p.exe_basename.as_deref()),
             marker,
         );
     }

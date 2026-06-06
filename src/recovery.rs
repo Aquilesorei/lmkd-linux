@@ -10,13 +10,16 @@ use crate::monitor;
 
 const MAX_RESTORE_ATTEMPTS: u32 = 3;
 const MIN_FREEZE_AGE_SECS: u64 = 15;
+/// Max processes to unfreeze per recovery cycle. Staggering (vs. releasing all
+/// at once) lets PSI react between batches and avoids bouncing back into pressure.
+const MAX_UNFREEZE_PER_CYCLE: usize = 4;
 
 pub fn run(
     frozen: Arc<Mutex<FrozenRegistry>>,
     checkpointed: Arc<Mutex<CheckpointRegistry>>,
+    log: Arc<Logger>,
 ) {
     let mut baseline = HealthBaseline::new();
-    let log = Logger::new();
 
     loop {
         if crate::should_shutdown() { return; }
@@ -46,7 +49,18 @@ pub fn run(
             if reg.count() > 0 {
                 sync_print!("\n[recovery] 🌡 Pressure normal — checking {} frozen processes", reg.count());
                 let pids = reg.frozen_pids();
+                let mut unfrozen_this_cycle = 0;
                 for pid in pids {
+                    if unfrozen_this_cycle >= MAX_UNFREEZE_PER_CYCLE {
+                        sync_print!("  ⏸ Unfreeze cap reached ({MAX_UNFREEZE_PER_CYCLE}/cycle) — rest next cycle");
+                        break;
+                    }
+                    // Headroom gate: only release more if RAM stays above baseline.
+                    // Stops a barely-recovered system from oscillating back into pressure.
+                    if !baseline.safe_to_restore(meminfo.available_kb, meminfo.total_kb, 0) {
+                        sync_print!("  ⏸ RAM near baseline — pausing unfreeze until headroom recovers");
+                        break;
+                    }
                     let age = now.saturating_sub(reg.frozen_at(pid));
                     if age < MIN_FREEZE_AGE_SECS {
                         sync_print!("  ⏳ PID {pid} frozen only {age}s ago — waiting");
@@ -59,6 +73,7 @@ pub fn run(
                         sync_print!("  ✓ Unfroze PID {pid} name={name} (frozen {age}s)");
                         log.log(&LogEntry::new("UNFREEZE", pid, name, 0.0, "unfrozen"));
                         reg.remove(pid);
+                        unfrozen_this_cycle += 1;
                     } else {
                         sync_print!("  ✗ Unfreeze PID {pid} failed: {}", r.error.unwrap_or_default());
                     }

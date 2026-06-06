@@ -7,6 +7,7 @@ mod logger;
 mod output;
 mod evictor;
 mod recovery;
+mod maintenance;
 mod util;
 mod ipc;
 
@@ -66,14 +67,26 @@ fn main() {
 
     cleanup_orphaned_snapshots();
 
-    println!("Memory Guardian v0.3.0 — two-actor architecture");
-    println!("  PressureResponder: 5s poll (freeze/checkpoint/kill)");
-    println!("  RecoveryManager:   3s poll (unfreeze/restore)");
-    println!("  IPC socket:        {}", lmkd_linux::socket_path().display());
+    println!("Memory Guardian v0.3.0");
+    println!("  PressureResponder:  5s poll (freeze/checkpoint/kill)");
+    println!("  RecoveryManager:    3s poll (unfreeze/restore)");
+    println!("  MaintenanceManager: 60s poll (idle reaps, housekeeping)");
+    println!("  IPC socket:         {}", lmkd_linux::socket_path().display());
+    match executor::checkpoint::criu_path() {
+        Some(p) => println!(
+            "  CRIU:               {} (checkpoint enabled; needs cap_checkpoint_restore,cap_sys_ptrace — falls back to kill if unprivileged)",
+            p.display()
+        ),
+        None => println!("  CRIU:               not found (checkpoint disabled — will SIGKILL instead)"),
+    }
     println!("Press Ctrl+C to stop\n");
 
     let frozen = Arc::new(Mutex::new(FrozenRegistry::new()));
     let checkpointed = Arc::new(Mutex::new(CheckpointRegistry::new()));
+
+    // Single shared logger — both actors write to one session file (and rotation
+    // runs once, not twice). Logger::log() takes &self, so Arc sharing is safe.
+    let logger = Arc::new(logger::Logger::new());
 
     // ── Signal handlers ─────────────────────────────────────────────────────
     // All three signal handlers are async-signal-safe: they only store to
@@ -87,20 +100,26 @@ fn main() {
     // ── Actor threads ────────────────────────────────────────────────────────
     let f1 = Arc::clone(&frozen);
     let c1 = Arc::clone(&checkpointed);
-    let responder = thread::spawn(move || evictor::run(f1, c1));
+    let l1 = Arc::clone(&logger);
+    let responder = thread::spawn(move || evictor::run(f1, c1, l1));
 
     let f2 = Arc::clone(&frozen);
     let c2 = Arc::clone(&checkpointed);
-    let recovery = thread::spawn(move || recovery::run(f2, c2));
+    let l2 = Arc::clone(&logger);
+    let recovery = thread::spawn(move || recovery::run(f2, c2, l2));
 
     let f3 = Arc::clone(&frozen);
     let c3 = Arc::clone(&checkpointed);
     let ipc = thread::spawn(move || ipc::run_server(f3, c3));
 
-    // Block until both main actors exit (they check should_shutdown() each iteration)
+    let l4 = Arc::clone(&logger);
+    let maintenance = thread::spawn(move || maintenance::run(l4));
+
+    // Block until the actors exit (they check should_shutdown() each iteration)
     let _ = responder.join();
     let _ = recovery.join();
     let _ = ipc.join();
+    let _ = maintenance.join();
 
     // Final unfreeze sweep — no race: both actors are done, no new freezes possible
     shutdown_unfreeze(&frozen);
