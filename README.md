@@ -187,7 +187,7 @@ checkpoint = true
 name       = "quick-tool"
 pattern    = "^quick-tool$"
 priority   = 60
-checkpoint = false
+chegckpoint = false
 
 # Hard protect — mgd will never touch this process regardless of pressure
 [[protect]]
