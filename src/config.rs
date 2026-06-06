@@ -45,6 +45,8 @@ struct RawConfig {
     #[serde(default)]
     zram: Zram,
     #[serde(default)]
+    reclaim: Reclaim,
+    #[serde(default)]
     firefox: Firefox,
 }
 
@@ -106,6 +108,48 @@ impl Default for Zram {
 
 fn default_zram_compact() -> bool { true }
 fn default_zram_min_used() -> u64 { 128 }
+
+/// Optional proactive swap reclaim (Phase 3 / PRIVILEGE_DESIGN §2). When the
+/// system is calm, cycles the zram swap device (swapoff/swapon) via the capped
+/// `mgd-zram-reclaim` helper to pull compressed pages back into RAM. PRIVILEGED:
+/// needs the opt-in capped helper, so it defaults OFF. All safety gates
+/// (decompressed-headroom OOM guard, cooldown, min-used) live in the daemon;
+/// the helper is dumb.
+#[derive(Deserialize)]
+struct Reclaim {
+    #[serde(default)] // privileged → off unless explicitly enabled
+    proactive_swap_reclaim: bool,
+    /// Only reclaim when swap is at least this % full (no point otherwise).
+    #[serde(default = "default_reclaim_threshold_pct")]
+    threshold_pct: f64,
+    #[serde(default = "default_reclaim_cooldown")]
+    cooldown_min: u64,
+    /// Skip reclaim unless the zram pool holds at least this much compressed RAM.
+    #[serde(default = "default_reclaim_min_used")]
+    min_zram_used_mb: u64,
+    /// Require MemAvailable > decompressed_footprint × this multiplier before
+    /// reclaiming — the OOM guard. zram stores compressed; pages expand 2-3× on
+    /// the way back into RAM.
+    #[serde(default = "default_reclaim_headroom_mult")]
+    decompressed_headroom_mult: f64,
+}
+
+impl Default for Reclaim {
+    fn default() -> Self {
+        Reclaim {
+            proactive_swap_reclaim: false,
+            threshold_pct: default_reclaim_threshold_pct(),
+            cooldown_min: default_reclaim_cooldown(),
+            min_zram_used_mb: default_reclaim_min_used(),
+            decompressed_headroom_mult: default_reclaim_headroom_mult(),
+        }
+    }
+}
+
+fn default_reclaim_threshold_pct() -> f64 { 30.0 }
+fn default_reclaim_cooldown() -> u64 { 10 }
+fn default_reclaim_min_used() -> u64 { 2048 }
+fn default_reclaim_headroom_mult() -> f64 { 1.5 }
 
 /// Optional Firefox preventive-memory watcher. Disabled unless `watch_memory = true`.
 /// Runs only at PressureLevel::Normal — see evictor::check_firefox_memory.
@@ -223,6 +267,16 @@ pub struct CompiledConfig {
     pub compact_zram_on_elevated: bool,
     /// Skip zram compaction when the pool holds less than this many MB.
     pub zram_min_used_mb: u64,
+    /// Proactive swap reclaim (PRIVILEGED) — off unless enabled in [reclaim].
+    pub proactive_swap_reclaim: bool,
+    /// Only reclaim when swap is at least this % full.
+    pub reclaim_threshold_pct: f64,
+    /// Minimum seconds between proactive reclaim cycles (cooldown floor).
+    pub reclaim_cooldown_secs: u64,
+    /// Skip reclaim unless the zram pool holds at least this much compressed RAM.
+    pub reclaim_min_zram_used_mb: u64,
+    /// OOM guard: require MemAvailable > decompressed footprint × this multiplier.
+    pub reclaim_headroom_mult: f64,
     /// Firefox preventive-memory watcher — off unless enabled in [firefox].
     pub watch_firefox: bool,
     pub firefox_rss_threshold_mb: u64,
@@ -339,6 +393,11 @@ fn compile(content: &str) -> Result<CompiledConfig, String> {
         pd_cooldown_secs: raw.plasma_discover.cooldown_min.saturating_mul(60),
         compact_zram_on_elevated: raw.zram.compact_on_elevated,
         zram_min_used_mb: raw.zram.min_used_mb,
+        proactive_swap_reclaim: raw.reclaim.proactive_swap_reclaim,
+        reclaim_threshold_pct: raw.reclaim.threshold_pct,
+        reclaim_cooldown_secs: raw.reclaim.cooldown_min.saturating_mul(60),
+        reclaim_min_zram_used_mb: raw.reclaim.min_zram_used_mb,
+        reclaim_headroom_mult: raw.reclaim.decompressed_headroom_mult,
         watch_firefox: raw.firefox.watch_memory,
         firefox_rss_threshold_mb: raw.firefox.rss_threshold_mb,
         firefox_gc_cooldown_secs: raw.firefox.gc_cooldown_min.saturating_mul(60),

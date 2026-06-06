@@ -56,6 +56,26 @@ cooldown_min = 30                # cooldown floor between reaps
 compact_on_elevated = true
 min_used_mb = 128                 # skip compaction when the pool holds less
 
+# ── proactive swap reclaim (PRIVILEGED, opt-in) ──────────────────────────────
+# After a pressure spike subsides, compressed pages sit in zram even when RAM is
+# free. When the system is calm, mgd can pull them all back by cycling the zram
+# swap device (swapoff/swapon) via the capped helper `mgd-zram-reclaim`. This
+# needs CAP_SYS_ADMIN, so it is PRIVILEGED and OFF by default — enable only after
+# installing the helper (see docs/PRIVILEGE_DESIGN.md §2):
+#   sudo install -m 0750 -o root -g mgd target/release/mgd-zram-reclaim /usr/local/bin/
+#   sudo setcap cap_sys_admin+ep /usr/local/bin/mgd-zram-reclaim
+# All safety gates live in the daemon. The decompressed-headroom gate is the
+# critical one: zram stores COMPRESSED pages that expand 2-3× on the way back
+# into RAM, so mgd refuses to reclaim unless MemAvailable exceeds the estimated
+# decompressed footprint times `decompressed_headroom_mult` — otherwise the
+# reclaim itself could OOM the box. Runs on the maintenance thread.
+[reclaim]
+proactive_swap_reclaim = false    # PRIVILEGED — leave off until helper installed
+threshold_pct = 30                # only reclaim when swap is at least this full
+cooldown_min = 10                 # cooldown floor between reclaim cycles
+min_zram_used_mb = 2048           # skip when the pool holds less compressed RAM
+decompressed_headroom_mult = 1.5  # OOM guard: avail must exceed decompressed × this
+
 # ── Firefox preventive-memory watcher ────────────────────────────────────────
 # Firefox never releases RSS after tabs close. When enabled, mgd nudges Firefox's
 # internal GC via SIGUSR1 (non-disruptive — Firefox keeps running) once total RSS

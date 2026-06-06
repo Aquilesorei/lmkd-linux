@@ -6,6 +6,24 @@ SERVICE_DIR="$HOME/.config/systemd/user"
 CONFIG_DIR="$HOME/.config/mgd"
 SERVICE_NAME="mgd.service"
 
+# Opt-in privileged features (group + zram-compact sysfs grant + capped swap
+# reclaim helper). Off by default — the daemon runs fully unprivileged without
+# them. Enable with: ./install.sh --privileged
+WITH_PRIVILEGED=0
+HELPER_DEST="/usr/local/bin/mgd-zram-reclaim"
+for arg in "$@"; do
+    case "$arg" in
+        --privileged) WITH_PRIVILEGED=1 ;;
+        -h|--help)
+            echo "Usage: $0 [--privileged]"
+            echo "  --privileged   also install opt-in privileged features (needs sudo):"
+            echo "                 mgd group, zram-compact sysfs grant, capped swap-reclaim helper."
+            echo "                 See docs/PRIVILEGE_DESIGN.md."
+            exit 0 ;;
+        *) echo "unknown argument: $arg (try --help)" >&2; exit 1 ;;
+    esac
+done
+
 # ── colours ──────────────────────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
 ok()   { echo -e "${GREEN}✓${NC} $*"; }
@@ -24,11 +42,16 @@ if ! command -v criu >/dev/null 2>&1; then
     warn "  Debian:  sudo apt install criu"
 fi
 
+if [[ "$WITH_PRIVILEGED" == 1 ]]; then
+    command -v setcap >/dev/null 2>&1 || die "setcap not found (needed for --privileged) — install libcap (Fedora: libcap; Debian: libcap2-bin)"
+    command -v sudo   >/dev/null 2>&1 || die "sudo not found (needed for --privileged)"
+fi
+
 ok "Dependencies OK"
 
 # ── build ─────────────────────────────────────────────────────────────────────
 echo "Building release binaries..."
-cargo build --bin mgd --bin mgctl --release 2>&1 | tail -3
+cargo build --bin mgd --bin mgctl --bin mgd-zram-reclaim --release 2>&1 | tail -3
 ok "Build complete"
 
 # ── stop existing service if running ─────────────────────────────────────────
@@ -58,6 +81,49 @@ if [[ -f "$CONFIG_DIR/priorities.toml" ]]; then
 else
     cp config/priorities.toml "$CONFIG_DIR/priorities.toml"
     ok "Default config installed to $CONFIG_DIR/priorities.toml"
+fi
+
+# ── optional privileged features (opt-in) ────────────────────────────────────
+# Each grant is independent; skipping one disables only that feature. The daemon
+# detects a missing grant at runtime, logs once, and continues unprivileged.
+# See docs/PRIVILEGE_DESIGN.md for the full rationale.
+if [[ "$WITH_PRIVILEGED" == 1 ]]; then
+    echo
+    echo "Installing opt-in privileged features (sudo required)..."
+
+    # mgd group — gates who may use the capped helper / sysfs grant.
+    sudo groupadd -f mgd
+    if ! id -nG "$USER" | tr ' ' '\n' | grep -qx mgd; then
+        sudo usermod -aG mgd "$USER"
+        warn "Added $USER to the 'mgd' group — log out and back in for it to take effect"
+    fi
+    ok "mgd group ready"
+
+    # Fix 1 — zram compact: sysfs group-write grant (no capability, no binary).
+    sudo install -m 0644 packaging/mgd-zram.conf /etc/tmpfiles.d/mgd-zram.conf
+    if sudo systemd-tmpfiles --create /etc/tmpfiles.d/mgd-zram.conf 2>/dev/null; then
+        ok "zram compact grant installed (/sys/block/zram0/compact group-writable)"
+    else
+        warn "tmpfiles grant installed but --create failed (no zram0 yet?) — applies on next boot"
+    fi
+
+    # Fix 2 — swap reclaim: capped helper (CAP_SYS_ADMIN, never SUID root).
+    # The daemon looks for the helper in /usr/local/bin then /usr/bin; install.sh
+    # uses /usr/local/bin (manual install convention). Distro packages use /usr/bin.
+    sudo install -m 0750 -o root -g mgd target/release/mgd-zram-reclaim "$HELPER_DEST"
+    sudo setcap cap_sys_admin+ep "$HELPER_DEST"
+    ok "swap reclaim helper installed + capped at $HELPER_DEST"
+    warn "  reclaim stays OFF until you set [reclaim] proactive_swap_reclaim = true in priorities.toml"
+
+    # CRIU (Option A) — narrow caps instead of root, if criu is present.
+    if command -v criu >/dev/null 2>&1; then
+        sudo setcap cap_checkpoint_restore,cap_sys_ptrace+ep "$(command -v criu)" \
+            && ok "criu capped (cap_checkpoint_restore,cap_sys_ptrace) — no root needed" \
+            || warn "could not setcap criu (kernel may lack CAP_CHECKPOINT_RESTORE) — CRIU still falls back to kill"
+    fi
+else
+    warn "Privileged features skipped (default). To enable zram compact + swap reclaim:"
+    warn "  ./install.sh --privileged    (or follow docs/PRIVILEGE_DESIGN.md manually)"
 fi
 
 # ── enable + (re)start ───────────────────────────────────────────────────────
