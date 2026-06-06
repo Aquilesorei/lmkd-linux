@@ -41,8 +41,43 @@ struct RawConfig {
     #[serde(default)]
     plasma: Plasma,
     #[serde(default)]
+    plasma_discover: PlasmaDiscover,
+    #[serde(default)]
     firefox: Firefox,
 }
+
+/// Optional plasma-discover idle-reap watcher. plasma-discover (KDE's package
+/// manager) accumulates RAM + GPU buffers and is non-critical — when it is idle
+/// and over the RSS threshold mgd SIGTERMs it; KDE relaunches it on demand.
+/// Runs on the maintenance thread (the idle CPU sample blocks). Enabled by
+/// default — reaping it has no user-visible cost.
+#[derive(Deserialize)]
+struct PlasmaDiscover {
+    #[serde(default = "default_pd_watch")]
+    watch_memory: bool,
+    #[serde(default = "default_pd_threshold")]
+    rss_threshold_mb: u64,
+    #[serde(default = "default_pd_idle")]
+    idle_check_secs: u64,
+    #[serde(default = "default_pd_cooldown")]
+    cooldown_min: u64,
+}
+
+impl Default for PlasmaDiscover {
+    fn default() -> Self {
+        PlasmaDiscover {
+            watch_memory: default_pd_watch(),
+            rss_threshold_mb: default_pd_threshold(),
+            idle_check_secs: default_pd_idle(),
+            cooldown_min: default_pd_cooldown(),
+        }
+    }
+}
+
+fn default_pd_watch() -> bool { true }
+fn default_pd_threshold() -> u64 { 400 }
+fn default_pd_idle() -> u64 { 60 }
+fn default_pd_cooldown() -> u64 { 30 }
 
 /// Optional Firefox preventive-memory watcher. Disabled unless `watch_memory = true`.
 /// Runs only at PressureLevel::Normal — see evictor::check_firefox_memory.
@@ -148,6 +183,13 @@ pub struct CompiledConfig {
     pub gpu_leak_threshold_mb: u64,
     /// Minimum seconds between plasmashell restarts (cooldown floor).
     pub min_restart_interval_secs: u64,
+    /// plasma-discover idle-reap watcher — on unless disabled in [plasma_discover].
+    pub watch_plasma_discover: bool,
+    pub pd_rss_threshold_mb: u64,
+    /// Seconds between the two CPU samples used to judge plasma-discover idle.
+    pub pd_idle_check_secs: u64,
+    /// Minimum seconds between plasma-discover reaps (cooldown floor).
+    pub pd_cooldown_secs: u64,
     /// Firefox preventive-memory watcher — off unless enabled in [firefox].
     pub watch_firefox: bool,
     pub firefox_rss_threshold_mb: u64,
@@ -258,6 +300,10 @@ fn compile(content: &str) -> Result<CompiledConfig, String> {
         watch_gpu_leak: raw.plasma.watch_gpu_leak,
         gpu_leak_threshold_mb: raw.plasma.gpu_leak_threshold_mb,
         min_restart_interval_secs: raw.plasma.min_restart_interval_min.saturating_mul(60),
+        watch_plasma_discover: raw.plasma_discover.watch_memory,
+        pd_rss_threshold_mb: raw.plasma_discover.rss_threshold_mb,
+        pd_idle_check_secs: raw.plasma_discover.idle_check_secs,
+        pd_cooldown_secs: raw.plasma_discover.cooldown_min.saturating_mul(60),
         watch_firefox: raw.firefox.watch_memory,
         firefox_rss_threshold_mb: raw.firefox.rss_threshold_mb,
         firefox_gc_cooldown_secs: raw.firefox.gc_cooldown_min.saturating_mul(60),

@@ -70,6 +70,30 @@ cp config/mgd.service ~/.config/systemd/user/
 systemctl --user enable --now mgd.service
 ```
 
+### Optional privileged features (opt-in)
+
+mgd runs fully unprivileged out of the box. A few features need a small OS
+privilege; each is opt-in and granted to a file on disk (not to the daemon —
+`AmbientCapabilities=` does not work for a `--user` service). The `mgd` group
+gates who may use them. Full rationale: [docs/PRIVILEGE_DESIGN.md](docs/PRIVILEGE_DESIGN.md).
+
+```bash
+# one-time: create the group and add yourself (log out/in to take effect)
+sudo groupadd -f mgd
+sudo usermod -aG mgd "$USER"
+```
+
+zram compact (Fix 1 — no capability, sysfs group-write grant):
+```bash
+sudo install -m 0644 packaging/mgd-zram.conf /etc/tmpfiles.d/mgd-zram.conf
+sudo systemd-tmpfiles --create /etc/tmpfiles.d/mgd-zram.conf
+```
+
+> Further grants (swap reclaim helper, CRIU caps) are documented in
+> `docs/PRIVILEGE_DESIGN.md` and land with their respective features. Each step
+> is independent — skipping one disables only that feature; mgd logs it
+> unavailable at startup and continues.
+
 ## Usage
 
 ### Daemon

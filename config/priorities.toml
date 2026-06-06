@@ -29,6 +29,20 @@ watch_gpu_leak = false
 gpu_leak_threshold_mb = 1024      # restart when plasmashell GPU mem exceeds this
 min_restart_interval_min = 30     # cooldown floor: never restart more often
 
+# ── plasma-discover idle-reap watcher ────────────────────────────────────────
+# plasma-discover (KDE's package manager) should be a lightweight background
+# service but accumulates RAM + GPU buffers over time and is non-critical. When
+# enabled, mgd checks it only while the system is calm (Normal pressure): if it
+# is over the RSS threshold AND has burned no CPU across a short sample window
+# (idle), mgd SIGTERMs it. KDE relaunches it on demand, so there is no
+# user-visible cost. Runs on the maintenance thread (the idle sample blocks).
+# Enabled by default.
+[plasma_discover]
+watch_memory = true
+rss_threshold_mb = 400            # only reap when above this RSS
+idle_check_secs = 60             # CPU-idle sample window before reaping
+cooldown_min = 30                # cooldown floor between reaps
+
 # ── Firefox preventive-memory watcher ────────────────────────────────────────
 # Firefox never releases RSS after tabs close. When enabled, mgd nudges Firefox's
 # internal GC via SIGUSR1 (non-disruptive — Firefox keeps running) once total RSS

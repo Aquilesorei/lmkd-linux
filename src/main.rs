@@ -7,6 +7,7 @@ mod logger;
 mod output;
 mod evictor;
 mod recovery;
+mod maintenance;
 mod util;
 mod ipc;
 
@@ -66,10 +67,11 @@ fn main() {
 
     cleanup_orphaned_snapshots();
 
-    println!("Memory Guardian v0.3.0 — two-actor architecture");
-    println!("  PressureResponder: 5s poll (freeze/checkpoint/kill)");
-    println!("  RecoveryManager:   3s poll (unfreeze/restore)");
-    println!("  IPC socket:        {}", lmkd_linux::socket_path().display());
+    println!("Memory Guardian v0.3.0");
+    println!("  PressureResponder:  5s poll (freeze/checkpoint/kill)");
+    println!("  RecoveryManager:    3s poll (unfreeze/restore)");
+    println!("  MaintenanceManager: 60s poll (idle reaps, housekeeping)");
+    println!("  IPC socket:         {}", lmkd_linux::socket_path().display());
     println!("Press Ctrl+C to stop\n");
 
     let frozen = Arc::new(Mutex::new(FrozenRegistry::new()));
@@ -103,10 +105,14 @@ fn main() {
     let c3 = Arc::clone(&checkpointed);
     let ipc = thread::spawn(move || ipc::run_server(f3, c3));
 
-    // Block until both main actors exit (they check should_shutdown() each iteration)
+    let l4 = Arc::clone(&logger);
+    let maintenance = thread::spawn(move || maintenance::run(l4));
+
+    // Block until the actors exit (they check should_shutdown() each iteration)
     let _ = responder.join();
     let _ = recovery.join();
     let _ = ipc.join();
+    let _ = maintenance.join();
 
     // Final unfreeze sweep — no race: both actors are done, no new freezes possible
     shutdown_unfreeze(&frozen);
