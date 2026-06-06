@@ -170,8 +170,9 @@ fi
 
 echo
 echo "To customize priorities:  $CONFIG_DIR/priorities.toml"
-echo "To reload config live:    mgctl reload     (or: kill -HUP \$(pgrep mgd))"
-echo "To view status:           mgctl status"
+echo "To reload config live:    mgctl reload"
+echo "To view status:           mgctl status        (daemon: pressure + frozen)"
+echo "To view service state:    mgctl service       (systemd: active, PID, uptime)"
 echo "To list frozen processes: mgctl list"
-echo "To view logs:             journalctl --user -u mgd.service -f"
-echo "To stop:                  systemctl --user stop mgd.service"
+echo "To view logs:             mgctl logs -f"
+echo "To restart / stop:        mgctl restart  |  mgctl stop"
