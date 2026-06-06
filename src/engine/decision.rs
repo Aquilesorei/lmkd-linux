@@ -1,34 +1,22 @@
 use crate::monitor::process::Process;
 use crate::monitor::psi::PressureLevel;
 
-/// What the daemon will do to a process when memory pressure is detected.
-/// Actions are ordered by severity — escalation goes from Freeze up to Kill.
+/// Action for a process under pressure, ordered by severity.
 #[derive(Debug, PartialEq)]
 pub enum Action {
-    /// No action needed. Pressure is below all thresholds.
     None,
 
-    /// Send SIGSTOP to pause the process.
-    /// Reversible instantly with SIGCONT.
-    /// Does not free RAM directly but stops the process from allocating more,
-    /// and allows the kernel to reclaim its pages if needed.
+    /// SIGSTOP. Reversible via SIGCONT. Frees no RAM directly — only stops
+    /// further allocation; reclaim is left to the kernel.
     Freeze,
 
-    /// Use CRIU to dump the full process state to disk, then kill it.
-    /// Frees all RSS immediately.
-    /// Reversible — user can restore the process exactly where it left off.
-    /// Only used for processes marked checkpoint=true in config.
+    /// CRIU dump to disk, then kill. Frees RSS; restorable. checkpoint=true only.
     Checkpoint,
 
-    /// Send SIGTERM — ask the process to shut down gracefully.
-    /// Gives the process 5 seconds to clean up before SIGKILL.
-    /// Not reversible — process must be relaunched manually.
-    /// Used when checkpoint=false and pressure is Critical.
+    /// SIGTERM, then SIGKILL after a 5s grace. Not restorable.
     Terminate,
 
-    /// Send SIGKILL — immediate forced termination, no cleanup.
-    /// Last resort. Used at Emergency pressure or when SIGTERM times out.
-    /// Not reversible.
+    /// SIGKILL. Last resort: Emergency, or SIGTERM timeout.
     Kill,
 }
 
@@ -54,73 +42,72 @@ pub struct Decision {
     pub reason: String,
 }
 
-/// Priority tier based on process name — delegates to loaded config.
-/// Falls back to .desktop category lookup via exe_basename if no regex matches.
-/// Returns 0–100 (higher = kill first).
+/// Priority 0-100 (higher = sacrifice first), from config (`[[apps]]` regex,
+/// then `.desktop` category by exe_basename, then default).
 pub fn get_priority(name: &str, exe_basename: Option<&str>) -> u8 {
     crate::config::get().priority_for(name, exe_basename)
 }
 
-/// Calculate how much RAM we need to free (in KB)
+/// KB to free to reach the 15%-free target. Negative if already above.
 pub fn ram_deficit_kb(available_kb: u64, total_kb: u64) -> i64 {
-    let target_kb = (total_kb as f64 * 0.15) as u64; // want 15% free
+    let target_kb = (total_kb as f64 * 0.15) as u64;
     target_kb as i64 - available_kb as i64
 }
-/// Given pressure level + process list, decide what to do (DRY RUN).
-///
-/// Logic:
-/// 1. Calculate how much RAM we need to free (deficit)
-/// 2. Sort processes by priority (least important first)
-/// 3. For each candidate, decide the action based on BOTH pressure level
-///    AND process-specific properties (priority, swap ratio, size)
-/// 4. Stop as soon as deficit is covered — never kill more than needed
+
+/// Decide actions for the current pressure level (dry run — no side effects).
+/// Walks candidates least-important-first, stopping once the deficit is covered.
 pub fn plan(
     level: &PressureLevel,
     procs: &[&Process],
     available_kb: u64,
     total_kb: u64,
 ) -> Vec<Decision> {
-    // No pressure = no action
     if *level == PressureLevel::Normal {
         return vec![];
     }
 
-    // How much RAM do we need to free?
     let mut deficit = ram_deficit_kb(available_kb, total_kb);
     if deficit <= 0 {
         return vec![];
     }
 
-    // Acquire config once for the entire plan() call — avoids O(n) lock cycles.
+    // One config read for the whole call.
     let cfg = crate::config::get();
 
-    // Sort candidates: highest priority number first (least important first)
-    // Filter out tiny processes — not worth the overhead.
-    // Include swap in the size check: a mostly-swapped process is still reclaimable.
-    let mut candidates: Vec<(u8, &Process)> = procs.iter()
-        .filter(|p| p.rss_kb + p.swap_kb > 10 * 1024) // ignore processes using < 10MB total
-        .map(|p| (cfg.priority_for(&p.name, p.exe_basename.as_deref()), *p))
+  
+    let count_gpu = *level >= PressureLevel::High;
+
+    // (priority, sort_footprint_kb, proc). gpu read once per candidate.
+    let mut candidates: Vec<(u8, u64, &Process)> = procs.iter()
+        .filter(|p| p.rss_kb + p.swap_kb > 10 * 1024)
+        .map(|p| {
+            let prio = cfg.priority_for(&p.name, p.exe_basename.as_deref());
+            let gpu_kb = if count_gpu {
+                crate::monitor::gpu::process_gpu_kb_cached(p.pid)
+            } else {
+                0
+            };
+            (prio, p.rss_kb.saturating_add(gpu_kb), *p)
+        })
         .collect();
 
-    candidates.sort_by(|(pa, a), (pb, b)| {
+    candidates.sort_by(|(pa, fa, a), (pb, fb, b)| {
         pb.cmp(pa)
-            .then(b.rss_kb.cmp(&a.rss_kb))
+            .then(fb.cmp(fa)) // rss + resident GPU — sort only
             .then(b.oom_score.cmp(&a.oom_score))
     });
 
     let mut decisions = vec![];
 
-    for (prio, proc) in candidates {
+    for (prio, _sort_footprint_kb, proc) in candidates {
         if deficit <= 0 {
             break;
         }
 
-        // Hard rule 1: never touch SYSTEM or CRITICAL tier (priority <= 19)
+        // Never touch the system/critical tier or the protect list.
         if prio <= 19 {
             continue;
         }
-
-        // Hard rule 2: never touch user-configured protect list
         if cfg.is_protected(&proc.name) {
             continue;
         }
@@ -132,11 +119,9 @@ pub fn plan(
             0.0
         };
 
-        // Per-process checkpoint override from config
         let checkpoint_override = cfg.checkpoint_override(&proc.name);
         let action = decide_action(level, prio, swap_ratio, checkpoint_override);
 
-        // Skip no-ops — don't waste a decision slot or count toward deficit
         if action == Action::None {
             continue;
         }
@@ -149,13 +134,9 @@ pub fn plan(
             deficit as f64 / 1024.0,
         );
 
-        // Freeze frees no RAM directly — SIGSTOP only stops the process from
-        // allocating/re-faulting; any reclaim is indirect and handled by the
-        // kernel later. So it must NOT count toward the deficit, otherwise we'd
-        // believe memory was freed when none was. Expendable processes are still
-        // frozen (to stop the bleeding); we just don't let that close the loop.
-        // Kill/Terminate/Checkpoint free the full RSS within this cycle; the next
-        // 5s cycle re-measures available_kb, so any terminate lag self-corrects.
+        // Freeze frees no RAM, so it doesn't count toward the deficit — expendable
+        // procs are still frozen to stop the bleeding, but the loop keeps going.
+        // Kill/Terminate/Checkpoint free full RSS; the next cycle re-measures.
         let freed = match action {
             Action::Freeze => 0,
             _ => proc.rss_kb as i64,
@@ -175,9 +156,8 @@ pub fn plan(
     decisions
 }
 
-/// Decide the action for a single process based on pressure level,
-/// its priority tier, how much of it is already in swap, and any
-/// per-process checkpoint override from config.
+/// Action for one process from pressure level, priority, swap ratio, and the
+/// per-process checkpoint override.
 fn decide_action(
     level: &PressureLevel,
     prio: u8,
@@ -187,48 +167,41 @@ fn decide_action(
     match level {
         PressureLevel::Normal => Action::None,
 
-        // Elevated: just pause background processes, don't kill anything yet
         PressureLevel::Elevated => {
             if prio >= 60 {
-                Action::Freeze  // pause low/expendable tier
+                Action::Freeze
             } else {
-                Action::None    // leave normal/high tier alone
+                Action::None
             }
         }
 
-        // High: freeze everything low priority, start being more aggressive
         PressureLevel::High => {
             if prio >= 80 {
-                Action::Terminate   // expendable tier — just kill it
+                Action::Terminate
             } else if prio >= 60 {
-                Action::Freeze      // low tier — pause it
+                Action::Freeze
             } else {
-                Action::None        // normal/high tier — leave alone
+                Action::None
             }
         }
 
-        // Critical: start freeing real memory
         PressureLevel::Critical => {
-            // Per-process override takes priority over all heuristics
             if let Some(cp) = checkpoint_override {
                 return if cp { Action::Checkpoint } else {
                     if swap_ratio > 0.5 { Action::Kill } else { Action::Terminate }
                 };
             }
             if swap_ratio > 0.5 {
-                // Already mostly in swap — checkpointing is pointless,
-                // the data is already on disk effectively. Just kill it.
+                // Mostly in swap already — its data is effectively on disk, so
+                // checkpointing buys nothing. Kill.
                 Action::Kill
             } else if prio >= 75 {
-                // Low/expendable tier — not worth saving, terminate
                 Action::Terminate
             } else {
-                // Normal tier with real RAM usage — checkpoint to preserve state
                 Action::Checkpoint
             }
         }
 
-        // Emergency: no time for grace, kill everything non-critical
         PressureLevel::Emergency => Action::Kill,
     }
 }
@@ -258,8 +231,7 @@ mod tests {
 
     #[test]
     fn elevated_skips_normal_tier_entirely() {
-        // "some_app" default priority 50 — no decision emitted at all
-        let procs = vec![proc("some_app", 500_000, 0)];
+        let procs = vec![proc("some_app", 500_000, 0)]; // default priority 50
         let decisions = plan(&PressureLevel::Elevated, &procs.iter().collect::<Vec<_>>(), 1_000_000, 16_000_000);
         assert!(decisions.is_empty());
     }
@@ -293,24 +265,21 @@ mod tests {
             proc("msedge", 2_000_000, 0),
             proc("msedge", 2_000_000, 0),
         ];
-        // deficit = 16M*0.15 - 1M = 1.4M KB. First kill (2M) covers it.
+        // deficit = 16M*0.15 - 1M = 1.4M KB; first 2M kill covers it.
         let decisions = plan(&PressureLevel::Emergency, &procs.iter().collect::<Vec<_>>(), 1_000_000, 16_000_000);
         assert_eq!(decisions.len(), 1);
     }
 
     #[test]
     fn freeze_does_not_count_toward_deficit() {
-        // Freeze frees no RAM, so it never reduces the deficit. Even a tiny
-        // deficit must not stop us short: ALL expendable processes get frozen
-        // ("stop the bleeding"), and the next cycle re-measures whether PSI dropped.
+        // Freeze credits nothing, so a tiny deficit must not stop the loop short:
+        // all 4 expendable procs freeze.
         let procs = vec![
             proc("baloo_file_extractor", 200_000, 0),
             proc("baloo_file_extractor", 200_000, 0),
             proc("baloo_file_extractor", 200_000, 0),
             proc("baloo_file_extractor", 200_000, 0),
         ];
-        // available just 1MB below target → tiny deficit a single 200MB process
-        // would have "covered" under the old 25% credit. All 4 must still freeze.
         let target = 16_000_000 * 15 / 100;
         let decisions = plan(&PressureLevel::Elevated, &procs.iter().collect::<Vec<_>>(), target as u64 - 1024, 16_000_000);
         assert_eq!(decisions.len(), 4);
@@ -322,6 +291,20 @@ mod tests {
         let procs = vec![proc("tiny", 5_000, 0)];
         let decisions = plan(&PressureLevel::Emergency, &procs.iter().collect::<Vec<_>>(), 500_000, 16_000_000);
         assert!(decisions.is_empty());
+    }
+
+    #[test]
+    fn high_pressure_deficit_credits_rss_only() {
+        // Guard: GPU ranking must not leak into the deficit. Synthetic pids have
+        // no GPU mem, so High behaves as RSS-only.
+        let procs = vec![
+            proc("msedge", 2_000_000, 0),
+            proc("msedge", 2_000_000, 0),
+        ];
+        let decisions = plan(&PressureLevel::High, &procs.iter().collect::<Vec<_>>(), 1_000_000, 16_000_000);
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].action, Action::Terminate);
+        assert_eq!(decisions[0].rss_mb as u64, 1953); // 2_000_000 KB / 1024
     }
 
     #[test]

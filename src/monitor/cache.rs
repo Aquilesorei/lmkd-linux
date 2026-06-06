@@ -1,45 +1,25 @@
-//! Page-cache drop — surgically evict stale file cache before freezing apps.
+//! Page-cache drop via `posix_fadvise(DONTNEED)` over configured dir trees,
+//! run before freezing apps at High+ pressure.
 //!
-//! Under pressure the kernel often evicts application pages to swap while
-//! retaining file cache (build artifacts, node_modules, browser cache) that
-//! won't be read again until the next build. At High pressure, before any
-//! process is frozen, mgd tells the kernel to drop cache for a configured set of
-//! directory trees via `posix_fadvise(POSIX_FADV_DONTNEED)`. This is surgical
-//! (only the listed trees, never a global `drop_caches`), needs no privilege
-//! (the files are the user's own), and is non-destructive — `DONTNEED` drops
-//! *clean* cached pages immediately; dirty pages are written back first by the
-//! kernel and only then evictable, so no data is lost.
-//!
-//! Paths support a leading `~` and a single `*` wildcard per path segment
-//! (e.g. `~/projects/*/target`). Expansion is hand-rolled (no glob dependency)
-//! per the project's libc/serde/toml/regex-only constraint.
+//! DONTNEED drops clean pages immediately and leaves dirty pages for the kernel
+//! to write back first, so no data is lost. Paths take a leading `~` and one `*`
+//! per segment; expansion is hand-rolled to avoid a glob dependency.
 
 use std::fs;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 
-/// Cap on directory-tree recursion depth, so a misconfigured path like `~`
-/// can't make mgd walk the whole home tree while under memory pressure.
 const MAX_DEPTH: usize = 8;
-
-/// Cap on the number of files advised per `drop_caches` call (GLOBAL across all
-/// configured patterns, not per-pattern), so a multi-path config can't make mgd
-/// walk an unbounded number of files inline in the pressure loop.
+/// Global across all patterns in one `drop_caches` call — bounds inline work.
 const MAX_FILES: usize = 50_000;
 
-/// Outcome of dropping cache for one configured path pattern.
 pub struct CacheDropResult {
     pub pattern: String,
     pub files_advised: usize,
     pub bytes_advised: u64,
 }
 
-/// Drop page cache for every configured path pattern, returning per-pattern
-/// results. Each pattern is `~`/`*`-expanded, then each resolved directory tree
-/// (or file) is walked and `POSIX_FADV_DONTNEED`-advised. The `MAX_FILES` budget
-/// is shared across all patterns so total inline work stays bounded.
 pub fn drop_caches(patterns: &[String]) -> Vec<CacheDropResult> {
-    // Shared budget across every pattern in this call.
     let mut budget = MAX_FILES;
     patterns
         .iter()
@@ -61,8 +41,6 @@ pub fn drop_caches(patterns: &[String]) -> Vec<CacheDropResult> {
         .collect()
 }
 
-/// Recursively advise every regular file under `path` with `DONTNEED`, bounded
-/// by depth and the shared file budget. `path` may be a file or a directory.
 fn advise_tree(
     path: &Path,
     depth: usize,
@@ -77,8 +55,7 @@ fn advise_tree(
     let Ok(meta) = fs::symlink_metadata(path) else { return };
     let ft = meta.file_type();
 
-    // Never follow symlinks — a symlink could point outside the configured tree
-    // (e.g. into / or another user's data).
+    // Don't follow symlinks: they could point outside the configured tree.
     if ft.is_symlink() {
         return;
     }
@@ -103,9 +80,7 @@ fn advise_tree(
     }
 }
 
-/// `posix_fadvise(POSIX_FADV_DONTNEED)` on a single regular file. Returns the
-/// file size in bytes advised, or None on open/fadvise failure (skipped). Opens
-/// read-only — no write access, no truncation, never modifies file contents.
+/// fadvise(DONTNEED) one file, opened read-only. Returns bytes advised.
 fn advise_drop_file(path: &Path) -> Option<u64> {
     let file = fs::File::open(path).ok()?;
     let len = file.metadata().ok()?.len();
@@ -115,20 +90,15 @@ fn advise_drop_file(path: &Path) -> Option<u64> {
     let ret = unsafe {
         libc::posix_fadvise(file.as_raw_fd(), 0, len as libc::off_t, libc::POSIX_FADV_DONTNEED)
     };
-    // posix_fadvise returns the errno directly (0 = success), does not set errno.
+    // posix_fadvise returns the errno directly; it does not set the errno global.
     if ret == 0 { Some(len) } else { None }
 }
 
-// ── path expansion (pure, unit-tested) ───────────────────────────────────────
+// ── path expansion ────────────────────────────────────────────────────────────
 
-/// Expand a configured pattern into concrete existing paths. Supports a leading
-/// `~` (HOME) and a single `*` per segment. A segment with `*` is matched
-/// against the actual directory contents; segments without `*` are taken
-/// literally. Only paths that exist are returned.
-///
-/// Paths are resolved from the filesystem root: use absolute or `~`-rooted
-/// patterns. A relative pattern (`foo/bar`) is walked from `/`, not the daemon's
-/// cwd — cache-drop config should always be absolute or `~`-rooted.
+/// Expand `~` and one `*` per segment into existing paths. Resolved from `/`, so
+/// patterns must be absolute or `~`-rooted (a relative pattern walks from root,
+/// not cwd). Only existing paths are returned.
 pub fn expand_path(pattern: &str) -> Vec<PathBuf> {
     let expanded = expand_tilde(pattern);
     let segments: Vec<&str> = expanded
@@ -138,14 +108,11 @@ pub fn expand_path(pattern: &str) -> Vec<PathBuf> {
         .filter(|s| !s.is_empty())
         .collect();
 
-    // Absolute paths only (after ~ expansion everything we care about is). Start
-    // from root and walk segment by segment, fanning out on wildcard segments.
     let mut frontier: Vec<PathBuf> = vec![PathBuf::from("/")];
     for seg in segments {
         let mut next = Vec::new();
         for base in &frontier {
             if seg.contains('*') {
-                // Wildcard: list base dir, keep entries whose name matches.
                 let Ok(entries) = fs::read_dir(base) else { continue };
                 for entry in entries.filter_map(|e| e.ok()) {
                     let name = entry.file_name();
@@ -169,7 +136,6 @@ pub fn expand_path(pattern: &str) -> Vec<PathBuf> {
     frontier
 }
 
-/// Replace a leading `~` with $HOME. Anything else is returned unchanged.
 fn expand_tilde(pattern: &str) -> PathBuf {
     if let Some(rest) = pattern.strip_prefix("~/") {
         crate::util::home_dir().join(rest)
@@ -180,10 +146,8 @@ fn expand_tilde(pattern: &str) -> PathBuf {
     }
 }
 
-/// Glob-match one path segment against one name, supporting a single `*`
-/// wildcard (matching any run of characters, including empty). A segment with no
-/// `*` is an exact match. This is deliberately simple — one `*` per segment is
-/// all the config syntax promises.
+/// Match one segment against a name with a single optional `*` (any run,
+/// including empty); no `*` is an exact match.
 fn segment_matches(pattern: &str, name: &str) -> bool {
     match pattern.split_once('*') {
         None => pattern == name,
@@ -208,14 +172,14 @@ mod tests {
     #[test]
     fn segment_star_prefix() {
         assert!(segment_matches("*.cache", "build.cache"));
-        assert!(segment_matches("*.cache", ".cache")); // empty run before suffix
+        assert!(segment_matches("*.cache", ".cache")); // empty run
         assert!(!segment_matches("*.cache", "cache.txt"));
     }
 
     #[test]
     fn segment_star_suffix() {
         assert!(segment_matches("node_*", "node_modules"));
-        assert!(segment_matches("node_*", "node_")); // empty run after prefix
+        assert!(segment_matches("node_*", "node_")); // empty run
         assert!(!segment_matches("node_*", "mynode_x"));
     }
 
@@ -227,8 +191,8 @@ mod tests {
 
     #[test]
     fn segment_star_no_overlap() {
-        // prefix + suffix longer than the name must not match via overlap.
-        assert!(!segment_matches("ab*ba", "aba")); // would need >=4 chars
+        // prefix+suffix must not overlap to match a too-short name.
+        assert!(!segment_matches("ab*ba", "aba"));
         assert!(segment_matches("ab*ba", "abba"));
         assert!(segment_matches("ab*ba", "abXba"));
     }
@@ -238,13 +202,11 @@ mod tests {
         let home = crate::util::home_dir();
         assert_eq!(expand_tilde("~"), home);
         assert_eq!(expand_tilde("~/foo/bar"), home.join("foo/bar"));
-        // No leading ~: unchanged.
         assert_eq!(expand_tilde("/etc/x"), PathBuf::from("/etc/x"));
     }
 
     #[test]
     fn expand_literal_existing_path() {
-        // /tmp always exists; a literal (no wildcard) path resolves to itself.
         let v = expand_path("/tmp");
         assert!(v.iter().any(|p| p == Path::new("/tmp")));
     }
@@ -256,7 +218,6 @@ mod tests {
 
     #[test]
     fn expand_wildcard_lists_matches() {
-        // /usr/lib and /usr/bin etc. exist; "/usr/*" should fan out to several.
         let v = expand_path("/usr/*");
         assert!(!v.is_empty());
         assert!(v.iter().all(|p| p.starts_with("/usr/")));
@@ -264,7 +225,6 @@ mod tests {
 
     #[test]
     fn temp_drop_caches_walks_and_advises_real_tree() {
-        // Real end-to-end walk over a temp tree created on disk.
         let root = std::env::temp_dir().join(format!("mgd_cache_it_{}", std::process::id()));
         let sub = root.join("sub");
         fs::create_dir_all(&sub).unwrap();
@@ -276,7 +236,6 @@ mod tests {
         assert_eq!(results.len(), 1);
         let r = &results[0];
         assert_eq!(r.pattern, pat);
-        // Two regular files found across root + sub.
         assert_eq!(r.files_advised, 2);
         assert_eq!(r.bytes_advised, 5 * 1024 * 1024);
 
@@ -285,9 +244,6 @@ mod tests {
 
     #[test]
     fn budget_is_shared_across_patterns() {
-        // Two trees, MAX_FILES worth of files split across them, would exceed the
-        // cap if the budget were per-pattern. Here we just assert the documented
-        // invariant holds: total files advised never exceeds MAX_FILES.
         let base = std::env::temp_dir().join(format!("mgd_cache_budget_{}", std::process::id()));
         let a = base.join("a");
         let b = base.join("b");
@@ -301,7 +257,7 @@ mod tests {
         let pats = vec![a.to_string_lossy().to_string(), b.to_string_lossy().to_string()];
         let total: usize = drop_caches(&pats).iter().map(|r| r.files_advised).sum();
         assert!(total <= MAX_FILES);
-        assert_eq!(total, 10); // all 10 fit under the cap
+        assert_eq!(total, 10);
 
         fs::remove_dir_all(&base).unwrap();
     }
