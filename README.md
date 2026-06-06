@@ -77,6 +77,17 @@ privilege; each is opt-in and granted to a file on disk (not to the daemon —
 `AmbientCapabilities=` does not work for a `--user` service). The `mgd` group
 gates who may use them. Full rationale: [docs/PRIVILEGE_DESIGN.md](docs/PRIVILEGE_DESIGN.md).
 
+The easiest way to enable all of them is the installer's opt-in flag (it prompts
+for `sudo` and is safe to re-run):
+
+```bash
+./install.sh --privileged
+```
+
+This creates the `mgd` group, installs the zram-compact grant, installs and caps
+the swap-reclaim helper, and caps `criu` — each step independent and skippable.
+Prefer to do it by hand? The individual commands are below.
+
 ```bash
 # one-time: create the group and add yourself (log out/in to take effect)
 sudo groupadd -f mgd
@@ -102,10 +113,9 @@ sudo setcap cap_checkpoint_restore,cap_sys_ptrace,cap_net_admin+ep "$(command -v
 > SIGKILL again (it logs the criu privilege failure with the exact command to
 > re-run).
 
-> Further grants are documented in `docs/PRIVILEGE_DESIGN.md`. Each step is
-> independent — skipping one disables only that feature; mgd logs it unavailable
-> at startup and continues. `./install.sh --privileged` applies all of these
-> automatically.
+> Each step above is independent — skipping one disables only that feature; mgd
+> logs it unavailable at startup and continues. The swap-reclaim helper and its
+> install are documented in `docs/PRIVILEGE_DESIGN.md`.
 
 ## Usage
 
