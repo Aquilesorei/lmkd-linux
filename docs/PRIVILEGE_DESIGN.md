@@ -131,16 +131,30 @@ Carrier rules (all mandatory):
   don't read env.)
 - **No subprocess.** Call `libc::swapoff` / `libc::swapon` directly. Never shell
   out to `/sbin/swapoff` (PATH hijack risk).
-- **Validate the target is zram.** Read `/proc/swaps`, confirm the device
-  basename starts with `zram`, before touching it. Prevents ever disabling a
-  real disk-swap partition. (No user input feeds this, but defense in depth
-  against device/config surprises.)
+- **Validate the target is zram.** Read `/proc/swaps`, confirm the device path is
+  a canonical `/dev/zram<N>` (anchored on the full path, *not* a basename
+  `starts_with("zram")` — a swapfile named `zram-cache` must not match), before
+  touching it. Prevents ever disabling a real disk-swap partition or a lookalike
+  swapfile.
+- **Self-enforce the OOM floor (the helper is group-executable).** The binary is
+  `0750 root:mgd`, so *any* `mgd`-group process can run it directly — not only
+  the daemon. It therefore cannot rely on the daemon's headroom gate. Before any
+  `swapoff`, the helper itself reads `MemAvailable` (`/proc/meminfo`) and the
+  decompressed footprint (`orig_data_size` from `/sys/block/zramN/mm_stat`, both
+  world-readable, no extra privilege) and **refuses** (distinct exit code, no
+  syscall made) unless available RAM strictly exceeds the decompressed total.
+  This makes the privileged action safe *by construction* regardless of caller.
 - **Atomic, never strand the system.** Perform `swapoff` then `swapon` in one
-  invocation and never return with swap left off. Install signal handlers so an
-  interrupt between the two cannot leave the system swapless; re-enable on the
-  way out.
+  invocation and never return with swap left off. Block terminating signals
+  (SIGINT/TERM/HUP/QUIT) across the pair, and retry `swapon` on failure, so an
+  interrupt between the two cannot leave the system swapless.
+- **Distinct exit codes.** `0` ok/nothing-to-do, `2` swapoff EPERM (binary not
+  capped — persistent, caller disables the feature), `3` refused for unsafe
+  headroom and `4` meminfo-unreadable and `1` transient (all retried next
+  cycle). Lets the daemon tell "uncapped" from "transient" without string-matching.
 
-Policy stays in mgd (the daemon, unprivileged):
+Policy stays in mgd (the daemon, unprivileged) — a *stricter* layer on top of the
+helper's hard floor:
 
 - `PressureLevel::Normal` and pressure calm (e.g. `some_avg60 < 5%`).
 - Cooldown (e.g. ≥10 min between cycles).
@@ -150,7 +164,9 @@ Policy stays in mgd (the daemon, unprivileged):
   **decompressed estimate** (use `zramctl` original-data-size, not the
   compressed figure) against available RAM, or the reclaim itself can OOM the
   system at the moment all pages land back in RAM. Require a real margin
-  (e.g. MemAvailable > decompressed-size × 1.5).
+  (e.g. MemAvailable > decompressed-size × 1.5). The helper independently
+  enforces a bare `> 1.0×` floor so a direct invocation that bypasses this
+  policy still cannot self-OOM.
 
 mgd evaluates all gates, then — and only then — execs `mgd-zram-reclaim`.
 

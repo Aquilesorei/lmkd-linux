@@ -287,15 +287,21 @@ fn check_proactive_reclaim(pressure: &monitor::psi::MemoryPressure, log: &Logger
                 ),
             ));
         }
-        Err(e) => {
+        Err((code, e)) => {
             // Don't arm the cooldown on failure (matches the other watchers).
-            locked_print(&format!("[reclaim] helper failed: {e}"));
+            locked_print(&format!("[reclaim] helper failed (exit {code:?}): {e}"));
             log.log(&LogEntry::new("RECLAIM", 0, "zram", 0.0, &format!("failed: {e}")));
-            // A privilege failure (helper present but uncapped) is persistent;
-            // disable for the session so it isn't retried every cooldown.
-            if e.contains("exit status: 1") || e.contains("EPERM") {
+            // Exit-code contract from mgd-zram-reclaim:
+            //   2 = swapoff EPERM → binary not capped → PERSISTENT, disable for
+            //       the session so it isn't retried every cooldown.
+            //   1 = transient kernel error, 3 = refused (unsafe headroom),
+            //       4 = no meminfo → all transient/conditional, keep trying.
+            if code == Some(2) {
                 RECLAIM_DISABLED.store(true, Ordering::Relaxed);
-                locked_print("[reclaim] disabling for session (helper present but reclaim failed)");
+                locked_print(
+                    "[reclaim] disabling for session: helper present but not capped \
+                     (setcap cap_sys_admin+ep). See docs/PRIVILEGE_DESIGN.md §2."
+                );
             }
         }
     }
@@ -318,16 +324,18 @@ fn helper_available(path: &str) -> bool {
 
 /// Exec the capped helper with a CLEARED environment and no arguments — matches
 /// the helper's no-argv/no-env discipline and removes any inherited-env vector.
-/// Returns Err with a message on non-zero exit or spawn failure.
-fn run_reclaim_helper(path: &str) -> Result<(), String> {
+/// Returns Ok(()) on exit 0, or Err((exit_code, message)) otherwise. The exit
+/// code distinguishes uncapped (persistent) from refused/transient failures —
+/// see mgd-zram-reclaim's exit-code contract.
+fn run_reclaim_helper(path: &str) -> Result<(), (Option<i32>, String)> {
     let status = std::process::Command::new(path)
         .env_clear()
         .status()
-        .map_err(|e| format!("spawn failed: {e}"))?;
+        .map_err(|e| (None, format!("spawn failed: {e}")))?;
     if status.success() {
         Ok(())
     } else {
-        Err(format!("{status}"))
+        Err((status.code(), format!("{status}")))
     }
 }
 

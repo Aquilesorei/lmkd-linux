@@ -67,18 +67,29 @@ pub fn compact(device: &str) -> io::Result<()> {
 
 // ── pure parse helpers (unit-tested) ─────────────────────────────────────────
 
-/// Extract zram swap-device basenames from /proc/swaps content. The first
-/// column is the device path (e.g. `/dev/zram0`); we keep basenames starting
-/// with `zram`. The header line and disk/file swaps are skipped.
+/// Extract zram swap-device basenames (e.g. `zram0`) from /proc/swaps content.
+/// Validation anchors on the canonical `/dev/zram<N>` path, not a basename
+/// `starts_with("zram")`, so a swapfile named like `zram-cache` is not mistaken
+/// for a zram block device. The header line and disk/file swaps are skipped.
 fn parse_zram_devices(swaps: &str) -> Vec<String> {
     swaps
         .lines()
         .skip(1) // header: "Filename  Type  Size  Used  Priority"
         .filter_map(|line| line.split_whitespace().next())
+        .filter(|path| is_zram_device_path(path))
         .filter_map(|dev| dev.rsplit('/').next())
-        .filter(|base| base.starts_with("zram"))
         .map(|s| s.to_string())
         .collect()
+}
+
+/// True only for a canonical zram block-device path: `/dev/zram` followed by at
+/// least one ASCII digit (e.g. `/dev/zram0`). Rejects swapfiles, partitions,
+/// and lookalike names such as `/swap/zram-cache`.
+fn is_zram_device_path(path: &str) -> bool {
+    match path.strip_prefix("/dev/zram") {
+        Some(rest) => !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()),
+        None => false,
+    }
 }
 
 /// Parse `mem_used_total` (bytes) — the 3rd whitespace field of mm_stat:
@@ -126,6 +137,24 @@ mod tests {
         // Header only, no swap devices.
         let swaps = "Filename Type Size Used Priority\n";
         assert!(parse_zram_devices(swaps).is_empty());
+    }
+
+    #[test]
+    fn test_parse_zram_devices_skips_lookalike_swapfile() {
+        // A swapfile named like a zram device must not be picked up — anchored
+        // /dev/zram<N> validation rejects it.
+        let swaps = "Filename Type Size Used Priority\n\
+                     /swap/zram-cache file 2097152 0 -3\n";
+        assert!(parse_zram_devices(swaps).is_empty());
+    }
+
+    #[test]
+    fn test_is_zram_device_path() {
+        assert!(is_zram_device_path("/dev/zram0"));
+        assert!(is_zram_device_path("/dev/zram10"));
+        assert!(!is_zram_device_path("/dev/zram"));
+        assert!(!is_zram_device_path("/swap/zram-cache"));
+        assert!(!is_zram_device_path("/dev/nvme0n1p3"));
     }
 
     #[test]
