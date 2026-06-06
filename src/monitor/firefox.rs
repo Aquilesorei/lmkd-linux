@@ -1,18 +1,14 @@
 //! Firefox preventive-memory watcher.
+//! Firefox preventive GC watcher.
 //!
-//! Firefox does not release RSS after tabs close, growing unbounded over long
-//! sessions; on Intel UMA GPUs it also holds GPU buffers backed by system RAM.
-//! This watcher runs ONLY while the system is healthy (PressureLevel::Normal) and
-//! nudges Firefox's internal GC via SIGUSR1 to keep it lean before pressure hits.
-//!
-//! It is strictly complementary to the evictor: under any pressure the evictor
-//! handles Firefox content processes via the priority system, and this watcher
-//! bails out. The two must never act on Firefox concurrently.
+//! Firefox doesn't release RSS after tabs close. At Normal pressure only, nudge
+//! its internal GC via SIGUSR1 to keep it lean. Under pressure the evictor
+//! handles Firefox via the priority system; the two must not act on it at once.
 
 use crate::monitor::process::Process;
 
-/// Names (as seen in /proc/<pid>/comm, truncated to 15 chars) of Firefox content
-/// processes — these mirror the `browser-isolated` regex in priorities.toml.
+/// Firefox content-process comm names (15-char truncated). Mirror the
+/// `browser-isolated` regex in priorities.toml.
 const CONTENT_NAMES: &[&str] = &[
     "Isolated",
     "Isolated Servic",

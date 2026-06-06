@@ -4,11 +4,8 @@ use std::io;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
-/// Standard absolute locations for the `criu` binary, probed in order. We never
-/// resolve criu via a `PATH` search: once the binary is capped
-/// (`cap_checkpoint_restore,cap_sys_ptrace+ep`), a PATH lookup would be a
-/// privilege-hijack vector — a `criu` planted earlier in `PATH` would run with
-/// those caps. All candidates are root-controlled absolute paths.
+/// criu locations, probed in order. Never a PATH search: a capped criu invoked
+/// by bare name would let a planted criu run with the caps. All root-controlled.
 const CRIU_CANDIDATES: &[&str] = &[
     "/usr/sbin/criu",
     "/usr/bin/criu",
@@ -18,19 +15,16 @@ const CRIU_CANDIDATES: &[&str] = &[
     "/usr/local/bin/criu",
 ];
 
-/// Resolved absolute path to criu (probed once), or None if not installed.
 static CRIU_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
 
-/// Absolute path to the criu binary, resolved once from the fixed candidate
-/// list. None if criu is not installed. Never does a PATH search.
+/// Absolute path to criu, resolved once. None if not installed.
 pub fn criu_path() -> Option<&'static PathBuf> {
     CRIU_PATH
         .get_or_init(|| resolve_in(CRIU_CANDIDATES))
         .as_ref()
 }
 
-/// First candidate path that exists and is executable, or None. Pure (takes the
-/// candidate list) so it is unit-testable without touching global state.
+/// First existing+executable candidate. Pure, for testing.
 fn resolve_in(candidates: &[&str]) -> Option<PathBuf> {
     candidates
         .iter()
@@ -38,17 +32,14 @@ fn resolve_in(candidates: &[&str]) -> Option<PathBuf> {
         .find(|p| is_executable(p))
 }
 
-/// True if `path` exists and is executable (access X_OK). No PATH search.
 fn is_executable(path: &std::path::Path) -> bool {
     use std::os::unix::ffi::OsStrExt;
     let Ok(c) = std::ffi::CString::new(path.as_os_str().as_bytes()) else { return false };
     unsafe { libc::access(c.as_ptr(), libc::X_OK) == 0 }
 }
 
-/// Heuristic: does this criu stderr indicate a privilege/capability shortfall
-/// (as opposed to a process-specific restore failure)? Used to give the user a
-/// targeted "run setcap" hint instead of a generic error. Inference-based so we
-/// avoid a libcap dependency just to read file caps.
+/// Whether criu stderr looks like a capability shortfall vs a per-process restore
+/// failure — drives the "run setcap" hint. Inference-based to avoid a libcap dep.
 pub fn looks_like_privilege_error(stderr: &str) -> bool {
     let s = stderr.to_ascii_lowercase();
     s.contains("operation not permitted")
@@ -75,11 +66,9 @@ pub struct RestoreResult {
     pub error: Option<String>,
 }
 
-/// Checkpoint a process using CRIU — save state to disk and kill it.
-/// Falls back to SIGSTOP if CRIU fails.
+/// CRIU dump to disk, then SIGKILL on success.
 pub fn checkpoint(pid: u32, name: &str) -> CheckpointResult {
-    // Sanitize comm name: kernel allows '/' in prctl-set names, which would escape
-    // the snapshots directory. Replace any non-alphanumeric char with '_'.
+    // comm may contain '/' (prctl-set), which would escape the snapshot dir.
     let safe_name: String = name
         .chars()
         .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '_' })
@@ -109,7 +98,6 @@ pub fn checkpoint(pid: u32, name: &str) -> CheckpointResult {
         }
     };
 
-    // Resolve criu by absolute path (never PATH — the binary may be capped).
     let Some(criu) = criu_path() else {
         let _ = fs::remove_dir_all(&snapshot_dir);
         return CheckpointResult {
@@ -135,12 +123,11 @@ pub fn checkpoint(pid: u32, name: &str) -> CheckpointResult {
 
     match output {
         Ok(out) if out.status.success() => {
-            // CRIU succeeded — now kill the process (state is saved)
+            // State saved — kill the process.
             let kill_ret = unsafe { libc::kill(pid as i32, libc::SIGKILL) };
             if kill_ret != 0 {
                 let errno = io::Error::last_os_error().raw_os_error().unwrap_or(0);
-                // ESRCH = process already gone, which is fine
-                if errno != libc::ESRCH {
+                if errno != libc::ESRCH { // ESRCH = already gone
                     return CheckpointResult {
                         pid,
                         success: false,
@@ -157,7 +144,6 @@ pub fn checkpoint(pid: u32, name: &str) -> CheckpointResult {
             }
         }
         Ok(out) => {
-            // CRIU failed — clean up partial snapshot, caller decides what to do
             let _ = fs::remove_dir_all(&snapshot_dir);
             let stderr = String::from_utf8_lossy(&out.stderr).to_string();
             let error = if looks_like_privilege_error(&stderr) {
@@ -257,8 +243,6 @@ mod tests {
 
     #[test]
     fn resolve_in_finds_first_executable() {
-        // /bin/sh exists and is executable on any POSIX system; a bogus path
-        // before it must be skipped, and the real one returned.
         let candidates = ["/nonexistent/criu", "/bin/sh"];
         assert_eq!(resolve_in(&candidates), Some(PathBuf::from("/bin/sh")));
     }
@@ -271,8 +255,7 @@ mod tests {
 
     #[test]
     fn resolve_in_respects_order() {
-        // Two real executables — the earlier candidate wins.
-        let candidates = ["/bin/sh", "/bin/cat"];
+        let candidates = ["/bin/sh", "/bin/cat"]; // earlier wins
         assert_eq!(resolve_in(&candidates), Some(PathBuf::from("/bin/sh")));
     }
 

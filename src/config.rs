@@ -52,11 +52,7 @@ struct RawConfig {
     firefox: Firefox,
 }
 
-/// Optional plasma-discover idle-reap watcher. plasma-discover (KDE's package
-/// manager) accumulates RAM + GPU buffers and is non-critical — when it is idle
-/// and over the RSS threshold mgd SIGTERMs it; KDE relaunches it on demand.
-/// Runs on the maintenance thread (the idle CPU sample blocks). Enabled by
-/// default — reaping it has no user-visible cost.
+/// `[plasma_discover]` — idle-reap watcher (on by default). See priorities.toml.
 #[derive(Deserialize)]
 struct PlasmaDiscover {
     #[serde(default = "default_pd_watch")]
@@ -85,12 +81,7 @@ fn default_pd_threshold() -> u64 { 400 }
 fn default_pd_idle() -> u64 { 60 }
 fn default_pd_cooldown() -> u64 { 30 }
 
-/// Optional zram compaction. When pressure reaches Elevated (or higher), mgd
-/// repacks the zram pool to release fragmented-but-empty pages back to RAM
-/// before touching any process — a cheap (~100ms) system pre-action that needs
-/// no privileged binary, only the opt-in sysfs grant (see PRIVILEGE_DESIGN §1).
-/// Skipped when the pool holds less than `min_used_mb` (not worth the walk).
-/// Enabled by default — it is non-destructive and never touches a process.
+/// `[zram]` — compaction pre-action (on by default). See priorities.toml.
 #[derive(Deserialize)]
 struct Zram {
     #[serde(default = "default_zram_compact")]
@@ -111,27 +102,19 @@ impl Default for Zram {
 fn default_zram_compact() -> bool { true }
 fn default_zram_min_used() -> u64 { 128 }
 
-/// Optional proactive swap reclaim (Phase 3 / PRIVILEGE_DESIGN §2). When the
-/// system is calm, cycles the zram swap device (swapoff/swapon) via the capped
-/// `mgd-zram-reclaim` helper to pull compressed pages back into RAM. PRIVILEGED:
-/// needs the opt-in capped helper, so it defaults OFF. All safety gates
-/// (decompressed-headroom OOM guard, cooldown, min-used) live in the daemon;
-/// the helper is dumb.
+/// `[reclaim]` — proactive swap reclaim (PRIVILEGED, off by default; needs the
+/// capped helper). Gates live in the daemon. See priorities.toml.
 #[derive(Deserialize)]
 struct Reclaim {
-    #[serde(default)] // privileged → off unless explicitly enabled
+    #[serde(default)] // off unless explicitly enabled
     proactive_swap_reclaim: bool,
-    /// Only reclaim when swap is at least this % full (no point otherwise).
     #[serde(default = "default_reclaim_threshold_pct")]
     threshold_pct: f64,
     #[serde(default = "default_reclaim_cooldown")]
     cooldown_min: u64,
-    /// Skip reclaim unless the zram pool holds at least this much compressed RAM.
     #[serde(default = "default_reclaim_min_used")]
     min_zram_used_mb: u64,
-    /// Require MemAvailable > decompressed_footprint × this multiplier before
-    /// reclaiming — the OOM guard. zram stores compressed; pages expand 2-3× on
-    /// the way back into RAM.
+    /// OOM guard: require MemAvailable > decompressed_footprint × this.
     #[serde(default = "default_reclaim_headroom_mult")]
     decompressed_headroom_mult: f64,
 }
@@ -153,11 +136,8 @@ fn default_reclaim_cooldown() -> u64 { 10 }
 fn default_reclaim_min_used() -> u64 { 2048 }
 fn default_reclaim_headroom_mult() -> f64 { 1.5 }
 
-/// Optional page-cache drop (Phase 4). At `trigger_level` pressure or higher,
-/// before freezing any process, advise the kernel to drop page cache for the
-/// configured directory trees via posix_fadvise(DONTNEED). No privilege (own
-/// files), non-destructive (clean pages only). Enabled by default, but a no-op
-/// until `paths` is populated.
+/// `[cache_drop]` — page-cache drop pre-action (on by default, no-op until
+/// `paths` is set). See priorities.toml.
 #[derive(Deserialize)]
 struct CacheDrop {
     #[serde(default = "default_cache_enabled")]
@@ -185,8 +165,7 @@ fn default_cache_enabled() -> bool { true }
 fn default_cache_trigger() -> String { "High".to_string() }
 fn default_cache_cooldown() -> u64 { 5 }
 
-/// Optional Firefox preventive-memory watcher. Disabled unless `watch_memory = true`.
-/// Runs only at PressureLevel::Normal — see evictor::check_firefox_memory.
+/// `[firefox]` — preventive GC watcher (off by default). See priorities.toml.
 #[derive(Deserialize)]
 struct Firefox {
     #[serde(default)]
@@ -214,8 +193,7 @@ fn default_ff_threshold() -> u64 { 3072 }
 fn default_ff_cooldown() -> u64 { 15 }
 fn default_ff_warn() -> u64 { 4096 }
 
-/// Optional plasmashell GPU-leak watcher (KDE Plasma + Intel UMA workaround).
-/// Disabled unless `watch_gpu_leak = true`.
+/// `[plasma]` — plasmashell GPU-leak watcher (off by default). See priorities.toml.
 #[derive(Deserialize)]
 struct Plasma {
     #[serde(default)]
@@ -296,8 +274,7 @@ pub struct CompiledConfig {
     pub pd_idle_check_secs: u64,
     /// Minimum seconds between plasma-discover reaps (cooldown floor).
     pub pd_cooldown_secs: u64,
-    /// zram compaction pre-action — on unless disabled in [zram]. Runs when
-    /// pressure is Elevated or higher, before any process is touched.
+    /// zram compaction pre-action — on unless disabled in [zram].
     pub compact_zram_on_elevated: bool,
     /// Skip zram compaction when the pool holds less than this many MB.
     pub zram_min_used_mb: u64,

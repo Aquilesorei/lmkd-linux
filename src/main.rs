@@ -84,13 +84,10 @@ fn main() {
     let frozen = Arc::new(Mutex::new(FrozenRegistry::new()));
     let checkpointed = Arc::new(Mutex::new(CheckpointRegistry::new()));
 
-    // Single shared logger — both actors write to one session file (and rotation
-    // runs once, not twice). Logger::log() takes &self, so Arc sharing is safe.
+    // One shared logger so rotation runs once. log() takes &self.
     let logger = Arc::new(logger::Logger::new());
 
-    // ── Signal handlers ─────────────────────────────────────────────────────
-    // All three signal handlers are async-signal-safe: they only store to
-    // AtomicBool with Relaxed, which compiles to a single `mov` on x86/ARM.
+    // Handlers are async-signal-safe: a single relaxed atomic store.
     unsafe {
         libc::signal(libc::SIGINT,  handle_sigterm as *const () as libc::sighandler_t);
         libc::signal(libc::SIGTERM, handle_sigterm as *const () as libc::sighandler_t);
@@ -115,19 +112,17 @@ fn main() {
     let l4 = Arc::clone(&logger);
     let maintenance = thread::spawn(move || maintenance::run(l4));
 
-    // Block until the actors exit (they check should_shutdown() each iteration)
     let _ = responder.join();
     let _ = recovery.join();
     let _ = ipc.join();
     let _ = maintenance.join();
 
-    // Final unfreeze sweep — no race: both actors are done, no new freezes possible
+    // Actors are done, so no new freezes: safe to sweep.
     shutdown_unfreeze(&frozen);
 }
 
-/// Remove any snapshot directories left behind by a previous daemon crash.
-/// CheckpointRegistry is in-memory only — orphaned snapshots would never be cleaned
-/// up otherwise, leaking potentially hundreds of MB across restarts.
+
+/// Remove snapshot dirs left by a previous crash — the registry isn't persisted.
 fn cleanup_orphaned_snapshots() {
     let dir = util::home_dir().join(".local/share/mgd/snapshots");
     let Ok(entries) = std::fs::read_dir(&dir) else { return };

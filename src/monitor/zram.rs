@@ -1,80 +1,59 @@
-//! zram introspection + compaction.
+//! zram introspection and compaction.
 //!
-//! zram keeps swapped-out pages compressed in RAM, but its allocator
-//! fragments over time: freed slots are not automatically coalesced, so the
-//! pool can hold more RAM than its live compressed data needs. Writing `1` to
-//! `/sys/block/<dev>/compact` triggers the kernel to repack live objects and
-//! release whole empty pages back to the system — a cheap (~100ms) win with no
-//! process touched.
-//!
-//! The compact sysfs node is `0200 root:root` by default, so the unprivileged
-//! daemon cannot write it. The opt-in `packaging/mgd-zram.conf` tmpfiles grant
-//! makes it group-writable by the `mgd` group (see docs/PRIVILEGE_DESIGN.md §1).
-//! Without that grant the write fails with `EACCES` and the caller degrades
-//! gracefully.
+//! Compacting (`echo 1 > /sys/block/<dev>/compact`) repacks the pool and frees
+//! pages stranded by allocator fragmentation. The node is `0200 root:root`; the
+//! opt-in tmpfiles grant (`packaging/mgd-zram.conf`) makes it group-writable.
+//! Without it, `compact` returns EACCES and the caller degrades.
 
 use std::fs;
 use std::io;
 use std::path::PathBuf;
 
-/// zram swap devices currently active, by basename (e.g. `zram0`).
-/// Parsed from /proc/swaps — only devices actually used as swap qualify, which
-/// is what mgd cares about (zram used as a plain block device is out of scope).
+/// Active zram swap devices by basename (e.g. `zram0`), from /proc/swaps.
 pub fn zram_devices() -> Vec<String> {
     let content = fs::read_to_string("/proc/swaps").unwrap_or_default();
     parse_zram_devices(&content)
 }
 
-/// RAM the zram pool occupies right now, in MB (`mem_used_total` from
-/// /sys/block/<dev>/mm_stat). This is the *compressed* footprint actually held
-/// in RAM — the right figure for the min-used gate. Returns None if the node is
-/// unreadable.
+/// Compressed RAM the pool holds, MB (`mem_used_total`). For the min-used gate.
 pub fn zram_used_mb(device: &str) -> Option<u64> {
     let path = format!("/sys/block/{device}/mm_stat");
     let content = fs::read_to_string(path).ok()?;
     parse_mem_used_bytes(&content).map(|b| b / (1024 * 1024))
 }
 
-/// The *decompressed* footprint of a zram pool in MB (`orig_data_size`, field 0
-/// of mm_stat). This is the RAM that pages will occupy once swapped back in —
-/// 2-3× the compressed `mem_used_total`. The proactive-reclaim headroom gate
-/// must use THIS figure (not the compressed one) to avoid OOMing the system at
-/// the moment all pages land back in RAM. Returns None if the node is unreadable.
+/// Decompressed footprint, MB (`orig_data_size`) — 2-3x the compressed figure.
+/// The reclaim headroom gate uses this: it's the RAM pages reclaim into.
 pub fn zram_orig_mb(device: &str) -> Option<u64> {
     let path = format!("/sys/block/{device}/mm_stat");
     let content = fs::read_to_string(path).ok()?;
     parse_orig_data_bytes(&content).map(|b| b / (1024 * 1024))
 }
 
-/// Total decompressed footprint across all active zram swap devices, in MB.
-/// The figure the reclaim headroom gate compares against MemAvailable.
+/// Total decompressed footprint across all zram swap devices, MB.
 pub fn zram_orig_mb_total() -> u64 {
     zram_devices().iter().filter_map(|d| zram_orig_mb(d)).sum()
 }
 
-/// Total compressed RAM held across all active zram swap devices, in MB.
-/// Used for the min-used gate (skip reclaim when little is stored).
+/// Total compressed RAM across all zram swap devices, MB.
 pub fn zram_used_mb_total() -> u64 {
     zram_devices().iter().filter_map(|d| zram_used_mb(d)).sum()
 }
 
-/// Trigger compaction on one device: write `1` to /sys/block/<dev>/compact.
-/// `EACCES` here means the tmpfiles grant is absent (node still root-only).
+/// Compact one device. EACCES means the tmpfiles grant is absent.
 pub fn compact(device: &str) -> io::Result<()> {
     let path: PathBuf = format!("/sys/block/{device}/compact").into();
     fs::write(path, b"1")
 }
 
-// ── pure parse helpers (unit-tested) ─────────────────────────────────────────
+// ── parse helpers ─────────────────────────────────────────────────────────────
 
-/// Extract zram swap-device basenames (e.g. `zram0`) from /proc/swaps content.
-/// Validation anchors on the canonical `/dev/zram<N>` path, not a basename
-/// `starts_with("zram")`, so a swapfile named like `zram-cache` is not mistaken
-/// for a zram block device. The header line and disk/file swaps are skipped.
+/// zram swap basenames from /proc/swaps. Anchored on `/dev/zram<N>` so a
+/// swapfile named `zram-cache` isn't mistaken for a device.
 fn parse_zram_devices(swaps: &str) -> Vec<String> {
     swaps
         .lines()
-        .skip(1) // header: "Filename  Type  Size  Used  Priority"
+        .skip(1) // header
         .filter_map(|line| line.split_whitespace().next())
         .filter(|path| is_zram_device_path(path))
         .filter_map(|dev| dev.rsplit('/').next())
@@ -82,9 +61,7 @@ fn parse_zram_devices(swaps: &str) -> Vec<String> {
         .collect()
 }
 
-/// True only for a canonical zram block-device path: `/dev/zram` followed by at
-/// least one ASCII digit (e.g. `/dev/zram0`). Rejects swapfiles, partitions,
-/// and lookalike names such as `/swap/zram-cache`.
+/// `/dev/zram` followed by digits — rejects partitions and lookalike swapfiles.
 fn is_zram_device_path(path: &str) -> bool {
     match path.strip_prefix("/dev/zram") {
         Some(rest) => !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()),
@@ -92,15 +69,13 @@ fn is_zram_device_path(path: &str) -> bool {
     }
 }
 
-/// Parse `mem_used_total` (bytes) — the 3rd whitespace field of mm_stat:
-///   orig_data_size compr_data_size mem_used_total ...
+/// `mem_used_total` — field 2 (0-indexed) of mm_stat:
+/// `orig_data_size compr_data_size mem_used_total ...`
 fn parse_mem_used_bytes(mm_stat: &str) -> Option<u64> {
     mm_stat.split_whitespace().nth(2)?.parse().ok()
 }
 
-/// Parse `orig_data_size` (bytes) — the 1st whitespace field of mm_stat. This
-/// is the uncompressed size of the stored data; the figure the reclaim headroom
-/// gate must use (see zram_orig_mb).
+/// `orig_data_size` — field 0 of mm_stat.
 fn parse_orig_data_bytes(mm_stat: &str) -> Option<u64> {
     mm_stat.split_whitespace().next()?.parse().ok()
 }
