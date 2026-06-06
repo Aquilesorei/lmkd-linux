@@ -123,7 +123,9 @@ pub fn plan(
         .map(|p| {
             let prio = cfg.priority_for(&p.name, p.exe_basename.as_deref());
             let gpu_kb = if count_gpu {
-                crate::monitor::gpu::process_gpu_kb(p.pid).unwrap_or(0)
+                // Cached: the per-fd fdinfo sweep is paid once per 30s per PID,
+                // not every 5s cycle — keeps the High+ loop responsive.
+                crate::monitor::gpu::process_gpu_kb_cached(p.pid)
             } else {
                 0
             };

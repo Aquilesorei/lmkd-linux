@@ -13,8 +13,46 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
+use std::sync::{LazyLock, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// TTL for the per-PID GPU residency cache. GPU footprint moves slowly relative
+/// to the 5s evictor cycle, so a value stale by ≤30s is fine for SORT RANKING
+/// (its only consumer). During a sustained High+ pressure episode this means the
+/// fdinfo walk is paid once on entry, not every cycle.
+const GPU_CACHE_TTL: Duration = Duration::from_secs(30);
+
+/// pid → (resident KiB, sampled-at). Module-global; advisory ranking data only.
+/// Keyed on pid alone (no start_time recycle guard): a recycled PID at worst
+/// mis-ranks one candidate for up to one TTL window, and this value is NEVER
+/// credited toward the deficit — so the blast radius is a single sort position.
+static GPU_CACHE: LazyLock<Mutex<HashMap<u32, (u64, Instant)>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Cached form of [`process_gpu_kb`], collapsing the per-fd fdinfo walk to once
+/// per [`GPU_CACHE_TTL`] per PID. Returns resident GPU KiB (0 if not a GPU client
+/// or unreadable). This is the entry point the evictor's `plan()` uses, so the
+/// ~60ms full sweep is paid only on the first High+ cycle of a pressure episode.
+pub fn process_gpu_kb_cached(pid: u32) -> u64 {
+    let now = Instant::now();
+    if let Ok(cache) = GPU_CACHE.lock()
+        && let Some(&(kb, at)) = cache.get(&pid)
+        && now.duration_since(at) < GPU_CACHE_TTL
+    {
+        return kb;
+    }
+
+    let kb = process_gpu_kb(pid).unwrap_or(0);
+
+    if let Ok(mut cache) = GPU_CACHE.lock() {
+        // Prune expired entries so the map can't grow without bound as GPU PIDs
+        // churn over the daemon's lifetime.
+        cache.retain(|_, (_, at)| now.duration_since(*at) < GPU_CACHE_TTL);
+        cache.insert(pid, (kb, now));
+    }
+    kb
+}
 
 /// Sum of resident GPU memory (KiB) across all of this process's DRM clients.
 ///
@@ -22,17 +60,30 @@ use std::time::Duration;
 /// can't be read. A process dup's its DRM fd many times but each fd reports the
 /// same per-client totals, so we deduplicate by `drm-client-id` to avoid
 /// multiply-counting one allocation.
+///
+/// Walk is gated on `/proc/<pid>/fd` symlinks: only fds pointing into `/dev/dri/`
+/// have their fdinfo read. `readlink` is one cheap syscall, so non-GPU processes
+/// (and a GPU process's many non-DRM fds) cost a readdir + readlinks and no file
+/// reads at all — the bulk of the sweep cost lands only on real DRM clients.
 pub fn process_gpu_kb(pid: u32) -> Option<u64> {
-    let dir = format!("/proc/{pid}/fdinfo");
-    let entries = fs::read_dir(&dir).ok()?;
+    let fd_dir = format!("/proc/{pid}/fd");
+    let entries = fs::read_dir(&fd_dir).ok()?;
 
     // client-id → resident KiB. HashMap dedups dup'd fds of the same DRM client.
     let mut per_client: HashMap<String, u64> = HashMap::new();
     let mut saw_drm = false;
 
     for entry in entries.filter_map(|e| e.ok()) {
-        // fdinfo files are tiny; a read error on one fd (e.g. it closed) is not fatal.
-        let Ok(content) = fs::read_to_string(entry.path()) else { continue };
+        // Cheap gate: skip any fd that isn't a DRM device node before touching fdinfo.
+        match fs::read_link(entry.path()) {
+            Ok(target) if target.to_string_lossy().starts_with("/dev/dri/") => {}
+            _ => continue,
+        }
+
+        // fdinfo mirrors the fd number: /proc/<pid>/fdinfo/<fd>. Tiny file; a read
+        // error on one fd (e.g. it closed between readdir and read) is not fatal.
+        let fdinfo = format!("/proc/{pid}/fdinfo/{}", entry.file_name().to_string_lossy());
+        let Ok(content) = fs::read_to_string(&fdinfo) else { continue };
 
         let mut client_id: Option<&str> = None;
         let mut resident_kb: u64 = 0;
@@ -145,5 +196,16 @@ mod tests {
         // Bare number = bytes per DRM spec.
         assert_eq!(parse_mem_kb("4096"), Some(4));
         assert_eq!(parse_mem_kb("garbage"), None);
+    }
+
+    #[test]
+    fn cached_is_consistent_and_hits() {
+        // Own PID (test runner) is not a DRM client, so this exercises the
+        // non-GPU fast path: first call computes (0), second is a cache hit.
+        // Asserts the cache returns a stable value and never panics.
+        let pid = std::process::id();
+        let first = process_gpu_kb_cached(pid);
+        let second = process_gpu_kb_cached(pid);
+        assert_eq!(first, second);
     }
 }
