@@ -16,9 +16,6 @@ use crate::monitor::psi::PressureLevel;
 /// Unix-seconds of the last plasmashell restart (0 = never).
 static LAST_PLASMA_RESTART: AtomicU64 = AtomicU64::new(0);
 
-/// Unix-seconds of the last Firefox GC trigger (0 = never).
-static LAST_FIREFOX_GC: AtomicU64 = AtomicU64::new(0);
-
 /// Set once on zram-compact EACCES (grant absent) to log only once per session.
 static ZRAM_COMPACT_DISABLED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -57,7 +54,6 @@ pub fn run(
         print_status(&pressure, &effective_level, &procs, &meminfo, &frozen);
 
         check_plasma_gpu(&procs, &log);
-        check_firefox_memory(&procs, &effective_level, &log);
 
         // System pre-actions run before plan() so their freed RAM shrinks the
         // deficit. zram compact (cheaper) first, then cache drop.
@@ -149,53 +145,6 @@ fn check_plasma_gpu(procs: &[Process], log: &Logger) {
         "RESTART", pid, "plasmashell", 0.0,
         &format!("gpu_leak_reclaimed {before_mb}MB→{after_mb}MB"),
     ));
-}
-
-/// Nudge Firefox's GC via SIGUSR1 (non-disruptive) when its total RSS is high.
-/// Normal pressure only — under pressure the evictor handles Firefox instead, and
-/// the two must not act on it at once. No-op unless `[firefox] watch_memory = true`.
-fn check_firefox_memory(procs: &[Process], level: &PressureLevel, log: &Logger) {
-    let (rss_threshold_mb, warn_threshold_mb, cooldown_secs) = {
-        let cfg = crate::config::get();
-        if !cfg.watch_firefox {
-            return;
-        }
-        (cfg.firefox_rss_threshold_mb, cfg.firefox_warn_threshold_mb, cfg.firefox_gc_cooldown_secs)
-    };
-
-    if *level != PressureLevel::Normal {
-        return;
-    }
-
-    let (total_kb, _pids) = crate::monitor::firefox::firefox_total_rss_kb(procs);
-    let total_mb = total_kb / 1024;
-
-    // Informational, always logged, no cooldown.
-    if total_mb >= warn_threshold_mb {
-        log.log(&LogEntry::new("WARN", 0, "firefox", total_mb as f64, "rss_above_warn_threshold"));
-    }
-
-    if total_mb < rss_threshold_mb {
-        return;
-    }
-
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-    let last = LAST_FIREFOX_GC.load(Ordering::Relaxed);
-    if last != 0 && now.saturating_sub(last) < cooldown_secs {
-        return;
-    }
-
-    match crate::monitor::firefox::trigger_firefox_gc(procs) {
-        Ok(pid) => {
-            LAST_FIREFOX_GC.store(now, Ordering::Relaxed);
-            log.log(&LogEntry::new("GC", pid, "firefox", total_mb as f64, "gc_triggered"));
-        }
-        Err(e) => {
-            // Don't arm the cooldown on failure.
-            sync_print!("[firefox] GC skipped: {e}");
-            log.log(&LogEntry::new("GC", 0, "firefox", total_mb as f64, &format!("skipped: {e}")));
-        }
-    }
 }
 
 /// Compact zram at Elevated+ to free fragmented pages before touching a process.

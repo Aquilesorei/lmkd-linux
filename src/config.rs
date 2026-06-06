@@ -48,8 +48,6 @@ struct RawConfig {
     reclaim: Reclaim,
     #[serde(default)]
     cache_drop: CacheDrop,
-    #[serde(default)]
-    firefox: Firefox,
 }
 
 /// `[plasma_discover]` — idle-reap watcher (on by default). See priorities.toml.
@@ -165,34 +163,6 @@ fn default_cache_enabled() -> bool { true }
 fn default_cache_trigger() -> String { "High".to_string() }
 fn default_cache_cooldown() -> u64 { 5 }
 
-/// `[firefox]` — preventive GC watcher (off by default). See priorities.toml.
-#[derive(Deserialize)]
-struct Firefox {
-    #[serde(default)]
-    watch_memory: bool,
-    #[serde(default = "default_ff_threshold")]
-    rss_threshold_mb: u64,
-    #[serde(default = "default_ff_cooldown")]
-    gc_cooldown_min: u64,
-    #[serde(default = "default_ff_warn")]
-    warn_threshold_mb: u64,
-}
-
-impl Default for Firefox {
-    fn default() -> Self {
-        Firefox {
-            watch_memory: false,
-            rss_threshold_mb: default_ff_threshold(),
-            gc_cooldown_min: default_ff_cooldown(),
-            warn_threshold_mb: default_ff_warn(),
-        }
-    }
-}
-
-fn default_ff_threshold() -> u64 { 3072 }
-fn default_ff_cooldown() -> u64 { 15 }
-fn default_ff_warn() -> u64 { 4096 }
-
 /// `[plasma]` — plasmashell GPU-leak watcher (off by default). See priorities.toml.
 #[derive(Deserialize)]
 struct Plasma {
@@ -296,12 +266,6 @@ pub struct CompiledConfig {
     pub cache_drop_cooldown_secs: u64,
     /// Directory-tree patterns (~ and single-* per segment) to drop cache for.
     pub cache_drop_paths: Vec<String>,
-    /// Firefox preventive-memory watcher — off unless enabled in [firefox].
-    pub watch_firefox: bool,
-    pub firefox_rss_threshold_mb: u64,
-    /// Minimum seconds between Firefox GC attempts (cooldown floor).
-    pub firefox_gc_cooldown_secs: u64,
-    pub firefox_warn_threshold_mb: u64,
     /// (regex, priority, checkpoint_override)
     entries: Vec<(Regex, u8, Option<bool>)>,
     /// Patterns that must never be touched
@@ -428,10 +392,6 @@ fn compile(content: &str) -> Result<CompiledConfig, String> {
             }),
         cache_drop_cooldown_secs: raw.cache_drop.cooldown_min.saturating_mul(60),
         cache_drop_paths: raw.cache_drop.paths,
-        watch_firefox: raw.firefox.watch_memory,
-        firefox_rss_threshold_mb: raw.firefox.rss_threshold_mb,
-        firefox_gc_cooldown_secs: raw.firefox.gc_cooldown_min.saturating_mul(60),
-        firefox_warn_threshold_mb: raw.firefox.warn_threshold_mb,
         entries,
         protected,
         desktop_index,

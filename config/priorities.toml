@@ -97,18 +97,6 @@ paths = [
     # "~/.cache/JetBrains",
 ]
 
-# ── Firefox preventive-memory watcher ────────────────────────────────────────
-# Firefox never releases RSS after tabs close. When enabled, mgd nudges Firefox's
-# internal GC via SIGUSR1 (non-disruptive — Firefox keeps running) once total RSS
-# (main + content processes) crosses the threshold. Runs ONLY when the system is
-# healthy (Normal pressure); under any pressure the evictor handles Firefox tabs
-# via the priority system instead. Never restarts Firefox. Disabled by default.
-[firefox]
-watch_memory = false
-rss_threshold_mb = 3072           # trigger GC above this total RSS
-gc_cooldown_min = 15              # cooldown floor between GC attempts
-warn_threshold_mb = 4096          # log a warning above this (no action taken)
-
 # ── XDG desktop category fallback ────────────────────────────────────────────
 # Applied when a process isn't matched by any [[apps]] regex.
 # mgd reads /proc/PID/exe to get the untruncated binary name, looks it up in
