@@ -72,6 +72,13 @@ fn main() {
     println!("  RecoveryManager:    3s poll (unfreeze/restore)");
     println!("  MaintenanceManager: 60s poll (idle reaps, housekeeping)");
     println!("  IPC socket:         {}", lmkd_linux::socket_path().display());
+    match executor::checkpoint::criu_path() {
+        Some(p) => println!(
+            "  CRIU:               {} (checkpoint enabled; needs cap_checkpoint_restore,cap_sys_ptrace — falls back to kill if unprivileged)",
+            p.display()
+        ),
+        None => println!("  CRIU:               not found (checkpoint disabled — will SIGKILL instead)"),
+    }
     println!("Press Ctrl+C to stop\n");
 
     let frozen = Arc::new(Mutex::new(FrozenRegistry::new()));

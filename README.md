@@ -89,10 +89,23 @@ sudo install -m 0644 packaging/mgd-zram.conf /etc/tmpfiles.d/mgd-zram.conf
 sudo systemd-tmpfiles --create /etc/tmpfiles.d/mgd-zram.conf
 ```
 
-> Further grants (swap reclaim helper, CRIU caps) are documented in
-> `docs/PRIVILEGE_DESIGN.md` and land with their respective features. Each step
-> is independent — skipping one disables only that feature; mgd logs it
-> unavailable at startup and continues.
+CRIU checkpoint/restore without root (two narrow caps on the `criu` binary):
+```bash
+sudo setcap cap_checkpoint_restore,cap_sys_ptrace+ep "$(command -v criu)"
+# optional — only if you want live TCP connections (e.g. browsers) to survive
+# restore; widens the grant by one capability:
+sudo setcap cap_checkpoint_restore,cap_sys_ptrace,cap_net_admin+ep "$(command -v criu)"
+```
+
+> **Caveat:** a distro package update of `criu` **resets its file capabilities**.
+> Re-run the `setcap` above after upgrading criu, or mgd will fall back to
+> SIGKILL again (it logs the criu privilege failure with the exact command to
+> re-run).
+
+> Further grants are documented in `docs/PRIVILEGE_DESIGN.md`. Each step is
+> independent — skipping one disables only that feature; mgd logs it unavailable
+> at startup and continues. `./install.sh --privileged` applies all of these
+> automatically.
 
 ## Usage
 
@@ -174,10 +187,11 @@ session. System daemons (snapd, fwupd, root-owned services) are skipped
 by design — both because mgd lacks permission to signal them, and because
 its scope is deliberately limited to your session.
 
-Running mgd as root or with elevated capabilities is not recommended and
-not required for normal operation. CRIU checkpointing has reduced
-functionality without CAP_SYS_ADMIN; the daemon falls back to SIGKILL
-when checkpoint fails.
+Running mgd as root is not recommended and not required for normal
+operation. CRIU checkpointing works unprivileged once the `criu` binary
+is granted two narrow capabilities (`CAP_CHECKPOINT_RESTORE` +
+`CAP_SYS_PTRACE`) — **no root**. Without that grant the daemon simply
+falls back to SIGKILL when checkpoint fails. See the opt-in setup below.
 
 ## Roadmap
 

@@ -116,10 +116,27 @@ if [[ "$WITH_PRIVILEGED" == 1 ]]; then
     warn "  reclaim stays OFF until you set [reclaim] proactive_swap_reclaim = true in priorities.toml"
 
     # CRIU (Option A) — narrow caps instead of root, if criu is present.
-    if command -v criu >/dev/null 2>&1; then
-        sudo setcap cap_checkpoint_restore,cap_sys_ptrace+ep "$(command -v criu)" \
-            && ok "criu capped (cap_checkpoint_restore,cap_sys_ptrace) — no root needed" \
-            || warn "could not setcap criu (kernel may lack CAP_CHECKPOINT_RESTORE) — CRIU still falls back to kill"
+    # Resolve criu from the SAME fixed locations the daemon probes (it never does
+    # a PATH search, since the binary is capped), so we cap exactly the binary mgd
+    # will run. Falls back to `command -v` only as a last resort.
+    criu_bin=""
+    for c in /usr/sbin/criu /usr/bin/criu /sbin/criu /bin/criu \
+             /usr/local/sbin/criu /usr/local/bin/criu; do
+        if [[ -x "$c" ]]; then criu_bin="$c"; break; fi
+    done
+    [[ -z "$criu_bin" ]] && criu_bin="$(command -v criu 2>/dev/null || true)"
+
+    if [[ -n "$criu_bin" ]]; then
+        if sudo setcap cap_checkpoint_restore,cap_sys_ptrace+ep "$criu_bin"; then
+            ok "criu capped (cap_checkpoint_restore,cap_sys_ptrace) at $criu_bin — no root needed"
+            warn "  for live TCP restore (browsers), re-cap with cap_net_admin added:"
+            warn "    sudo setcap cap_checkpoint_restore,cap_sys_ptrace,cap_net_admin+ep $criu_bin"
+            warn "  a criu package UPGRADE resets these caps — re-run install.sh --privileged afterwards"
+        else
+            warn "could not setcap criu (kernel may lack CAP_CHECKPOINT_RESTORE) — CRIU falls back to kill"
+        fi
+    else
+        warn "criu not found — checkpoint/restore disabled (mgd will SIGKILL instead)"
     fi
 else
     warn "Privileged features skipped (default). To enable zram compact + swap reclaim:"

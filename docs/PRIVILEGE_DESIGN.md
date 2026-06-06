@@ -210,12 +210,25 @@ Two ways to grant it:
 | **A. setcap criu directly** | `setcap cap_checkpoint_restore,cap_sys_ptrace+ep $(command -v criu)` | Simplest, no new code. But any local user can then run criu near-privileged (limited to dumping their own-uid processes). Mild risk. |
 | **B. validating wrapper** | `mgd-checkpoint <pid>`, capped, validates the PID, then execs criu | Safer (gates which PID), but new code + must sanitize the exec. |
 
-**Option A is likely sufficient for mgd**, because the dangerous decision —
-*which* PID gets checkpointed — is already made by mgd's gated, unprivileged
-logic. The capped `criu` only ever dumps own-uid processes.
+**Option A is the chosen and implemented path for mgd** (single-user desktop
+threat model), because the dangerous decision — *which* PID gets checkpointed —
+is already made by mgd's gated, unprivileged logic. The capped `criu` only ever
+dumps own-uid processes.
+
+> **Implemented (Option A):** `src/executor/checkpoint.rs` resolves `criu` to an
+> **absolute path** from a fixed root-controlled candidate list
+> (`/usr/sbin`, `/usr/bin`, `/sbin`, `/bin`, `/usr/local/{s}bin`) and never does
+> a `PATH` search — capping a binary then invoking it by bare name would let a
+> `criu` planted earlier in `PATH` run with the caps. The grant is applied by
+> `install.sh --privileged` (and documented for manual use in the README).
+> A criu package upgrade **resets file caps**; mgd detects the resulting
+> privilege failure (stderr inference, no libcap dependency) and logs the exact
+> `setcap` command to re-run. criu absent vs present-but-unprivileged are
+> distinguished at startup and in failure logs.
 
 **Option B (validating wrapper)** matters only if other local users abusing the
-capped `criu` is a concern. If built, the wrapper must, before execing criu:
+capped `criu` is a concern (multi-user host). Deferred. If built, the wrapper
+must, before execing criu:
 
 - confirm the PID **exists**,
 - confirm it is **owned by mgd's uid**,
