@@ -464,8 +464,8 @@ systemd unit view (active state, PID, uptime, memory) — deliberately distinct.
 
 ## 12. Logging (`src/logger.rs`)
 
-One session log file per run at `~/memlogs/mgd_<ts>.log`, shared via `Arc<Logger>`
-(so rotation runs once, not per-thread). `LogEntry { action, pid, name, rss_mb,
+One session log file per run at `~/memlogs/mgd_<YYYY-MM-DD_HH-MM-SS>.log` (local
+time), shared via `Arc<Logger>` (so rotation runs once, not per-thread). `LogEntry { action, pid, name, rss_mb,
 result }` is the structured line format. Rotation keeps the newest `log_keep`
 files (default 10; 0 = unlimited). Actions seen in logs: `FREEZE`, `UNFREEZE`,
 `TERMINATE`, `KILL`, `CHECKPOINT`, `RESTORE`/`RESTORE_FAIL`/`RESTORE_ABANDON`,

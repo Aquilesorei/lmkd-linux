@@ -12,13 +12,8 @@ impl Logger {
         let log_dir = crate::util::home_dir().join("memlogs");
         let _ = create_dir_all(&log_dir);
 
-        // New file per session, timestamped
-        let ts = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-
-        let log_path = log_dir.join(format!("mgd_{ts}.log"));
+        // New file per session, stamped with local date+time (sorts chronologically).
+        let log_path = log_dir.join(format!("mgd_{}.log", local_datetime_compact()));
 
         // Rotate: remove oldest files if we exceed log_keep
         let keep = crate::config::get().log_keep;
@@ -70,35 +65,52 @@ impl<'a> LogEntry<'a> {
     }
 }
 
-fn timestamp_now() -> String {
-    let now = SystemTime::now()
+fn local_tm() -> libc::tm {
+    let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    let secs = now.as_secs() as libc::time_t;
+        .unwrap_or_default()
+        .as_secs() as libc::time_t;
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
     unsafe { libc::localtime_r(&secs, &mut tm) };
+    tm
+}
+
+fn timestamp_now() -> String {
+    let tm = local_tm();
     format!("{:02}:{:02}:{:02}", tm.tm_hour, tm.tm_min, tm.tm_sec)
+}
+
+/// `YYYY-MM-DD_HH-MM-SS` in local time — for the session log filename.
+/// Zero-padded ISO order so plain string sort is chronological.
+fn local_datetime_compact() -> String {
+    let tm = local_tm();
+    format!(
+        "{:04}-{:02}-{:02}_{:02}-{:02}-{:02}",
+        tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+        tm.tm_hour, tm.tm_min, tm.tm_sec,
+    )
 }
 
 /// Keep only the `keep` most-recent `mgd_*.log` files; delete the rest.
 fn rotate_logs(log_dir: &std::path::Path, keep: usize) {
-    let mut log_files: Vec<(u64, PathBuf)> = read_dir(log_dir)
+    let mut log_files: Vec<(String, PathBuf)> = read_dir(log_dir)
         .into_iter()
         .flatten()
         .flatten()
         .filter_map(|e| {
-            let name = e.file_name();
-            let s = name.to_string_lossy();
-            let ts: u64 = s
-                .strip_prefix("mgd_")?
-                .strip_suffix(".log")?
-                .parse()
-                .ok()?;
-            Some((ts, e.path()))
+            let s = e.file_name().to_string_lossy().into_owned();
+            // Match this session's naming; ignore unrelated files. Both the new
+            // `mgd_YYYY-MM-DD_HH-MM-SS.log` and legacy `mgd_<unixts>.log` sort
+            // chronologically by name (zero-padded / fixed-width).
+            if s.starts_with("mgd_") && s.ends_with(".log") {
+                Some((s, e.path()))
+            } else {
+                None
+            }
         })
         .collect();
 
-    // Newest first
+    // Newest first (lexicographic = chronological for the zero-padded stamp)
     log_files.sort_by(|(a, _), (b, _)| b.cmp(a));
 
     // Delete everything beyond `keep` (the oldest files)
