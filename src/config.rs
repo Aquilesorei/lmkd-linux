@@ -47,6 +47,8 @@ struct RawConfig {
     #[serde(default)]
     reclaim: Reclaim,
     #[serde(default)]
+    cache_drop: CacheDrop,
+    #[serde(default)]
     firefox: Firefox,
 }
 
@@ -150,6 +152,38 @@ fn default_reclaim_threshold_pct() -> f64 { 30.0 }
 fn default_reclaim_cooldown() -> u64 { 10 }
 fn default_reclaim_min_used() -> u64 { 2048 }
 fn default_reclaim_headroom_mult() -> f64 { 1.5 }
+
+/// Optional page-cache drop (Phase 4). At `trigger_level` pressure or higher,
+/// before freezing any process, advise the kernel to drop page cache for the
+/// configured directory trees via posix_fadvise(DONTNEED). No privilege (own
+/// files), non-destructive (clean pages only). Enabled by default, but a no-op
+/// until `paths` is populated.
+#[derive(Deserialize)]
+struct CacheDrop {
+    #[serde(default = "default_cache_enabled")]
+    enabled: bool,
+    #[serde(default = "default_cache_trigger")]
+    trigger_level: String,
+    #[serde(default = "default_cache_cooldown")]
+    cooldown_min: u64,
+    #[serde(default)]
+    paths: Vec<String>,
+}
+
+impl Default for CacheDrop {
+    fn default() -> Self {
+        CacheDrop {
+            enabled: default_cache_enabled(),
+            trigger_level: default_cache_trigger(),
+            cooldown_min: default_cache_cooldown(),
+            paths: Vec::new(),
+        }
+    }
+}
+
+fn default_cache_enabled() -> bool { true }
+fn default_cache_trigger() -> String { "High".to_string() }
+fn default_cache_cooldown() -> u64 { 5 }
 
 /// Optional Firefox preventive-memory watcher. Disabled unless `watch_memory = true`.
 /// Runs only at PressureLevel::Normal — see evictor::check_firefox_memory.
@@ -277,6 +311,14 @@ pub struct CompiledConfig {
     pub reclaim_min_zram_used_mb: u64,
     /// OOM guard: require MemAvailable > decompressed footprint × this multiplier.
     pub reclaim_headroom_mult: f64,
+    /// Page-cache drop — on unless disabled in [cache_drop]; no-op with no paths.
+    pub cache_drop_enabled: bool,
+    /// Pressure level at/above which cache drop fires (parsed from trigger_level).
+    pub cache_drop_trigger: crate::monitor::psi::PressureLevel,
+    /// Minimum seconds between cache-drop actions (cooldown floor).
+    pub cache_drop_cooldown_secs: u64,
+    /// Directory-tree patterns (~ and single-* per segment) to drop cache for.
+    pub cache_drop_paths: Vec<String>,
     /// Firefox preventive-memory watcher — off unless enabled in [firefox].
     pub watch_firefox: bool,
     pub firefox_rss_threshold_mb: u64,
@@ -398,6 +440,17 @@ fn compile(content: &str) -> Result<CompiledConfig, String> {
         reclaim_cooldown_secs: raw.reclaim.cooldown_min.saturating_mul(60),
         reclaim_min_zram_used_mb: raw.reclaim.min_zram_used_mb,
         reclaim_headroom_mult: raw.reclaim.decompressed_headroom_mult,
+        cache_drop_enabled: raw.cache_drop.enabled,
+        cache_drop_trigger: crate::monitor::psi::PressureLevel::parse(&raw.cache_drop.trigger_level)
+            .unwrap_or_else(|| {
+                eprintln!(
+                    "mgd: invalid [cache_drop] trigger_level '{}', defaulting to High",
+                    raw.cache_drop.trigger_level
+                );
+                crate::monitor::psi::PressureLevel::High
+            }),
+        cache_drop_cooldown_secs: raw.cache_drop.cooldown_min.saturating_mul(60),
+        cache_drop_paths: raw.cache_drop.paths,
         watch_firefox: raw.firefox.watch_memory,
         firefox_rss_threshold_mb: raw.firefox.rss_threshold_mb,
         firefox_gc_cooldown_secs: raw.firefox.gc_cooldown_min.saturating_mul(60),

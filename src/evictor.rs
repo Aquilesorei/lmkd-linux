@@ -27,6 +27,10 @@ static LAST_FIREFOX_GC: AtomicU64 = AtomicU64::new(0);
 static ZRAM_COMPACT_DISABLED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Unix-seconds of the last page-cache drop (0 = never). Cooldown floor for the
+/// Phase 4 cache-drop pre-action.
+static LAST_CACHE_DROP: AtomicU64 = AtomicU64::new(0);
+
 pub fn run(
     frozen: Arc<Mutex<FrozenRegistry>>,
     checkpointed: Arc<Mutex<CheckpointRegistry>>,
@@ -68,6 +72,11 @@ pub fn run(
         // System pre-action: at Elevated+ pressure, repack zram to release
         // fragmented-but-empty pages back to RAM before touching any process.
         compact_zram(&effective_level, &log);
+
+        // System pre-action: at High+ pressure, drop stale build/file cache for
+        // configured trees before freezing apps. Runs after zram compact so the
+        // cheaper reclaim happens first; both run before plan().
+        check_cache_drop(&effective_level, &log);
 
         // Fix 1: exclude already-frozen PIDs from plan so their RSS isn't
         // double-counted toward deficit, which would cause underkill.
@@ -276,6 +285,55 @@ fn compact_zram(level: &PressureLevel, log: &Logger) {
         }
     }
 }
+
+/// Page-cache drop pre-action (Phase 4). At the configured trigger level or
+/// higher, advise the kernel to drop page cache for the configured directory
+/// trees before any process is frozen — surgical, unprivileged, non-destructive
+/// (clean pages only). No-op unless `[cache_drop] enabled = true` with a
+/// non-empty `paths` list. Cooldown-gated so a sustained High spell doesn't
+/// re-walk the trees every 5s.
+fn check_cache_drop(level: &PressureLevel, log: &Logger) {
+    let (trigger, cooldown_secs, paths) = {
+        let cfg = crate::config::get();
+        if !cfg.cache_drop_enabled || cfg.cache_drop_paths.is_empty() {
+            return;
+        }
+        (cfg.cache_drop_trigger.clone(), cfg.cache_drop_cooldown_secs, cfg.cache_drop_paths.clone())
+    };
+
+    if *level < trigger {
+        return;
+    }
+
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let last = LAST_CACHE_DROP.load(Ordering::Relaxed);
+    if last != 0 && now.saturating_sub(last) < cooldown_secs {
+        return;
+    }
+    // Arm cooldown up-front: the walk itself is the cost we're rate-limiting,
+    // so even a zero-byte result shouldn't trigger a re-walk next cycle.
+    LAST_CACHE_DROP.store(now, Ordering::Relaxed);
+
+    let mut total_files = 0usize;
+    let mut total_bytes = 0u64;
+    for r in crate::monitor::cache::drop_caches(&paths) {
+        if r.files_advised > 0 {
+            log.log(&LogEntry::new(
+                "CACHE", 0, &r.pattern,
+                (r.bytes_advised / (1024 * 1024)) as f64,
+                &format!("advised {} files", r.files_advised),
+            ));
+        }
+        total_files += r.files_advised;
+        total_bytes += r.bytes_advised;
+    }
+
+    if total_files > 0 {
+        let mb = total_bytes / (1024 * 1024);
+        sync_print!("[cache] dropped cache for {total_files} files (~{mb}MB advised) before freeze");
+    }
+}
+
 
 fn print_status(
     pressure: &monitor::psi::MemoryPressure,

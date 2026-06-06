@@ -76,6 +76,27 @@ cooldown_min = 10                 # cooldown floor between reclaim cycles
 min_zram_used_mb = 2048           # skip when the pool holds less compressed RAM
 decompressed_headroom_mult = 1.5  # OOM guard: avail must exceed decompressed × this
 
+# ── page-cache drop before freeze ────────────────────────────────────────────
+# Under pressure the kernel often evicts app pages to swap while keeping file
+# cache (build artifacts, node_modules, browser cache) that won't be read again
+# until the next build. At `trigger_level` pressure or higher, BEFORE freezing
+# any process, mgd advises the kernel to drop page cache for the listed trees
+# via posix_fadvise(DONTNEED). Surgical (only these trees, never a global
+# drop_caches), no privilege (your own files), non-destructive (clean pages drop
+# immediately; dirty pages are written back first — no data loss).
+#
+# Paths support a leading ~ and a single * per path segment (e.g. ~/proj/*/target).
+# `paths` is empty by default, so this is a no-op until you list directories.
+[cache_drop]
+enabled = true
+trigger_level = "High"            # Normal | Elevated | High | Critical | Emergency
+cooldown_min = 5                  # cooldown floor between cache-drop walks
+paths = [
+    # "~/RustroverProjects/*/target",
+    # "~/WebstormProjects/*/node_modules/.cache",
+    # "~/.cache/JetBrains",
+]
+
 # ── Firefox preventive-memory watcher ────────────────────────────────────────
 # Firefox never releases RSS after tabs close. When enabled, mgd nudges Firefox's
 # internal GC via SIGUSR1 (non-disruptive — Firefox keeps running) once total RSS
