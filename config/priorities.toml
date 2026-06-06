@@ -18,6 +18,29 @@
 [defaults]
 priority = 50
 
+# ── plasmashell GPU-leak watcher (KDE Plasma + Intel UMA) ────────────────────
+# On Intel Iris Xe (unified memory), GPU allocations come from system RAM, and
+# plasmashell is known to leak GPU memory over days of uptime, reducing available
+# RAM. When enabled, mgd reads plasmashell's per-process GPU residency from
+# /proc/PID/fdinfo (no root, no extra tools) and restarts it via kquitapp6+kstart
+# once it crosses the threshold. Disabled by default.
+[plasma]
+watch_gpu_leak = false
+gpu_leak_threshold_mb = 1024      # restart when plasmashell GPU mem exceeds this
+min_restart_interval_min = 30     # cooldown floor: never restart more often
+
+# ── Firefox preventive-memory watcher ────────────────────────────────────────
+# Firefox never releases RSS after tabs close. When enabled, mgd nudges Firefox's
+# internal GC via SIGUSR1 (non-disruptive — Firefox keeps running) once total RSS
+# (main + content processes) crosses the threshold. Runs ONLY when the system is
+# healthy (Normal pressure); under any pressure the evictor handles Firefox tabs
+# via the priority system instead. Never restarts Firefox. Disabled by default.
+[firefox]
+watch_memory = false
+rss_threshold_mb = 3072           # trigger GC above this total RSS
+gc_cooldown_min = 15              # cooldown floor between GC attempts
+warn_threshold_mb = 4096          # log a warning above this (no action taken)
+
 # ── XDG desktop category fallback ────────────────────────────────────────────
 # Applied when a process isn't matched by any [[apps]] regex.
 # mgd reads /proc/PID/exe to get the untruncated binary name, looks it up in

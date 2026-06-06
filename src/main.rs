@@ -75,6 +75,10 @@ fn main() {
     let frozen = Arc::new(Mutex::new(FrozenRegistry::new()));
     let checkpointed = Arc::new(Mutex::new(CheckpointRegistry::new()));
 
+    // Single shared logger — both actors write to one session file (and rotation
+    // runs once, not twice). Logger::log() takes &self, so Arc sharing is safe.
+    let logger = Arc::new(logger::Logger::new());
+
     // ── Signal handlers ─────────────────────────────────────────────────────
     // All three signal handlers are async-signal-safe: they only store to
     // AtomicBool with Relaxed, which compiles to a single `mov` on x86/ARM.
@@ -87,11 +91,13 @@ fn main() {
     // ── Actor threads ────────────────────────────────────────────────────────
     let f1 = Arc::clone(&frozen);
     let c1 = Arc::clone(&checkpointed);
-    let responder = thread::spawn(move || evictor::run(f1, c1));
+    let l1 = Arc::clone(&logger);
+    let responder = thread::spawn(move || evictor::run(f1, c1, l1));
 
     let f2 = Arc::clone(&frozen);
     let c2 = Arc::clone(&checkpointed);
-    let recovery = thread::spawn(move || recovery::run(f2, c2));
+    let l2 = Arc::clone(&logger);
+    let recovery = thread::spawn(move || recovery::run(f2, c2, l2));
 
     let f3 = Arc::clone(&frozen);
     let c3 = Arc::clone(&checkpointed);

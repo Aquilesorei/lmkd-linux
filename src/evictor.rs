@@ -1,7 +1,8 @@
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::sync_print;
 use crate::engine::decision::{Action, Decision, plan, get_priority};
@@ -12,12 +13,19 @@ use crate::monitor::meminfo::MemInfo;
 use crate::monitor::process::Process;
 use crate::monitor::psi::PressureLevel;
 
+/// Unix-seconds of the last plasmashell restart (0 = never). Cooldown floor state
+/// for the GPU-leak watcher; mirrors the AtomicBool pattern used in main.rs.
+static LAST_PLASMA_RESTART: AtomicU64 = AtomicU64::new(0);
+
+/// Unix-seconds of the last Firefox GC trigger (0 = never). Cooldown floor for the
+/// preventive Firefox watcher.
+static LAST_FIREFOX_GC: AtomicU64 = AtomicU64::new(0);
+
 pub fn run(
     frozen: Arc<Mutex<FrozenRegistry>>,
     checkpointed: Arc<Mutex<CheckpointRegistry>>,
+    log: Arc<Logger>,
 ) {
-    let log = Logger::new();
-
     loop {
         if crate::should_shutdown() { return; }
 
@@ -43,6 +51,13 @@ pub fn run(
         procs.sort_by_key(|p| std::cmp::Reverse(p.rss_kb));
 
         print_status(&pressure, &effective_level, &procs, &meminfo, &frozen);
+
+        // Optional KDE Plasma GPU-leak watcher (gated behind [plasma] config).
+        check_plasma_gpu(&procs, &log);
+
+        // Optional Firefox preventive-memory watcher (gated behind [firefox] config).
+        // Pass effective_level so swap-escalated pressure also suppresses it.
+        check_firefox_memory(&procs, &effective_level, &log);
 
         // Fix 1: exclude already-frozen PIDs from plan so their RSS isn't
         // double-counted toward deficit, which would cause underkill.
@@ -80,6 +95,113 @@ fn escalate_for_swap(level: &PressureLevel, m: &MemInfo) -> PressureLevel {
         PressureLevel::High      => PressureLevel::Critical,
         PressureLevel::Critical  => PressureLevel::Emergency,
         PressureLevel::Emergency => PressureLevel::Emergency,
+    }
+}
+
+/// KDE Plasma + Intel UMA workaround: plasmashell leaks GPU memory (allocated from
+/// system RAM) over long uptimes. When it crosses the configured threshold and the
+/// cooldown has elapsed, restart it and log the reclaimed memory.
+///
+/// No-op unless `[plasma] watch_gpu_leak = true`. Reads GPU residency from fdinfo
+/// with no elevated privileges.
+fn check_plasma_gpu(procs: &[Process], log: &Logger) {
+    let (threshold_mb, cooldown_secs) = {
+        let cfg = crate::config::get();
+        if !cfg.watch_gpu_leak {
+            return;
+        }
+        (cfg.gpu_leak_threshold_mb, cfg.min_restart_interval_secs)
+    };
+
+    let Some(plasma) = procs.iter().find(|p| p.name == "plasmashell") else { return };
+
+    let Some(gpu_kb) = crate::monitor::gpu::process_gpu_kb(plasma.pid) else { return };
+    let before_mb = gpu_kb / 1024;
+    if before_mb <= threshold_mb {
+        return;
+    }
+
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let last = LAST_PLASMA_RESTART.load(Ordering::Relaxed);
+    if last != 0 && now.saturating_sub(last) < cooldown_secs {
+        return; // cooldown floor not elapsed
+    }
+
+    sync_print!("[plasma] plasmashell GPU mem {before_mb}MB > {threshold_mb}MB threshold — restarting");
+    if let Err(e) = crate::monitor::gpu::restart_plasmashell() {
+        // Don't arm the cooldown on failure, so a transient/missing-binary case
+        // isn't silently muted for the whole interval.
+        sync_print!("[plasma] restart skipped: {e}");
+        log.log(&LogEntry::new("RESTART", plasma.pid, "plasmashell", 0.0, &format!("skipped: {e}")));
+        return;
+    }
+
+    LAST_PLASMA_RESTART.store(now, Ordering::Relaxed);
+
+    // Re-read against the *new* plasmashell instance to report what was reclaimed.
+    let new_procs = crate::monitor::process::list_processes();
+    let new_plasma = new_procs.iter().find(|p| p.name == "plasmashell");
+    let pid = new_plasma.map(|p| p.pid).unwrap_or(plasma.pid);
+    let after_mb = new_plasma
+        .and_then(|p| crate::monitor::gpu::process_gpu_kb(p.pid))
+        .map(|kb| kb / 1024)
+        .unwrap_or(0);
+
+    log.log(&LogEntry::new(
+        "RESTART", pid, "plasmashell", 0.0,
+        &format!("gpu_leak_reclaimed {before_mb}MB→{after_mb}MB"),
+    ));
+}
+
+/// Firefox preventive-memory watcher. Runs ONLY at PressureLevel::Normal — under any
+/// pressure the evictor already manages Firefox content processes via the priority
+/// system, and the two must never act on Firefox concurrently. When healthy and RSS
+/// is high, nudges Firefox's internal GC via SIGUSR1 (non-disruptive, no restart).
+///
+/// No-op unless `[firefox] watch_memory = true`.
+fn check_firefox_memory(procs: &[Process], level: &PressureLevel, log: &Logger) {
+    let (rss_threshold_mb, warn_threshold_mb, cooldown_secs) = {
+        let cfg = crate::config::get();
+        if !cfg.watch_firefox {
+            return;
+        }
+        (cfg.firefox_rss_threshold_mb, cfg.firefox_warn_threshold_mb, cfg.firefox_gc_cooldown_secs)
+    };
+
+    // Preventive maintenance only: bail on any pressure. The evictor handles
+    // Firefox under pressure — never run both on Firefox at once.
+    if *level != PressureLevel::Normal {
+        return;
+    }
+
+    let (total_kb, _pids) = crate::monitor::firefox::firefox_total_rss_kb(procs);
+    let total_mb = total_kb / 1024;
+
+    // Warning is informational and always logged (no cooldown), independent of GC.
+    if total_mb >= warn_threshold_mb {
+        log.log(&LogEntry::new("WARN", 0, "firefox", total_mb as f64, "rss_above_warn_threshold"));
+    }
+
+    if total_mb < rss_threshold_mb {
+        return;
+    }
+
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let last = LAST_FIREFOX_GC.load(Ordering::Relaxed);
+    if last != 0 && now.saturating_sub(last) < cooldown_secs {
+        return; // GC cooldown not elapsed
+    }
+
+    match crate::monitor::firefox::trigger_firefox_gc(procs) {
+        Ok(pid) => {
+            LAST_FIREFOX_GC.store(now, Ordering::Relaxed);
+            log.log(&LogEntry::new("GC", pid, "firefox", total_mb as f64, "gc_triggered"));
+        }
+        Err(e) => {
+            // Don't arm the cooldown on failure.
+            sync_print!("[firefox] GC skipped: {e}");
+            log.log(&LogEntry::new("GC", 0, "firefox", total_mb as f64, &format!("skipped: {e}")));
+        }
     }
 }
 

@@ -149,10 +149,15 @@ pub fn plan(
             deficit as f64 / 1024.0,
         );
 
-        // Freeze doesn't actually free RAM — only count 25% (kernel may reclaim some)
-        // Kill/Terminate/Checkpoint free the full RSS
+        // Freeze frees no RAM directly — SIGSTOP only stops the process from
+        // allocating/re-faulting; any reclaim is indirect and handled by the
+        // kernel later. So it must NOT count toward the deficit, otherwise we'd
+        // believe memory was freed when none was. Expendable processes are still
+        // frozen (to stop the bleeding); we just don't let that close the loop.
+        // Kill/Terminate/Checkpoint free the full RSS within this cycle; the next
+        // 5s cycle re-measures available_kb, so any terminate lag self-corrects.
         let freed = match action {
-            Action::Freeze => proc.rss_kb as i64 / 4,
+            Action::Freeze => 0,
             _ => proc.rss_kb as i64,
         };
         deficit -= freed;
@@ -294,19 +299,22 @@ mod tests {
     }
 
     #[test]
-    fn freeze_counts_less_toward_deficit() {
-        // 4 processes at 200MB each. Freeze counts 25% = 50MB each.
-        // deficit = 16M*0.15 - 1M = 1.4M KB = ~1400MB needed
-        // At 50MB credit per freeze, need many more freezes than kills
+    fn freeze_does_not_count_toward_deficit() {
+        // Freeze frees no RAM, so it never reduces the deficit. Even a tiny
+        // deficit must not stop us short: ALL expendable processes get frozen
+        // ("stop the bleeding"), and the next cycle re-measures whether PSI dropped.
         let procs = vec![
             proc("baloo_file_extractor", 200_000, 0),
             proc("baloo_file_extractor", 200_000, 0),
             proc("baloo_file_extractor", 200_000, 0),
             proc("baloo_file_extractor", 200_000, 0),
         ];
-        let decisions = plan(&PressureLevel::Elevated, &procs.iter().collect::<Vec<_>>(), 1_000_000, 16_000_000);
-        // All 4 should be frozen since 4*50MB = 200MB < 1400MB deficit
+        // available just 1MB below target → tiny deficit a single 200MB process
+        // would have "covered" under the old 25% credit. All 4 must still freeze.
+        let target = 16_000_000 * 15 / 100;
+        let decisions = plan(&PressureLevel::Elevated, &procs.iter().collect::<Vec<_>>(), target as u64 - 1024, 16_000_000);
         assert_eq!(decisions.len(), 4);
+        assert!(decisions.iter().all(|d| d.action == Action::Freeze));
     }
 
     #[test]

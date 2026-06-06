@@ -34,8 +34,9 @@ Real memory pressure event on a 16GB system:
   were caught and frozen as they appeared.
 - **t+51s** — Killed the actual memory hog (a runaway node process, 580 MB).
   System recovered.
-- **t+71s** — Pressure dropped to Normal. All 30 frozen processes unfrozen
-  in a single cycle. No orphans.
+- **t+71s** — Pressure dropped to Normal. The 30 frozen processes were
+  unfrozen in staggered batches (capped per cycle, gated on RAM headroom)
+  over the next few cycles, avoiding a bounce back into pressure. No orphans.
 
 System stayed responsive throughout. No UI freeze, no compositor stutter, no reboot. Daemon RSS: ~6 MB.
 

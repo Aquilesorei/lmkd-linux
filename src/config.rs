@@ -38,7 +38,65 @@ struct RawConfig {
     protect: Vec<ProtectEntry>,
     #[serde(default)]
     category_priorities: HashMap<String, u8>,
+    #[serde(default)]
+    plasma: Plasma,
+    #[serde(default)]
+    firefox: Firefox,
 }
+
+/// Optional Firefox preventive-memory watcher. Disabled unless `watch_memory = true`.
+/// Runs only at PressureLevel::Normal — see evictor::check_firefox_memory.
+#[derive(Deserialize)]
+struct Firefox {
+    #[serde(default)]
+    watch_memory: bool,
+    #[serde(default = "default_ff_threshold")]
+    rss_threshold_mb: u64,
+    #[serde(default = "default_ff_cooldown")]
+    gc_cooldown_min: u64,
+    #[serde(default = "default_ff_warn")]
+    warn_threshold_mb: u64,
+}
+
+impl Default for Firefox {
+    fn default() -> Self {
+        Firefox {
+            watch_memory: false,
+            rss_threshold_mb: default_ff_threshold(),
+            gc_cooldown_min: default_ff_cooldown(),
+            warn_threshold_mb: default_ff_warn(),
+        }
+    }
+}
+
+fn default_ff_threshold() -> u64 { 3072 }
+fn default_ff_cooldown() -> u64 { 15 }
+fn default_ff_warn() -> u64 { 4096 }
+
+/// Optional plasmashell GPU-leak watcher (KDE Plasma + Intel UMA workaround).
+/// Disabled unless `watch_gpu_leak = true`.
+#[derive(Deserialize)]
+struct Plasma {
+    #[serde(default)]
+    watch_gpu_leak: bool,
+    #[serde(default = "default_gpu_threshold")]
+    gpu_leak_threshold_mb: u64,
+    #[serde(default = "default_restart_floor")]
+    min_restart_interval_min: u64,
+}
+
+impl Default for Plasma {
+    fn default() -> Self {
+        Plasma {
+            watch_gpu_leak: false,
+            gpu_leak_threshold_mb: default_gpu_threshold(),
+            min_restart_interval_min: default_restart_floor(),
+        }
+    }
+}
+
+fn default_gpu_threshold() -> u64 { 1024 }
+fn default_restart_floor() -> u64 { 30 }
 
 #[derive(Deserialize)]
 struct Defaults {
@@ -85,6 +143,17 @@ struct ProtectEntry {
 pub struct CompiledConfig {
     pub default_priority: u8,
     pub log_keep: usize,
+    /// Plasma GPU-leak watcher — off unless enabled in [plasma].
+    pub watch_gpu_leak: bool,
+    pub gpu_leak_threshold_mb: u64,
+    /// Minimum seconds between plasmashell restarts (cooldown floor).
+    pub min_restart_interval_secs: u64,
+    /// Firefox preventive-memory watcher — off unless enabled in [firefox].
+    pub watch_firefox: bool,
+    pub firefox_rss_threshold_mb: u64,
+    /// Minimum seconds between Firefox GC attempts (cooldown floor).
+    pub firefox_gc_cooldown_secs: u64,
+    pub firefox_warn_threshold_mb: u64,
     /// (regex, priority, checkpoint_override)
     entries: Vec<(Regex, u8, Option<bool>)>,
     /// Patterns that must never be touched
@@ -186,6 +255,13 @@ fn compile(content: &str) -> Result<CompiledConfig, String> {
     Ok(CompiledConfig {
         default_priority: raw.defaults.priority,
         log_keep: raw.defaults.log_keep,
+        watch_gpu_leak: raw.plasma.watch_gpu_leak,
+        gpu_leak_threshold_mb: raw.plasma.gpu_leak_threshold_mb,
+        min_restart_interval_secs: raw.plasma.min_restart_interval_min.saturating_mul(60),
+        watch_firefox: raw.firefox.watch_memory,
+        firefox_rss_threshold_mb: raw.firefox.rss_threshold_mb,
+        firefox_gc_cooldown_secs: raw.firefox.gc_cooldown_min.saturating_mul(60),
+        firefox_warn_threshold_mb: raw.firefox.warn_threshold_mb,
         entries,
         protected,
         desktop_index,
