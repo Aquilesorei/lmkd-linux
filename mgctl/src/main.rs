@@ -1,5 +1,6 @@
 /// mgctl — control client for the mgd daemon.
 mod calibrate;
+mod doctor;
 ///
 /// Talks to the running mgd daemon via its Unix domain socket for live
 /// introspection, and shells out to `systemctl --user` for lifecycle control
@@ -34,6 +35,7 @@ fn usage() {
     eprintln!("  mgctl logs [-f]");
     eprintln!("  mgctl calibrate [--dry-run]   (derive per-machine thresholds)");
     eprintln!("  mgctl calibrate --apply       (apply previously generated calibration)");
+    eprintln!("  mgctl doctor                  (environment + feature report)");
 }
 
 fn main() {
@@ -52,6 +54,7 @@ fn main() {
         "service"   => std::process::exit(run_service_status()),
         "logs"      => std::process::exit(run_logs(&args[2..])),
         "calibrate" => std::process::exit(calibrate::run(&args[2..])),
+        "doctor"    => std::process::exit(doctor::run()),
         _ => {}
     }
 
