@@ -1,0 +1,17 @@
+[package]
+name        = "mgd-gpu-intel"
+version     = "0.3.0"
+edition     = "2024"
+description = "Intel Iris Xe / UMA GPU residency watcher plugin for mgd"
+repository  = "https://github.com/Aquilesorei/lmkd-linux"
+license     = "GPL-2.0"
+authors     = ["Caleb Zongo <your@email.com>"]
+
+[[bin]]
+name = "mgd-gpu-intel"
+path = "src/main.rs"
+
+[dependencies]
+mgd-common = { path = "../mgd-common" }
+libc       = { workspace = true }
+serde_json.workspace = true

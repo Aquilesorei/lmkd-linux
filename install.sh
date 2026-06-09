@@ -51,7 +51,7 @@ ok "Dependencies OK"
 
 # ── build ─────────────────────────────────────────────────────────────────────
 echo "Building release binaries..."
-cargo build --bin mgd --bin mgctl --bin mgd-zram-reclaim --release 2>&1 | tail -3
+cargo build --bin mgd --bin mgctl --bin mgd-zram-reclaim --bin mgd-kde --bin mgd-gpu-intel --bin mgd-gpu-amd --bin mgd-gnome --bin mgd-cosmic --release 2>&1 | tail -3
 ok "Build complete"
 
 # ── stop existing service if running ─────────────────────────────────────────
@@ -64,8 +64,13 @@ fi
 mkdir -p "$BIN_DIR"
 cp target/release/mgd   "$BIN_DIR/mgd"
 cp target/release/mgctl "$BIN_DIR/mgctl"
-chmod +x "$BIN_DIR/mgd" "$BIN_DIR/mgctl"
-ok "Binaries installed to $BIN_DIR/{mgd,mgctl}"
+cp target/release/mgd-kde "$BIN_DIR/mgd-kde"
+cp target/release/mgd-gpu-intel "$BIN_DIR/mgd-gpu-intel"
+cp target/release/mgd-gpu-amd "$BIN_DIR/mgd-gpu-amd"
+cp target/release/mgd-gnome "$BIN_DIR/mgd-gnome"
+cp target/release/mgd-cosmic "$BIN_DIR/mgd-cosmic"
+chmod +x "$BIN_DIR"/mgd*
+ok "Binaries installed to $BIN_DIR/"
 
 # ── install service ───────────────────────────────────────────────────────────
 mkdir -p "$SERVICE_DIR"

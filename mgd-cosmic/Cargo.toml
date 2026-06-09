@@ -1,0 +1,16 @@
+[package]
+name        = "mgd-cosmic"
+version     = "0.3.0"
+edition     = "2024"
+description = "COSMIC DE / Pop!_OS 24 watcher plugin for mgd (scaffold)"
+repository  = "https://github.com/Aquilesorei/lmkd-linux"
+license     = "GPL-2.0"
+authors     = ["Caleb Zongo <your@email.com>"]
+
+[[bin]]
+name = "mgd-cosmic"
+path = "src/main.rs"
+
+[dependencies]
+mgd-common = { path = "../mgd-common" }
+libc       = { workspace = true }

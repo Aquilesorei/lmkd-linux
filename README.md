@@ -6,6 +6,8 @@ The Linux kernel swaps processes out on memory spikes but never actively reclaim
 
 `lmkd-linux` monitors PSI (Pressure Stall Information) and manages the reclaim cycle the kernel skips — freezing, checkpointing, or killing processes in priority order before stall time reaches the point of no return, then restoring them when pressure clears.
 
+**Note:** `mgd` does not replace the Linux kernel OOM killer or `systemd-oomd`. It operates purely as a userspace prioritization layer that preemptively freezes or deprioritizes processes under pressure, while all kernel-level memory management remains fully active as the final safety mechanism.
+
 ## How it works
 
 Reads `/proc/pressure/memory` every 5 seconds. When stall time crosses a threshold, calculates the RAM deficit and works through processes from least to most important until enough is freed.
@@ -231,10 +233,14 @@ falls back to SIGKILL when checkpoint fails. See the opt-in setup below.
 - [x] Process protect list in config (`[[protect]]` entries)
 - [x] Per-process `checkpoint = true/false` override in config
 - [x] Log rotation (`log_keep` in config, default 10 files)
-- [ ] D-Bus notifications with Restore button
-- [ ] Kernel patches (PSI triggers, proactive swap-in, LRU hints)
-
-See [DESIGN_SPEC.md](DESIGN_SPEC.md) for full architecture.
+- [x] Cargo workspace + plugin architecture — `mgd-common`, `mgd`, `mgctl`, `mgd-zram`, plugin scaffolds
+- [x] Plugin IPC protocol types (`PluginMessage`, `CoreMessage`)
+- [ ] Registry persistence across daemon restart
+- [ ] fdinfo GPU sweep cost reduction
+- [ ] `mgd doctor` + `mgd calibrate` portability UX
+- [ ] PSI epoll (kernel-native triggers, replace 5s poll)
+- [ ] Benchmark harness vs earlyoom / nohang / systemd-oomd
+- [ ] COSMIC DE / Pop!_OS 24 plugin (`mgd-cosmic`)
 
 ## Tested on
 

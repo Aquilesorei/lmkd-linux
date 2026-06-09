@@ -1,38 +1,27 @@
-[package]
-name = "lmkd-linux"
-version = "0.3.0"
-edition = "2024"
-description = "Proactive low-memory killer daemon for Linux desktop"
-repository = "https://github.com/Aquilesorei/lmkd-linux"
-license = "GPL-2.0"
-authors = ["Caleb Zongo <your@email.com>"]
+[workspace]
+members = [
+    "mgd-common",
+    "mgd",
+    "mgctl",
+    "mgd-zram",
+    "mgd-gpu-intel",
+    "mgd-gpu-amd",
+    "mgd-kde",
+    "mgd-gnome",
+    "mgd-cosmic",
+]
+resolver = "2"
 
-[lib]
-path = "src/lib.rs"
-
-[[bin]]
-name = "mgd"
-path = "src/main.rs"
-
-[[bin]]
-name = "mgctl"
-path = "src/mgctl.rs"
-
-# Privileged swap-reclaim helper (Phase 3). Built unprivileged; gains
-# CAP_SYS_ADMIN only via `setcap` at install time (opt-in). Self-contained —
-# depends only on libc, takes no argv/env, makes no subprocess.
-[[bin]]
-name = "mgd-zram-reclaim"
-path = "src/bin/mgd-zram-reclaim.rs"
-
-[dependencies]
-libc  = "0.2"
-serde = { version = "1", features = ["derive"] }
-toml  = "0.8"
-regex = "1"
+# Shared dependency versions — each member opts in via `workspace = true`.
+[workspace.dependencies]
+libc       = "0.2"
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml       = "0.8"
+regex      = "1"
 
 [profile.release]
 opt-level = 3
-strip = true      # strip debug symbols, smaller binary
-lto = true        # link-time optimization, faster runtime
-codegen-units = 1 # slower compile, faster binary
+strip = true         # strip debug symbols, smaller binary
+lto = true           # link-time optimisation, faster runtime
+codegen-units = 1    # slower compile, faster binary

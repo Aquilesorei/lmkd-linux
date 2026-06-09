@@ -1,0 +1,16 @@
+[package]
+name        = "mgd-gpu-amd"
+version     = "0.3.0"
+edition     = "2024"
+description = "AMD APU / UMA GPU residency watcher plugin for mgd (scaffold)"
+repository  = "https://github.com/Aquilesorei/lmkd-linux"
+license     = "GPL-2.0"
+authors     = ["Caleb Zongo <your@email.com>"]
+
+[[bin]]
+name = "mgd-gpu-amd"
+path = "src/main.rs"
+
+[dependencies]
+mgd-common = { path = "../mgd-common" }
+libc       = { workspace = true }

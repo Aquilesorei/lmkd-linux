@@ -70,7 +70,9 @@ pressure clears.
 
 ## 3. Process & threading model
 
-`mgd` is a single process running four cooperating threads ("actors"), spawned in
+The system is built as a Cargo workspace with a core daemon (`mgd`) and standalone plugins (`mgd-kde`, `mgd-gpu-intel`, etc.).
+
+The core daemon (`mgd`) runs four cooperating threads ("actors"), spawned in
 `main.rs` and joined on shutdown. They share three things via `Arc`:
 `Arc<Mutex<FrozenRegistry>>`, `Arc<Mutex<CheckpointRegistry>>`, and an
 `Arc<Logger>`.
@@ -87,9 +89,9 @@ pressure clears.
 │ PressureRespon│  │ RecoveryManager│    │  IPC server      │   │ MaintenanceManager│
 │   (evictor.rs)│  │ (recovery.rs)  │    │   (ipc.rs)       │   │ (maintenance.rs)  │
 │  5s poll      │  │  3s poll       │    │  unix socket     │   │  60s poll         │
-│  freeze/kill/ │  │  unfreeze/     │    │  status/list/    │   │  idle reaps,      │
-│  checkpoint + │  │  restore at    │    │  unfreeze/reload │   │  proactive swap   │
-│  system pre-  │  │  Normal only   │    │                  │   │  reclaim          │
+│  freeze/kill/ │  │  unfreeze/     │    │  status/list/    │   │  proactive swap   │
+│  checkpoint + │  │  restore at    │    │  unfreeze/reload │   │  reclaim          │
+│  system pre-  │  │  Normal only   │    │  & plugin comms  │   │                   │
 │  actions      │  │                │    │                  │   │                   │
 └───────────────┘  └───────────────┘     └─────────────────┘   └──────────────────┘
         │                  │                       │                      │
@@ -107,10 +109,9 @@ pressure clears.
   processes that have been frozen long enough, and restores checkpointed
   processes one at a time — both gated by a learned RAM baseline so the system
   doesn't bounce straight back into pressure.
-- **IPC server:** a Unix-domain-socket request/response server for `mgctl`.
+- **IPC server:** a Unix-domain-socket request/response server for `mgctl` and **plugins**.
 - **MaintenanceManager (60 s):** houses the *blocking* / slow housekeeping that
-  must not stall the 5 s loop — the plasma-discover CPU-idle sample (blocks for
-  `idle_check_secs`) and proactive swap reclaim (blocks on `swapoff`/`swapon`).
+  must not stall the 5 s loop (e.g., proactive swap reclaim which blocks on `swapoff`/`swapon`).
   Acts only when the system is calm.
 
 ### The threading rule (load-bearing)
@@ -120,9 +121,8 @@ pressure clears.
 > cycle** runs **inline in the evictor before `plan()`**.
 
 This is why zram *compact* and page-cache *drop* are inline pre-actions (their
-freed RAM must shrink the deficit `plan()` computes this cycle) while
-plasma-discover idle-reaping and swap *reclaim* are on the maintenance thread
-(they block, and have no same-cycle ordering dependency).
+freed RAM must shrink the deficit `plan()` computes this cycle) while swap *reclaim*
+is on the maintenance thread (it blocks, and has no same-cycle ordering dependency).
 
 ### Shutdown
 
@@ -360,18 +360,15 @@ gates live in the unprivileged daemon:
   expand 2–3× on the way back into RAM; without this gate the reclaim itself
   could OOM the box.
 
-### preventive watchers (don't fit the pressure pipeline)
+---
 
-- **plasmashell GPU-leak** (`gpu.rs`, evictor): reads per-process GPU residency
-  from DRM fdinfo (no privilege, unlike `intel_gpu_top`). Over threshold +
-  cooldown → restart via `kquitapp6`/`kstart`. Off by default.
-- **plasma-discover idle reaper** (`maintenance.rs`): over RSS threshold **and**
-  CPU-idle across a 60 s sample → SIGTERM (KDE relaunches on demand). The
-  blocking sample is why it's on the maintenance thread. On by default.
+## 8.5 Plugins (`mgd-kde`, `mgd-gpu-intel`, etc.)
 
-All watchers follow the same shape: a `check_X()` gated by a config flag read
-once, an `AtomicU64` cooldown floor, logging via the shared `Arc<Logger>`, and
-**not** arming the cooldown on failure.
+Historically, environment-specific watchers lived inside `mgd`. They are now decoupled into standalone plugin processes that connect to the IPC server using the `mgd-common` library:
+- **`mgd-kde`**: Handles restarting the KDE `plasmashell` on GPU leaks, and reaping `plasma-discover` on CPU idle.
+- **`mgd-gpu-intel`**: Scans `/proc/<pid>/fdinfo/` (DRM) to account for UMA graphics memory as part of process footprint.
+
+Plugins observe the system and request actions from the core daemon (`ActionRequest`), keeping the core portable.
 
 ---
 

@@ -1,0 +1,17 @@
+[package]
+name        = "mgctl"
+version     = "0.3.0"
+edition     = "2024"
+description = "Control client for the mgd memory guardian daemon"
+repository  = "https://github.com/Aquilesorei/lmkd-linux"
+license     = "GPL-2.0"
+authors     = ["Caleb Zongo <your@email.com>"]
+
+[[bin]]
+name = "mgctl"
+path = "src/main.rs"
+
+[dependencies]
+mgd-common = { path = "../mgd-common" }
+libc       = { workspace = true }
+serde_json = { workspace = true }

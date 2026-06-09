@@ -1,0 +1,12 @@
+[package]
+name    = "mgd-common"
+version = "0.3.0"
+edition = "2024"
+description = "Shared types, protocol, and utilities for the mgd plugin ecosystem"
+repository  = "https://github.com/Aquilesorei/lmkd-linux"
+license     = "GPL-2.0"
+
+[dependencies]
+libc       = { workspace = true }
+serde      = { workspace = true }
+serde_json = { workspace = true }
