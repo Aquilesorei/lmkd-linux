@@ -48,9 +48,13 @@ pub fn get_priority(name: &str, exe_basename: Option<&str>) -> u8 {
     crate::config::get().priority_for(name, exe_basename)
 }
 
-/// KB to free to reach the 15%-free target. Negative if already above.
+/// KB to free to reach the configured free-RAM target.
+/// The target percentage is RAM-scaled by default (see config::ram_scaled_target_pct),
+/// and can be overridden via [thresholds] in priorities.toml or by mgctl calibrate.
+/// Returns negative if already above the target (no action needed).
 pub fn ram_deficit_kb(available_kb: u64, total_kb: u64) -> i64 {
-    let target_kb = (total_kb as f64 * 0.15) as u64;
+    let pct = crate::config::get().target_available_pct / 100.0;
+    let target_kb = (total_kb as f64 * pct) as u64;
     target_kb as i64 - available_kb as i64
 }
 

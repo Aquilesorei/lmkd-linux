@@ -1,5 +1,5 @@
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -19,10 +19,31 @@ pub fn run(
     frozen: Arc<Mutex<FrozenRegistry>>,
     checkpointed: Arc<Mutex<CheckpointRegistry>>,
     log: Arc<Logger>,
+    wake: Arc<(Mutex<bool>, Condvar)>,
 ) {
     let mut baseline = HealthBaseline::new();
 
     loop {
+        if crate::should_shutdown() { return; }
+
+        // Sleep until evictor rings the doorbell (or 5s timeout for shutdown check).
+        // If a signal was already sent before we got here, `notified` is true
+        // and we skip the wait entirely — no missed wakeups.
+        {
+            let frozen_empty = frozen.lock().unwrap().count() == 0;
+            let cp_empty    = checkpointed.lock().unwrap().count() == 0;
+            if frozen_empty && cp_empty {
+                let (lock, cvar) = &*wake;
+                let mut notified = lock.lock().unwrap();
+                while !*notified {
+                    let (guard, _) = cvar.wait_timeout(notified, Duration::from_secs(5)).unwrap();
+                    notified = guard;
+                    if crate::should_shutdown() { return; }
+                }
+                *notified = false;
+            }
+        }
+
         if crate::should_shutdown() { return; }
         let pressure = match monitor::psi::read_pressure() {
             Ok(p) => p,

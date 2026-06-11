@@ -5,17 +5,24 @@
 //! they run here on a 60s poll. Acts only at Normal pressure; under pressure the
 //! evictor owns all process actions and the two must not act on one concurrently.
 
+use std::fs;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use mgd_common::logger::{LogEntry, Logger};
+use crate::engine::calibrate::{render_suggestion, Calibrator};
+use crate::executor::registry::{CheckpointRegistry, FrozenRegistry};
 use crate::monitor;
 use crate::monitor::psi::PressureLevel;
 use mgd_common::output::locked_print;
 
 const POLL_SECS: u64 = 60;
+
+/// Persist calibration aggregates at most this often (plus shutdown flush).
+const CALIBRATION_FLUSH_SECS: u64 = 600;
 
 /// Reclaim-helper locations, probed in order. Absolute, root-writable only — no
 /// PATH search, no attacker-controllable input (PRIVILEGE_DESIGN §3). Covers
@@ -33,7 +40,14 @@ static LAST_RECLAIM: AtomicU64 = AtomicU64::new(0);
 /// Set once when the reclaim helper is absent/uncapped, to log only once.
 static RECLAIM_DISABLED: AtomicBool = AtomicBool::new(false);
 
-pub fn run(log: Arc<Logger>) {
+pub fn run(
+    log: Arc<Logger>,
+    frozen: Arc<Mutex<FrozenRegistry>>,
+    checkpointed: Arc<Mutex<CheckpointRegistry>>,
+    calibrator: Arc<Mutex<Calibrator>>,
+) {
+    let mut last_calibration_flush = Instant::now();
+
     loop {
         if crate::should_shutdown() {
             return;
@@ -50,12 +64,95 @@ pub fn run(log: Arc<Logger>) {
         if calm {
             if let Some(p) = pressure.as_ref() {
                 check_proactive_reclaim(p, &log);
+
+                // Calibration benign-time sampling: the evictor only reads PSI
+                // when the kernel trigger wakes it, so calm time is invisible
+                // to it — this 60s sample is what builds the noise-floor
+                // histogram. Under pressure the evictor samples at 5s instead.
+                let intervention = frozen.lock().unwrap().count() > 0
+                    || checkpointed.lock().unwrap().count() > 0;
+                calibrator.lock().unwrap().observe(
+                    p.some_avg10,
+                    p.full_avg10,
+                    intervention,
+                    POLL_SECS,
+                );
             }
+        }
+
+        if last_calibration_flush.elapsed().as_secs() >= CALIBRATION_FLUSH_SECS {
+            last_calibration_flush = Instant::now();
+            flush_calibration(&calibrator, &log);
         }
 
         // Subtract time already spent (the idle sample) to hold the period at ~POLL_SECS.
         let spent = cycle_start.elapsed().as_secs();
         interruptible_sleep(POLL_SECS.saturating_sub(spent));
+    }
+}
+
+// ── Passive calibration persistence (Phase D) ─────────────────────────────────
+// The Calibrator itself is pure (engine/calibrate.rs); all file I/O lives here.
+
+pub fn calibration_state_path() -> PathBuf {
+    mgd_common::util::home_dir().join(".local/share/mgd/calibration_state.toml")
+}
+
+pub fn calibration_suggestion_path() -> PathBuf {
+    mgd_common::util::home_dir().join(".local/share/mgd/calibration_suggestion.toml")
+}
+
+/// Load persisted aggregates, or start fresh (first run / unparseable file).
+pub fn load_calibrator() -> Calibrator {
+    fs::read_to_string(calibration_state_path())
+        .ok()
+        .and_then(|s| Calibrator::from_toml(&s))
+        .unwrap_or_else(Calibrator::new)
+}
+
+/// Persist aggregates if dirty, and (re)write the suggestion file once the
+/// data gates pass. Called periodically from the loop and at shutdown.
+pub fn flush_calibration(calibrator: &Arc<Mutex<Calibrator>>, log: &Logger) {
+    let (state_toml, suggestion) = {
+        let mut cal = calibrator.lock().unwrap();
+        if !cal.dirty() {
+            return;
+        }
+        (cal.to_toml(), cal.suggest())
+    };
+
+    let state_path = calibration_state_path();
+    if let Some(parent) = state_path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if let Err(e) = fs::write(&state_path, &state_toml) {
+        locked_print(&format!("[calibrate] cannot persist state to {}: {e}", state_path.display()));
+        return;
+    }
+
+    let Some(s) = suggestion else { return };
+    let rendered = render_suggestion(&s, &crate::config::get().psi, now_secs());
+    let sug_path = calibration_suggestion_path();
+    // Rewrite only on change so the mtime stays meaningful and we log once
+    // per actual revision, not every flush.
+    if fs::read_to_string(&sug_path).ok().as_deref() == Some(rendered.as_str()) {
+        return;
+    }
+    match fs::write(&sug_path, &rendered) {
+        Ok(()) => {
+            locked_print(&format!(
+                "[calibrate] [psi] suggestion ready ({:.0}h observed, {} stalls) → {}",
+                s.observed_hours, s.stall_events, sug_path.display()
+            ));
+            log.log(&LogEntry::new(
+                "CALIBRATE", 0, "psi", s.elevated_pct,
+                &format!("suggested elevated_pct={:.1} full_critical_pct={:.1}",
+                    s.elevated_pct, s.full_critical_pct),
+            ));
+        }
+        Err(e) => locked_print(&format!(
+            "[calibrate] cannot write suggestion to {}: {e}", sug_path.display()
+        )),
     }
 }
 

@@ -53,7 +53,7 @@ checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
 
 [[package]]
 name = "mgctl"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "libc",
  "mgd-common",
@@ -62,7 +62,7 @@ dependencies = [
 
 [[package]]
 name = "mgd"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "libc",
  "mgd-common",
@@ -74,7 +74,7 @@ dependencies = [
 
 [[package]]
 name = "mgd-common"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "libc",
  "serde",
@@ -83,7 +83,7 @@ dependencies = [
 
 [[package]]
 name = "mgd-cosmic"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "libc",
  "mgd-common",
@@ -91,7 +91,7 @@ dependencies = [
 
 [[package]]
 name = "mgd-gnome"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "libc",
  "mgd-common",
@@ -99,7 +99,7 @@ dependencies = [
 
 [[package]]
 name = "mgd-gpu-amd"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "libc",
  "mgd-common",
@@ -107,7 +107,7 @@ dependencies = [
 
 [[package]]
 name = "mgd-gpu-intel"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "libc",
  "mgd-common",
@@ -116,7 +116,7 @@ dependencies = [
 
 [[package]]
 name = "mgd-kde"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "libc",
  "mgd-common",
@@ -126,7 +126,7 @@ dependencies = [
 
 [[package]]
 name = "mgd-zram"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "libc",
  "mgd-common",

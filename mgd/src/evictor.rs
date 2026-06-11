@@ -1,7 +1,7 @@
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -27,12 +27,41 @@ pub fn run(
     frozen: Arc<Mutex<FrozenRegistry>>,
     checkpointed: Arc<Mutex<CheckpointRegistry>>,
     log: Arc<Logger>,
+    recovery_wake: Arc<(Mutex<bool>, Condvar)>,
+    calibrator: Arc<Mutex<crate::engine::calibrate::Calibrator>>,
 ) {
+    mgd_common::sync_print!("[responder] PSI source: {}", monitor::psi::pressure_source());
+    let psi_trigger = monitor::psi::PsiTrigger::new().ok();
+    if let Some(t) = &psi_trigger {
+        mgd_common::sync_print!("[responder] PSI epoll trigger registered on {} (zero-CPU idle).", t.source);
+    } else {
+        mgd_common::sync_print!("[responder] PSI epoll failed — falling back to 5s polling.");
+    }
+
+    let mut last_level = PressureLevel::Normal;
+
     loop {
         if crate::should_shutdown() { return; }
 
         if crate::should_reload() {
             crate::config::reload();
+        }
+
+        // Zero-CPU idle: if pressure was Normal last cycle, block on the kernel
+        // PSI trigger instead of doing expensive /proc/pid walks.
+        // Timeout 5s just to re-check shutdown flags and maintain the loop pulse.
+        if last_level == PressureLevel::Normal {
+            if let Some(trigger) = &psi_trigger {
+                if !trigger.wait(5000) {
+                    continue; // Timeout, no pressure -> skip the whole cycle
+                }
+            } else {
+                thread::sleep(Duration::from_secs(5));
+            }
+        } else {
+            // When Elevated or higher, poll actively so we can monitor recovery
+            // or escalate if pressure rises further.
+            thread::sleep(Duration::from_secs(5));
         }
 
         let pressure = match monitor::psi::read_pressure() {
@@ -47,6 +76,28 @@ pub fn run(
         let level = monitor::psi::pressure_level(&pressure);
         let meminfo = crate::monitor::meminfo::read_meminfo();
         let effective_level = escalate_for_swap(&level, &meminfo);
+        last_level = effective_level.clone();
+
+        // Passive calibration (Phase D): feed the raw PSI sample before any
+        // action this cycle. Samples taken while interventions are in flight
+        // are excluded inside observe() — the daemon must not calibrate off
+        // pressure it is already treating.
+        {
+            let intervention = frozen.lock().unwrap().count() > 0
+                || checkpointed.lock().unwrap().count() > 0;
+            calibrator.lock().unwrap().observe(
+                pressure.some_avg10,
+                pressure.full_avg10,
+                intervention,
+                5,
+            );
+        }
+
+        if effective_level == PressureLevel::Normal {
+            // We just recovered to Normal, or the 1s trigger fired but the 10s EMA 
+            // hasn't crossed the 5.0% threshold yet. Do nothing.
+            continue;
+        }
 
         let mut procs = monitor::process::list_processes();
         procs.sort_by_key(|p| std::cmp::Reverse(p.rss_kb));
@@ -77,9 +128,11 @@ pub fn run(
                 let result_str = execute_decision(d, &frozen, &checkpointed, &log);
                 mgd_common::sync_print!("  {:<10} {:<8} {:<22} {:>6.1}MB  {}", d.action, d.pid, d.name, d.rss_mb, result_str);
             }
+            // Ring the doorbell — recovery thread may have new work.
+            let (lock, cvar) = &*recovery_wake;
+            *lock.lock().unwrap() = true;
+            cvar.notify_one();
         }
-
-        thread::sleep(Duration::from_secs(5));
     }
 }
 

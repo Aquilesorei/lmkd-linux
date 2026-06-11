@@ -9,7 +9,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use mgd_common::protocol::{CoreMessage, PluginAction, PluginMessage};
 
 const PLUGIN_NAME: &str = "mgd-kde";
-const VERSION: &str = "0.3.0";
+const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 static LAST_PLASMA_RESTART: AtomicU64 = AtomicU64::new(0);
 static LAST_PD_REAP: AtomicU64 = AtomicU64::new(0);

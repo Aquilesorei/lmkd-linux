@@ -157,8 +157,54 @@ fn get_version_from_proc(name: &str) -> Option<String> {
 
 // ── PSI availability ──────────────────────────────────────────────────────────
 
-fn check_psi() -> bool {
-    Path::new("/proc/pressure/memory").exists()
+use mgd_common::psi::{GLOBAL_PSI, resolve_pressure_source, trigger_armable};
+
+/// Parse "systemd 256 (...)" from `systemctl --version`. Relevant because
+/// systemd < 254 leaves the delegated cgroup's memory.pressure root-owned,
+/// so the daemon's kernel trigger falls back to the global file.
+fn systemd_version() -> Option<u32> {
+    let out = std::process::Command::new("systemctl")
+        .arg("--version")
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .next()?
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()
+}
+
+/// Report the PSI source exactly as the daemon resolves it, plus whether the
+/// zero-CPU kernel trigger can be armed on it.
+fn report_psi() {
+    if !Path::new(GLOBAL_PSI).exists() {
+        println!("  {}", warn("PSI unavailable — kernel CONFIG_PSI not enabled"));
+        return;
+    }
+
+    let source = resolve_pressure_source();
+    if source == GLOBAL_PSI {
+        println!("  {}", ok(&format!("PSI monitoring ({GLOBAL_PSI}, global)")));
+        println!("  {}", warn("per-cgroup PSI unusable — daemon reads system-wide pressure"));
+    } else {
+        println!("  {}", ok(&format!("PSI monitoring ({source}, per-session cgroup)")));
+    }
+
+    if trigger_armable(&source) {
+        println!("  {}", ok("PSI kernel trigger armable (zero-CPU idle)"));
+    } else if source != GLOBAL_PSI && trigger_armable(GLOBAL_PSI) {
+        let hint = match systemd_version() {
+            Some(v) if v < 254 => format!("systemd {v} < 254 leaves it root-owned"),
+            _ => "cgroup file not writable".to_string(),
+        };
+        println!("  {}", warn(&format!(
+            "cgroup PSI trigger not armable ({hint}) — daemon falls back to global trigger"
+        )));
+    } else {
+        println!("  {}", warn("PSI trigger not armable — daemon falls back to 5s polling"));
+    }
 }
 
 // ── Plugin binary detection ───────────────────────────────────────────────────
@@ -256,13 +302,55 @@ fn read_calibration() -> CalibrationInfo {
     info
 }
 
+// ── Passive calibration (daemon-side, suggest-don't-apply) ───────────────────
+
+/// First numeric value for `key = <num>` in a flat TOML string (comments ok).
+fn toml_num(data: &str, key: &str) -> Option<f64> {
+    data.lines().find_map(|line| {
+        let line = line.trim();
+        let rest = line.strip_prefix(key)?.trim_start();
+        let val = rest.strip_prefix('=')?;
+        let val = val.split('#').next()?.trim();
+        val.parse().ok()
+    })
+}
+
+/// Reports the daemon's passive [psi] calibration: a ready suggestion file,
+/// accumulation progress, or nothing yet. Read-only, mirrors the paths in
+/// mgd's maintenance.rs.
+fn report_passive_calibration() {
+    let base = mgd_common::util::home_dir().join(".local/share/mgd");
+    let suggestion_path = base.join("calibration_suggestion.toml");
+    let state_path = base.join("calibration_state.toml");
+
+    if let Ok(data) = fs::read_to_string(&suggestion_path) {
+        println!("  {}", ok(&format!(
+            "passive [psi] suggestion ready → {}", suggestion_path.display()
+        )));
+        if let Some(v) = toml_num(&data, "elevated_pct") {
+            println!("  {:30} {:.1}%", "suggested elevated_pct:", v);
+        }
+        if let Some(v) = toml_num(&data, "full_critical_pct") {
+            println!("  {:30} {:.1}%", "suggested full_critical_pct:", v);
+        }
+        println!("  Review the file, paste into ~/.config/mgd/priorities.toml, then: mgctl reload");
+    } else if let Ok(data) = fs::read_to_string(&state_path) {
+        let hours = toml_num(&data, "observed_secs").unwrap_or(0.0) / 3600.0;
+        let events = toml_num(&data, "stall_events").unwrap_or(0.0) as u64;
+        println!("  {}", warn(&format!(
+            "passive [psi] calibration accumulating — {hours:.1}h observed, {events} stall episodes (suggests after 24h + 10 episodes)"
+        )));
+    } else {
+        println!("  {}", skip("passive [psi] calibration: no data yet (collected while mgd runs)"));
+    }
+}
+
 // ── Main entry ────────────────────────────────────────────────────────────────
 
 pub fn run() -> i32 {
     let gpu     = detect_gpu();
     let swap    = detect_swap();
     let desktop = detect_desktop();
-    let psi_ok  = check_psi();
     let plugins = detect_plugins();
     let cal     = read_calibration();
 
@@ -292,11 +380,7 @@ pub fn run() -> i32 {
     // ── Core features ─────────────────────────────────────────────────────────
     println!("{}", bold("Core features:"));
 
-    if psi_ok {
-        println!("  {}", ok("PSI monitoring (/proc/pressure/memory)"));
-    } else {
-        println!("  {}", warn("PSI unavailable — kernel CONFIG_PSI not enabled"));
-    }
+    report_psi();
 
     let daemon_running = process_running("mgd");
     if daemon_running {
@@ -362,6 +446,7 @@ pub fn run() -> i32 {
         println!("  {}", warn("No calibration data — using built-in conservative defaults (15% target)"));
         println!("  Run: mgctl calibrate");
     }
+    report_passive_calibration();
     println!();
 
     // ── Privilege / caps ──────────────────────────────────────────────────────

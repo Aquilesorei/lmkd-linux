@@ -7,7 +7,7 @@ use std::time::Duration;
 use mgd_common::protocol::{Metric, PluginMessage};
 
 const PLUGIN_NAME: &str = "mgd-gpu-intel";
-const VERSION: &str = "0.3.0";
+const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn main() {
     let stream = mgd_common::plugin::connect_and_identify(PLUGIN_NAME, VERSION, vec!["gpu_residency"]);

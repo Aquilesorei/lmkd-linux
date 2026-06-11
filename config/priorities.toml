@@ -97,6 +97,24 @@ paths = [
     # "~/.cache/JetBrains",
 ]
 
+# ── PSI pressure tiers ───────────────────────────────────────────────────────
+# Boundaries mapping some_avg10 (% of time at least one task stalled on memory,
+# 10 s average) to the daemon's action tiers. Defaults below are the built-in
+# values — only uncomment to tune. Must satisfy
+#   0 < elevated < high < critical < emergency <= 100
+# or the whole block is rejected with a warning and defaults are used.
+# full_critical_pct: when full_avg10 (ALL tasks stalled) reaches this, the
+# level is forced to at least Critical regardless of some_avg10.
+# Note: elevated_pct also sets the kernel-trigger wake threshold, which is
+# armed once at startup — that one picks up changes on daemon restart, not
+# SIGHUP reload (the tier mapping itself hot-reloads).
+[psi]
+# elevated_pct = 5.0
+# high_pct = 25.0
+# critical_pct = 50.0
+# emergency_pct = 70.0
+# full_critical_pct = 20.0
+
 # ── XDG desktop category fallback ────────────────────────────────────────────
 # Applied when a process isn't matched by any [[apps]] regex.
 # mgd reads /proc/PID/exe to get the untruncated binary name, looks it up in

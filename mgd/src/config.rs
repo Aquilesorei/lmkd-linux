@@ -44,6 +44,56 @@ struct RawConfig {
     reclaim: Reclaim,
     #[serde(default)]
     cache_drop: CacheDrop,
+    #[serde(default)]
+    thresholds: Thresholds,
+    #[serde(default)]
+    psi: Psi,
+}
+
+/// `[psi]` — pressure-tier boundaries (some_avg10 %) and the full_avg10
+/// accelerator floor. Defaults match the long-standing built-in values; an
+/// invalid combination (non-increasing tiers, out of range) falls back to
+/// defaults with a warning rather than producing nonsense levels.
+#[derive(Deserialize)]
+struct Psi {
+    #[serde(default = "default_psi_elevated")]
+    elevated_pct: f64,
+    #[serde(default = "default_psi_high")]
+    high_pct: f64,
+    #[serde(default = "default_psi_critical")]
+    critical_pct: f64,
+    #[serde(default = "default_psi_emergency")]
+    emergency_pct: f64,
+    #[serde(default = "default_psi_full_critical")]
+    full_critical_pct: f64,
+}
+
+impl Default for Psi {
+    fn default() -> Self {
+        Psi {
+            elevated_pct: default_psi_elevated(),
+            high_pct: default_psi_high(),
+            critical_pct: default_psi_critical(),
+            emergency_pct: default_psi_emergency(),
+            full_critical_pct: default_psi_full_critical(),
+        }
+    }
+}
+
+fn default_psi_elevated() -> f64 { 5.0 }
+fn default_psi_high() -> f64 { 25.0 }
+fn default_psi_critical() -> f64 { 50.0 }
+fn default_psi_emergency() -> f64 { 70.0 }
+fn default_psi_full_critical() -> f64 { 20.0 }
+
+/// `[thresholds]` — optional user override for the free-RAM target.
+/// If not set, the daemon derives the target from total RAM (RAM-scaling).
+/// Run `mgctl calibrate --apply` to populate this automatically.
+#[derive(Deserialize, Default)]
+struct Thresholds {
+    /// Override the RAM-scaled free-RAM target (percentage 1–100).
+    /// Example: target_available_pct = 18
+    target_available_pct: Option<f64>,
 }
 
 
@@ -178,6 +228,12 @@ pub struct CompiledConfig {
     pub default_priority: u8,
     pub log_keep: usize,
 
+    /// Target free-RAM percentage used by the deficit calculation.
+    /// Derived from calibration if available, otherwise RAM-scaled:
+    ///   < 8 GB  → 20%,  8–16 GB → 15%,  16–32 GB → 12%,  > 32 GB → 10%.
+    /// Can also be overridden in [thresholds] target_available_pct.
+    pub target_available_pct: f64,
+
     /// zram compaction pre-action — on unless disabled in [zram].
     pub compact_zram_on_elevated: bool,
     /// Skip zram compaction when the pool holds less than this many MB.
@@ -196,6 +252,8 @@ pub struct CompiledConfig {
     pub cache_drop_enabled: bool,
     /// Pressure level at/above which cache drop fires (parsed from trigger_level).
     pub cache_drop_trigger: crate::monitor::psi::PressureLevel,
+    /// Pressure-tier boundaries from [psi] (validated; defaults if invalid).
+    pub psi: crate::monitor::psi::PsiThresholds,
     /// Minimum seconds between cache-drop actions (cooldown floor).
     pub cache_drop_cooldown_secs: u64,
     /// Directory-tree patterns (~ and single-* per segment) to drop cache for.
@@ -277,8 +335,56 @@ fn try_system_config() -> Option<(String, Option<PathBuf>)> {
     Some((content, Some(path)))
 }
 
+// ── RAM-scaling helpers ───────────────────────────────────────────────────────
+
+/// Returns the appropriate free-RAM target percentage for this machine's total RAM.
+/// Larger machines need less proportional headroom; smaller machines need more.
+///
+/// Scaling table:
+///   < 8 GB   → 20%   (tight machines — compositor takes a big share)
+///   8–16 GB  → 15%   (typical laptop — original conservative default)
+///   16–32 GB → 12%   (workstation — comfortable headroom without waste)
+///   > 32 GB  → 10%   (server/high-RAM — proportional guard is still ample)
+fn ram_scaled_target_pct() -> f64 {
+    let total_kb = crate::monitor::meminfo::read_meminfo().total_kb;
+    let total_gb = total_kb as f64 / (1024.0 * 1024.0);
+    if      total_gb < 8.0  { 20.0 }
+    else if total_gb < 16.0 { 15.0 }
+    else if total_gb < 32.0 { 12.0 }
+    else                    { 10.0 }
+}
+
+/// Try to load target_available_pct from `mgctl calibrate` output.
+/// Returns None if no calibration file exists or it cannot be parsed.
+fn load_calibrated_target_pct() -> Option<f64> {
+    let path = mgd_common::util::home_dir()
+        .join(".config/mgd/calibration.toml");
+    let content = std::fs::read_to_string(&path).ok()?;
+    for line in content.lines() {
+        if let Some(rest) = line.trim().strip_prefix("target_available_pct") {
+            if let Some(val) = rest.split('=').nth(1) {
+                let num: String = val.chars()
+                    .take_while(|c| c.is_ascii_digit() || *c == '.')
+                    .collect();
+                if let Ok(pct) = num.trim().parse::<f64>() {
+                    return Some(pct.clamp(5.0, 50.0));
+                }
+            }
+        }
+    }
+    None
+}
+
 fn compile(content: &str) -> Result<CompiledConfig, String> {
     let raw: RawConfig = toml::from_str(content).map_err(|e| e.to_string())?;
+
+    // Resolve target_available_pct in priority order:
+    //   1. [thresholds] override in config file (user explicit)
+    //   2. Calibration file (~/.local/share/mgd/calibration.json)
+    //   3. RAM-scaled default (safe for any machine, no config needed)
+    let target_available_pct = raw.thresholds.target_available_pct
+        .or_else(load_calibrated_target_pct)
+        .unwrap_or_else(ram_scaled_target_pct);
 
     let mut entries = Vec::with_capacity(raw.apps.len());
     for app in raw.apps {
@@ -298,9 +404,27 @@ fn compile(content: &str) -> Result<CompiledConfig, String> {
 
     let desktop_index = scan_desktop_files(&raw.category_priorities);
 
+    let psi = crate::monitor::psi::PsiThresholds {
+        elevated_pct: raw.psi.elevated_pct,
+        high_pct: raw.psi.high_pct,
+        critical_pct: raw.psi.critical_pct,
+        emergency_pct: raw.psi.emergency_pct,
+        full_critical_pct: raw.psi.full_critical_pct,
+    };
+    let psi = if psi.valid() {
+        psi
+    } else {
+        eprintln!(
+            "mgd: invalid [psi] thresholds (must be 0 < elevated < high < critical \
+             < emergency <= 100, full_critical_pct > 0), using defaults"
+        );
+        crate::monitor::psi::PsiThresholds::default()
+    };
+
     Ok(CompiledConfig {
         default_priority: raw.defaults.priority,
         log_keep: raw.defaults.log_keep,
+        target_available_pct,
 
         compact_zram_on_elevated: raw.zram.compact_on_elevated,
         zram_min_used_mb: raw.zram.min_used_mb,
@@ -320,6 +444,7 @@ fn compile(content: &str) -> Result<CompiledConfig, String> {
             }),
         cache_drop_cooldown_secs: raw.cache_drop.cooldown_min.saturating_mul(60),
         cache_drop_paths: raw.cache_drop.paths,
+        psi,
         entries,
         protected,
         desktop_index,
@@ -389,4 +514,46 @@ fn parse_desktop_file<'a>(path: &Path, category_priorities: &HashMap<String, u8>
         .filter_map(|cat| category_priorities.get(*cat).copied())
         .max()?;
     Some((exe, prio))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::monitor::psi::PsiThresholds;
+
+    #[test]
+    fn test_psi_block_overrides() {
+        let cfg = compile(
+            "[psi]\n\
+             elevated_pct = 10.0\n\
+             high_pct = 35.0\n\
+             critical_pct = 60.0\n\
+             emergency_pct = 80.0\n\
+             full_critical_pct = 30.0\n",
+        ).unwrap();
+        assert_eq!(cfg.psi.elevated_pct, 10.0);
+        assert_eq!(cfg.psi.high_pct, 35.0);
+        assert_eq!(cfg.psi.full_critical_pct, 30.0);
+    }
+
+    #[test]
+    fn test_psi_partial_block_keeps_other_defaults() {
+        let cfg = compile("[psi]\nelevated_pct = 8.0\n").unwrap();
+        assert_eq!(cfg.psi.elevated_pct, 8.0);
+        assert_eq!(cfg.psi.high_pct, 25.0);
+        assert_eq!(cfg.psi.emergency_pct, 70.0);
+    }
+
+    #[test]
+    fn test_psi_defaults_when_absent() {
+        let cfg = compile("").unwrap();
+        assert_eq!(cfg.psi, PsiThresholds::default());
+    }
+
+    #[test]
+    fn test_psi_invalid_falls_back_to_defaults() {
+        // elevated >= high: rejected as a set, not silently reordered.
+        let cfg = compile("[psi]\nelevated_pct = 50.0\nhigh_pct = 25.0\n").unwrap();
+        assert_eq!(cfg.psi, PsiThresholds::default());
+    }
 }

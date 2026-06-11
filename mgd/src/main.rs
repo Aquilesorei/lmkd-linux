@@ -8,7 +8,7 @@ mod maintenance;
 mod ipc;
 mod plugin_server;
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use executor::registry::{FrozenRegistry, CheckpointRegistry};
@@ -41,6 +41,10 @@ fn main() {
     let frozen = Arc::new(Mutex::new(FrozenRegistry::load()));
     let checkpointed = Arc::new(Mutex::new(CheckpointRegistry::load()));
 
+    // Passive calibration aggregates survive restarts (suggestions need days
+    // of observation). Maintenance flushes periodically; main flushes at exit.
+    let calibrator = Arc::new(Mutex::new(maintenance::load_calibrator()));
+
     let log_keep = config::get().log_keep;
     let logger = Arc::new(Logger::new(log_keep));
 
@@ -51,19 +55,26 @@ fn main() {
         libc::signal(libc::SIGHUP,  handle_sighup  as *const () as libc::sighandler_t);
     }
 
+    // Doorbell: evictor rings it when it adds to frozen/checkpointed registries.
+    // Recovery sleeps on it when both registries are empty.
+    let recovery_wake: Arc<(Mutex<bool>, Condvar)> = Arc::new((Mutex::new(false), Condvar::new()));
+
     // ── Actor threads ─────────────────────────────────────────────────────────
     let responder = {
         let f = Arc::clone(&frozen);
         let c = Arc::clone(&checkpointed);
         let l = Arc::clone(&logger);
-        thread::spawn(move || evictor::run(f, c, l))
+        let w = Arc::clone(&recovery_wake);
+        let cal = Arc::clone(&calibrator);
+        thread::spawn(move || evictor::run(f, c, l, w, cal))
     };
 
     let recovery = {
         let f = Arc::clone(&frozen);
         let c = Arc::clone(&checkpointed);
         let l = Arc::clone(&logger);
-        thread::spawn(move || recovery::run(f, c, l))
+        let w = Arc::clone(&recovery_wake);
+        thread::spawn(move || recovery::run(f, c, l, w))
     };
 
     let ipc = {
@@ -74,7 +85,10 @@ fn main() {
 
     let maintenance = {
         let l = Arc::clone(&logger);
-        thread::spawn(move || maintenance::run(l))
+        let f = Arc::clone(&frozen);
+        let c = Arc::clone(&checkpointed);
+        let cal = Arc::clone(&calibrator);
+        thread::spawn(move || maintenance::run(l, f, c, cal))
     };
 
     let _ = responder.join();
@@ -84,6 +98,9 @@ fn main() {
 
     // Actors are done — no new freezes: safe to sweep.
     shutdown_unfreeze(&frozen);
+
+    // Persist calibration aggregates gathered since the last periodic flush.
+    maintenance::flush_calibration(&calibrator, &logger);
 }
 
 /// Handle `mgd freeze <pid>` and `mgd unfreeze <pid>`.
@@ -125,9 +142,9 @@ fn handle_legacy_cli(args: &[String]) -> bool {
 }
 
 fn print_startup_banner() {
-    println!("Memory Guardian v0.3.0");
-    println!("  PressureResponder:  5s poll (freeze/checkpoint/kill)");
-    println!("  RecoveryManager:    3s poll (unfreeze/restore)");
+    println!("Memory Guardian v{}", env!("CARGO_PKG_VERSION"));
+    println!("  PressureResponder:  PSI epoll trigger (zero-CPU idle)");
+    println!("  RecoveryManager:    condvar sleep (wakes on freeze/checkpoint)");
     println!("  MaintenanceManager: 60s poll (idle reaps, housekeeping)");
     println!("  IPC socket:         {}", mgd_common::socket::socket_path().display());
 
