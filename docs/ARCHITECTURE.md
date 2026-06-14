@@ -39,9 +39,9 @@ when the system is already unresponsive, and it has no notion of *priority* — 
 compositor and a background file indexer are equal candidates.
 
 **mgd's thesis:** monitor pressure continuously, and manage the reclaim cycle the
-kernel skips — freezing, checkpointing, or killing processes *in priority order*
-before stall time reaches the point of no return, then restoring them when
-pressure clears.
+kernel skips — proactively reclaiming background cgroup memory, freezing, checkpointing,
+or killing processes *in priority order* before stall time reaches the point of no
+return, then restoring them when pressure clears.
 
 ---
 
