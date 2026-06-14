@@ -100,7 +100,7 @@ fn get_process_ticks(pid: u32) -> Option<u64> {
 fn check_plasma_gpu(writer: &mut UnixStream, cache: &Arc<Mutex<u64>>) {
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
     let last_restart = LAST_PLASMA_RESTART.load(Ordering::SeqCst);
-    if now - last_restart < 600 {
+    if now.saturating_sub(last_restart) < 600 {
         return; // 10 minute cooldown
     }
 
@@ -129,7 +129,7 @@ fn check_plasma_discover(writer: &mut UnixStream, tracker: &mut DiscoverTracker)
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
     
     let last_reap = LAST_PD_REAP.load(Ordering::SeqCst);
-    if now - last_reap < 60 {
+    if now.saturating_sub(last_reap) < 60 {
         return; // 1 minute cooldown between reap attempts
     }
 
@@ -152,7 +152,7 @@ fn check_plasma_discover(writer: &mut UnixStream, tracker: &mut DiscoverTracker)
         return; // not idle
     }
 
-    if now - tracker.idle_since >= 60 {
+    if now.saturating_sub(tracker.idle_since) >= 60 {
         // Idle for at least 60 seconds
         let status_path = format!("/proc/{pid}/status");
         let Ok(status) = fs::read_to_string(&status_path) else { return };

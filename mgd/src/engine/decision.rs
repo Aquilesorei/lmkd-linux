@@ -89,7 +89,7 @@ pub fn plan(
         .map(|p| {
             let mut prio = cfg.priority_for(&p.name, p.exe_basename.as_deref());
             if Some(p.pid) == active_pid {
-                prio = prio.saturating_sub(25);
+                prio = std::cmp::max(prio.saturating_sub(25), 20);
             }
             let gpu_kb = if count_gpu {
                 crate::plugin_server::get_gpu_kb(p.pid)
