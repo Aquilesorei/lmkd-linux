@@ -6,20 +6,26 @@ The Linux kernel swaps processes out on memory spikes but never actively reclaim
 
 `lmkd-linux` monitors PSI (Pressure Stall Information) and manages the reclaim cycle the kernel skips — freezing, checkpointing, or killing processes in priority order before stall time reaches the point of no return, then restoring them when pressure clears.
 
+**Note:** `mgd` does not replace the Linux kernel OOM killer or `systemd-oomd`. It operates purely as a userspace prioritization layer that preemptively freezes or deprioritizes processes under pressure, while all kernel-level memory management remains fully active as the final safety mechanism.
+
 ## How it works
 
-Reads `/proc/pressure/memory` every 5 seconds. When stall time crosses a threshold, calculates the RAM deficit and works through processes from least to most important until enough is freed.
+Instead of reacting to raw instantaneous metrics, `lmkd-linux` operates as a **damped feedback controller** to determine the system's memory pressure:
 
+1. **Continuous Pressure Score ($P$):** Combines weighted system signals: **60% PSI memory stall**, **25% swap saturation**, and **15% UMA GPU memory residency** (crucial for Intel Iris Xe and other integrated GPUs where graphics memory competing for system RAM is otherwise invisible to tools like `free`).
+2. **Pressure Trend ($T = dP/dt$):** Measures the velocity of pressure changes to accelerate reactions to sudden spikes while ignoring brief transient blips.
+3. **Damped State Machine:** Coordinates escalation and recovery. Upward transitions require pressure to persist for at least 2 cycles (ticks) unless a rapid critical spike occurs. Downward transitions require sustained calm (1–2 minutes) to prevent system oscillation.
+
+Once a target pressure level is determined:
 ```
-ELEVATED  (avg10 ≥ 5%)   →  SIGSTOP low-priority processes
-HIGH      (avg10 ≥ 25%)  →  SIGSTOP + SIGTERM expendable processes
-CRITICAL  (avg10 ≥ 50%)  →  CRIU checkpoint or kill
-EMERGENCY (avg10 ≥ 70%)  →  SIGKILL anything non-critical
+ELEVATED  →  zram compaction + SIGSTOP low-priority processes
+HIGH      →  page-cache drop + SIGSTOP/SIGTERM expendable processes
+CRITICAL  →  CRIU checkpoint or kill
+EMERGENCY →  SIGKILL anything non-critical
 ```
 
-If `full_avg10 ≥ 20%` (all tasks stalled), the daemon jumps straight to Critical regardless of `some_avg10`.
+If a desktop plugin (like `mgd-kde`) is active, the daemon dynamically protects your **active foreground window** by temporarily reducing its priority, ensuring it is shielded from eviction actions.
 
-Processes are never killed above their priority tier. The compositor and audio server are hardcoded untouchable. Frozen processes are tracked and automatically resumed when pressure drops.
 
 ## Stress test
 
@@ -126,17 +132,20 @@ mgd          # run daemon (normally via systemd)
 
 ### mgctl — live control CLI
 ```bash
-mgctl status              # current pressure level + frozen/checkpointed counts
-mgctl list                # list all currently frozen processes
-mgctl unfreeze firefox    # manually unfreeze by name (substring match)
-mgctl unfreeze 12345      # manually unfreeze by PID
-mgctl reload              # hot-reload config without restarting daemon (SIGHUP)
+mgctl status                  # current pressure level + frozen/checkpointed counts
+mgctl list                    # list all currently frozen processes
+mgctl unfreeze firefox        # manually unfreeze by name (substring match)
+mgctl unfreeze 12345          # manually unfreeze by PID
+mgctl reload                  # hot-reload config without restarting daemon (SIGHUP)
+mgctl doctor                  # print environment diagnostic + feature support report
+mgctl calibrate [--dry-run]   # derive recommended PSI thresholds based on historic load
+mgctl calibrate --apply       # apply previously generated calibration settings
 
-mgctl restart             # restart the mgd service
-mgctl start | stop        # start / stop the mgd service
-mgctl service             # systemd unit state (active, PID, uptime, memory)
-mgctl logs                # last 50 daemon log lines
-mgctl logs -f             # follow daemon logs live
+mgctl restart                 # restart the mgd service
+mgctl start | stop            # start / stop the mgd service
+mgctl service                 # systemd unit state (active, PID, uptime, memory)
+mgctl logs                    # last 50 daemon log lines
+mgctl logs -f                 # follow daemon logs live
 ```
 
 `status`, `list`, `unfreeze`, and `reload` talk to the running daemon via a Unix
@@ -231,10 +240,14 @@ falls back to SIGKILL when checkpoint fails. See the opt-in setup below.
 - [x] Process protect list in config (`[[protect]]` entries)
 - [x] Per-process `checkpoint = true/false` override in config
 - [x] Log rotation (`log_keep` in config, default 10 files)
-- [ ] D-Bus notifications with Restore button
-- [ ] Kernel patches (PSI triggers, proactive swap-in, LRU hints)
-
-See [DESIGN_SPEC.md](DESIGN_SPEC.md) for full architecture.
+- [x] Cargo workspace + plugin architecture — `mgd-common`, `mgd`, `mgctl`, `mgd-zram`, plugin scaffolds
+- [x] Plugin IPC protocol types (`PluginMessage`, `CoreMessage`)
+- [x] Registry persistence across daemon restart
+- [x] fdinfo GPU sweep cost reduction (pluginized decoupled architecture)
+- [x] `mgctl doctor` + `mgctl calibrate` portability UX
+- [x] PSI epoll (kernel-native triggers, replace 5s poll when calm)
+- [ ] Benchmark harness vs earlyoom / nohang / systemd-oomd
+- [ ] COSMIC DE / Pop!_OS 24 plugin (`mgd-cosmic`)
 
 ## Tested on
 

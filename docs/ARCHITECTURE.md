@@ -70,7 +70,9 @@ pressure clears.
 
 ## 3. Process & threading model
 
-`mgd` is a single process running four cooperating threads ("actors"), spawned in
+The system is built as a Cargo workspace with a core daemon (`mgd`) and standalone plugins (`mgd-kde`, `mgd-gpu-intel`, etc.).
+
+The core daemon (`mgd`) runs four cooperating threads ("actors"), spawned in
 `main.rs` and joined on shutdown. They share three things via `Arc`:
 `Arc<Mutex<FrozenRegistry>>`, `Arc<Mutex<CheckpointRegistry>>`, and an
 `Arc<Logger>`.
@@ -87,9 +89,9 @@ pressure clears.
 │ PressureRespon│  │ RecoveryManager│    │  IPC server      │   │ MaintenanceManager│
 │   (evictor.rs)│  │ (recovery.rs)  │    │   (ipc.rs)       │   │ (maintenance.rs)  │
 │  5s poll      │  │  3s poll       │    │  unix socket     │   │  60s poll         │
-│  freeze/kill/ │  │  unfreeze/     │    │  status/list/    │   │  idle reaps,      │
-│  checkpoint + │  │  restore at    │    │  unfreeze/reload │   │  proactive swap   │
-│  system pre-  │  │  Normal only   │    │                  │   │  reclaim          │
+│  freeze/kill/ │  │  unfreeze/     │    │  status/list/    │   │  proactive swap   │
+│  checkpoint + │  │  restore at    │    │  unfreeze/reload │   │  reclaim          │
+│  system pre-  │  │  Normal only   │    │  & plugin comms  │   │                   │
 │  actions      │  │                │    │                  │   │                   │
 └───────────────┘  └───────────────┘     └─────────────────┘   └──────────────────┘
         │                  │                       │                      │
@@ -107,10 +109,9 @@ pressure clears.
   processes that have been frozen long enough, and restores checkpointed
   processes one at a time — both gated by a learned RAM baseline so the system
   doesn't bounce straight back into pressure.
-- **IPC server:** a Unix-domain-socket request/response server for `mgctl`.
+- **IPC server:** a Unix-domain-socket request/response server for `mgctl` and **plugins**.
 - **MaintenanceManager (60 s):** houses the *blocking* / slow housekeeping that
-  must not stall the 5 s loop — the plasma-discover CPU-idle sample (blocks for
-  `idle_check_secs`) and proactive swap reclaim (blocks on `swapoff`/`swapon`).
+  must not stall the 5 s loop (e.g., proactive swap reclaim which blocks on `swapoff`/`swapon`).
   Acts only when the system is calm.
 
 ### The threading rule (load-bearing)
@@ -120,9 +121,8 @@ pressure clears.
 > cycle** runs **inline in the evictor before `plan()`**.
 
 This is why zram *compact* and page-cache *drop* are inline pre-actions (their
-freed RAM must shrink the deficit `plan()` computes this cycle) while
-plasma-discover idle-reaping and swap *reclaim* are on the maintenance thread
-(they block, and have no same-cycle ordering dependency).
+freed RAM must shrink the deficit `plan()` computes this cycle) while swap *reclaim*
+is on the maintenance thread (it blocks, and has no same-cycle ordering dependency).
 
 ### Shutdown
 
@@ -165,28 +165,30 @@ in `engine/decision.rs`.
 | `gpu.rs` | `/proc/<pid>/fdinfo/*` (DRM) | per-process GPU residency (UMA), plasmashell restart |
 | `cache.rs` | configured dir trees | `posix_fadvise(DONTNEED)` page-cache drop |
 
-### Pressure levels (`psi.rs`)
+### Pressure levels & Continuous Controller (`psi.rs`, `evictor.rs`)
 
 `PressureLevel` is an ordered enum (`Normal < Elevated < High < Critical <
 Emergency`), derived `PartialOrd`/`Ord` so callers can gate on
-`level >= Elevated`. Mapping from PSI `some avg10`:
+`level >= Elevated`. Instead of mapping raw PSI directly, the core daemon uses a **damped feedback controller** to determine the active level:
 
-| `some_avg10` | Level |
-|--------------|-------|
-| ≥ 70 % | Emergency |
-| ≥ 50 % | Critical |
-| ≥ 25 % | High |
-| ≥ 5 % | Elevated |
-| else | Normal |
+1. **Pressure Score ($P$):** A normalized score ($0.0$ to $1.0$) representing overall memory stress:
+   $$P = w_{\text{PSI}} \cdot S_{\text{PSI}} + w_{\text{swap}} \cdot S_{\text{swap}} + w_{\text{GPU}} \cdot S_{\text{GPU}}$$
+   where the weights are $w_{\text{PSI}} = 0.60$, $w_{\text{swap}} = 0.25$, and $w_{\text{GPU}} = 0.15$. The sub-scores are normalized between $0.0$ and $1.0$:
+   *   $S_{\text{PSI}} = \text{clamp}\left(\frac{\text{PSI}_{\text{some\_avg10}}}{100.0},\, 0.0,\, 1.0\right)$
+   *   $S_{\text{swap}} = \text{clamp}\left(\frac{\text{Swap}_{\text{used\_pct}}}{100.0},\, 0.0,\, 1.0\right)$ (defaults to $0.0$ if no swap exists)
+   *   $S_{\text{GPU}} = \text{clamp}\left(\frac{\text{GPU}_{\text{UMA\_kb}}}{\text{RAM}_{\text{total\_kb}}},\, 0.0,\, 1.0\right)$ (total GPU residency reported by driver plugins)
+2. **Trend ($T$):** The derivative ($dP/dt$) calculated dynamically across cycles to measure pressure velocity (change per second):
+   $$T = \frac{dP}{dt} \approx \frac{P_t - P_{t-1}}{\Delta t}$$
+   where $\Delta t$ is the precise time elapsed (in seconds) since the last cycle.
+3. **State Machine with Hysteresis:** An internal state machine determines the target pressure tier (`Calm` -> `Warning` -> `Evicting` -> `Critical` -> `Emergency`).
+   * **Escalation Delay:** To transition up the severity ladder, the target state must persist for at least **2 consecutive cycles** (ticks), preventing reactions to instantaneous spikes.
+   * **Instant Escalation:** If a massive spike is detected (`Critical`/`Emergency`) with a high positive trend ($T > 0.08$), the delay is bypassed to protect the system.
+   * **Recovery Cooldown:** Transitioning down the ladder requires the calmer state to persist longer (e.g., 1 minute of Calm before restoring/unfreezing).
 
-**Full-stall accelerator:** if `full_avg10 ≥ 20 %` (every task stalled), the
-level jumps straight to **Critical** (or Emergency if `some_avg10 ≥ 70`),
-regardless of the table above.
+The resulting state is mapped 1-to-1 to the `PressureLevel` enum.
 
-**Swap escalation (`evictor::escalate_for_swap`):** PSI can miss a slow pre-OOM
-where swap fills gradually. When `swap_used_pct ≥ 85 %` (and swap ≥ 256 MB), the
-computed level is bumped one tier. This *effective level* is what drives `plan()`
-and the pre-actions.
+**Active Foreground Protection:** If a desktop plugin reports the active window's PID via IPC (`PluginMessage::ActiveWindow`), its config priority is temporarily offset by `-25` inside `plan()`, shielding it from eviction actions unless no other candidates exist.
+
 
 ### Process selection (`process.rs`)
 
@@ -224,8 +226,10 @@ Every process gets a 0–100 priority (higher = sacrifice sooner), resolved by
 ### `plan()` algorithm
 
 1. If `Normal`, return no decisions.
-2. Compute the **RAM deficit**: `target = 15 % of total`; `deficit = target −
-   available`. If `≤ 0`, nothing to do.
+2. Compute the **RAM deficit** ($D$):
+   $$D = \text{Target}_{\text{avail}} - \text{MemAvailable}$$
+   $$\text{Target}_{\text{avail}} = 0.15 \cdot \text{RAM}_{\text{total}}$$
+   If $D \le 0$, there is no deficit and no action is taken.
 3. Build candidate list: processes using **> 10 MB** (RSS+swap), each tagged with
    its priority. Sort least-important first (priority desc, then RSS desc, then
    oom_score desc).
@@ -264,11 +268,16 @@ Every process gets a 0–100 priority (higher = sacrifice sooner), resolved by
 
 ### Restore safety (`health.rs`)
 
-`HealthBaseline` keeps an EMA (α = 0.05, ~60 samples to converge) of available
-RAM during Normal periods. `safe_to_restore(avail, total, rss)` requires
-post-restore RAM to stay above 85 % of the learned baseline (or a conservative
-10 % of total while fewer than 10 samples exist). This gates both unfreeze and
-checkpoint-restore so recovery never re-triggers pressure.
+`HealthBaseline` tracks a rolling baseline of available RAM during healthy (Normal pressure) periods using an Exponential Moving Average (EMA) with $\alpha = 0.05$:
+$$B_t = \alpha \cdot \text{MemAvailable}_t + (1 - \alpha) \cdot B_{t-1}$$
+
+To decide if it is safe to unfreeze or restore a process, `safe_to_restore` verifies:
+$$\text{MemAvailable} - \text{RSS}_{\text{process}} > 0.85 \cdot B_t$$
+
+If the baseline has fewer than 10 samples, it falls back to a conservative threshold:
+$$\text{MemAvailable} - \text{RSS}_{\text{process}} > 0.10 \cdot \text{RAM}_{\text{total}}$$
+
+This prevents recovery actions from immediately re-triggering pressure.
 
 ---
 
@@ -279,7 +288,7 @@ checkpoint-restore so recovery never re-triggers pressure.
 | `freezer.rs` | `freeze`/`unfreeze` (SIGSTOP/SIGCONT), plus `*_checked` variants |
 | `killer.rs` | `terminate` (SIGTERM → 5 s wait → SIGKILL), `kill` (SIGKILL) |
 | `checkpoint.rs` | CRIU dump/restore; absolute-path criu resolution |
-| `registry.rs` | `FrozenRegistry`, `CheckpointRegistry` (in-memory state) |
+| `registry.rs` | `FrozenRegistry`, `CheckpointRegistry` (persisted state) |
 | `mod.rs` | `OpResult`, `read_start_time()` |
 
 ### PID-recycle safety (a recurring theme)
@@ -297,10 +306,8 @@ before acting:
 
 ### Registries
 
-Both are **in-memory only**, not persisted. A daemon restart orphans frozen /
-checkpointed processes — which is why `main` runs `cleanup_orphaned_snapshots()`
-at startup (snapshot dirs from a previous crash would otherwise leak hundreds of
-MB). `CheckpointRegistry` tracks a per-entry restore-attempt count; after
+Both are **persisted to disk** in `~/.local/share/mgd/state/*.json`. A daemon restart restores the registry state so previously frozen processes can still be unfrozen and checkpointed processes restored. `cleanup_orphaned_snapshots()` is run at startup to remove any snapshot directories on disk that are not tracked in the recovered `CheckpointRegistry`.
+`CheckpointRegistry` tracks a per-entry restore-attempt count; after
 `MAX_RESTORE_ATTEMPTS = 3` the snapshot is abandoned and removed.
 
 ### CRIU specifics
@@ -355,23 +362,19 @@ gates live in the unprivileged daemon:
 - Normal pressure **and** `some_avg60 < 5 %` (calm, not a just-subsided spike)
 - cooldown elapsed (`reclaim_cooldown_min`, default 10 min)
 - `zram_used ≥ min_zram_used_mb` (default 2048)
-- **OOM headroom gate (critical):** `MemAvailable > decompressed_footprint ×
-  decompressed_headroom_mult` (default 1.5). zram stores *compressed* pages that
-  expand 2–3× on the way back into RAM; without this gate the reclaim itself
-  could OOM the box.
+- **OOM headroom gate (critical):** Restricts swap reclaim unless:
+  $$\text{MemAvailable} > \text{Footprint}_{\text{decompressed}} \cdot m_{\text{headroom}}$$
+  where $m_{\text{headroom}} = 1.5$ (default) and $\text{Footprint}_{\text{decompressed}}$ is the sum of `orig_data_size` (field 0 of `/sys/block/zramN/mm_stat`) across all zram devices. Because zram stores compressed pages that expand 2–3× on decompression, this gate prevents the reclaim operation itself from triggering a system OOM.
 
-### preventive watchers (don't fit the pressure pipeline)
+---
 
-- **plasmashell GPU-leak** (`gpu.rs`, evictor): reads per-process GPU residency
-  from DRM fdinfo (no privilege, unlike `intel_gpu_top`). Over threshold +
-  cooldown → restart via `kquitapp6`/`kstart`. Off by default.
-- **plasma-discover idle reaper** (`maintenance.rs`): over RSS threshold **and**
-  CPU-idle across a 60 s sample → SIGTERM (KDE relaunches on demand). The
-  blocking sample is why it's on the maintenance thread. On by default.
+## 8.5 Plugins (`mgd-kde`, `mgd-gpu-intel`, etc.)
 
-All watchers follow the same shape: a `check_X()` gated by a config flag read
-once, an `AtomicU64` cooldown floor, logging via the shared `Arc<Logger>`, and
-**not** arming the cooldown on failure.
+Historically, environment-specific watchers lived inside `mgd`. They are now decoupled into standalone plugin processes that connect to the IPC server using the `mgd-common` library:
+- **`mgd-kde`**: Handles restarting the KDE `plasmashell` on GPU leaks, and reaping `plasma-discover` on CPU idle.
+- **`mgd-gpu-intel`**: Scans `/proc/<pid>/fdinfo/` (DRM) to account for UMA graphics memory as part of process footprint.
+
+Plugins observe the system and request actions from the core daemon (`ActionRequest`), keeping the core portable.
 
 ---
 
@@ -443,19 +446,20 @@ top of its next cycle. `.desktop` files are re-scanned on each load to rebuild t
 
 ---
 
-## 11. IPC & control (`src/ipc.rs`, `src/mgctl.rs`)
+## 11. IPC & control (`src/ipc.rs`, `mgctl/src/main.rs`)
 
 The daemon serves a newline-delimited request/response protocol on a Unix socket
 at `$XDG_RUNTIME_DIR/mgd.sock` (fallback `/tmp/mgd-<uid>.sock`). Responses are
 `OK <data>` / `ERR <msg>`. Connections are short-lived threads, capped at
 `MAX_CONNECTIONS = 8`; a stale socket from a crash is detected and rebound.
 
-`mgctl` is the client and splits cleanly in two:
+`mgctl` is the client and splits cleanly into three categories:
 - **socket commands** (daemon must be alive): `status`, `list`, `unfreeze`,
   `reload`.
 - **lifecycle commands** (wrap `systemctl --user` / `journalctl --user`, work
   even when the daemon is down — which the socket cannot): `restart`, `start`,
   `stop`, `service` (systemd unit state), `logs [-f]`.
+- **standalone utility commands**: `doctor` (environment + feature report) and `calibrate` (derive per-machine PSI thresholds).
 
 `status` is the daemon's live view (pressure, frozen counts); `service` is the
 systemd unit view (active state, PID, uptime, memory) — deliberately distinct.
@@ -503,7 +507,7 @@ Everything mgd senses comes from procfs/sysfs — no kernel module, no BPF:
 | criu missing/unprivileged | fall back to SIGKILL; log the setcap command |
 | restore fails 3× | abandon snapshot, remove dir, log |
 | PID recycled | abort the op (or treat as success if target already gone) |
-| daemon restart | orphaned snapshots cleaned at startup; registries reset |
+| daemon restart | registry state recovered from disk; orphaned snapshots cleaned at startup |
 | shutdown (SIGTERM) | unfreeze sweep before exit |
 
 The invariant throughout: **no single failure aborts the daemon** — it logs and

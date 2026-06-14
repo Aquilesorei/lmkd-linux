@@ -1,0 +1,18 @@
+[package]
+name        = "mgd-kde"
+version     = "0.4.0"
+edition     = "2024"
+description = "KDE Plasma 6+ plasmashell and plasma-discover watcher plugin for mgd"
+repository  = "https://github.com/Aquilesorei/lmkd-linux"
+license     = "GPL-2.0"
+authors     = ["Caleb Zongo <your@email.com>"]
+
+[[bin]]
+name = "mgd-kde"
+path = "src/main.rs"
+
+[dependencies]
+mgd-common = { path = "../mgd-common" }
+libc       = { workspace = true }
+serde      = { workspace = true }
+serde_json = { workspace = true }
