@@ -42,6 +42,9 @@ static ZRAM_COMPACT_DISABLED: std::sync::atomic::AtomicBool =
 /// Unix-seconds of the last page-cache drop (0 = never).
 static LAST_CACHE_DROP: AtomicU64 = AtomicU64::new(0);
 
+/// Unix-seconds of the last early background process reclaim.
+static LAST_EARLY_RECLAIM: AtomicU64 = AtomicU64::new(0);
+
 pub fn run(
     frozen: Arc<Mutex<FrozenRegistry>>,
     checkpointed: Arc<Mutex<CheckpointRegistry>>,
@@ -214,13 +217,16 @@ pub fn run(
         // System pre-actions run before plan() so their freed RAM shrinks the
         // deficit. zram compact (cheaper) first, then cache drop.
         compact_zram(&effective_level, &log);
-        check_cache_drop(&effective_level, &log);
 
         // Exclude frozen PIDs so their RSS isn't double-counted toward the deficit.
         let frozen_set: HashSet<u32> = frozen.lock().unwrap().frozen_pids().into_iter().collect();
         let plan_procs: Vec<&Process> = procs.iter()
             .filter(|p| !frozen_set.contains(&p.pid))
             .collect();
+
+        let active_pid = crate::plugin_server::get_active_foreground_pid();
+        check_early_process_reclaim(&effective_level, &plan_procs, active_pid, &log);
+        check_cache_drop(&effective_level, &log);
 
         let decisions = plan(&effective_level, &plan_procs, meminfo.available_kb, meminfo.total_kb);
         if decisions.is_empty() {
@@ -439,5 +445,97 @@ fn execute_checkpoint(d: &Decision, checkpointed: &Arc<Mutex<CheckpointRegistry>
         let kr = crate::executor::killer::kill(d.pid);
         if kr.success { "killed (CRIU failed)".into() }
         else { format!("kill_fail: {}", kr.error.unwrap_or_default()) }
+    }
+}
+
+fn reclaim_process_cgroup(pid: u32, bytes: u64) -> Result<(), std::io::Error> {
+    let cgroup_file = format!("/proc/{}/cgroup", pid);
+    let content = std::fs::read_to_string(&cgroup_file)?;
+    for line in content.lines() {
+        if let Some(path) = line.strip_prefix("0::") {
+            let path = path.trim();
+            if path == "/" {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "cannot reclaim root cgroup",
+                ));
+            }
+            let reclaim_path = std::path::Path::new("/sys/fs/cgroup")
+                .join(path.trim_start_matches('/'))
+                .join("memory.reclaim");
+            if reclaim_path.exists() {
+                std::fs::write(&reclaim_path, format!("{}", bytes))?;
+                return Ok(());
+            }
+        }
+    }
+    Err(std::io::Error::new(std::io::ErrorKind::NotFound, "cgroup memory.reclaim not found"))
+}
+
+fn check_early_process_reclaim(
+    level: &PressureLevel,
+    plan_procs: &[&Process],
+    active_pid: Option<u32>,
+    log: &Logger,
+) {
+    if *level != PressureLevel::Elevated {
+        return;
+    }
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let last = LAST_EARLY_RECLAIM.load(Ordering::Relaxed);
+    if last != 0 && now.saturating_sub(last) < 30 {
+        return; // 30s cooldown
+    }
+    LAST_EARLY_RECLAIM.store(now, Ordering::Relaxed);
+
+    // Filter candidate background processes:
+    // - Priority >= 50 (expendable/user apps)
+    // - RSS > 20MB
+    // - Not the active foreground process
+    let mut targets: Vec<&Process> = plan_procs
+        .iter()
+        .filter(|p| {
+            p.rss_kb > 20_000
+                && Some(p.pid) != active_pid
+                && get_priority(&p.name, p.exe_basename.as_deref()) >= 50
+        })
+        .copied()
+        .collect();
+
+    // Sort by RSS descending to target the largest background processes first
+    targets.sort_by_key(|p| std::cmp::Reverse(p.rss_kb));
+
+    for p in targets.iter().take(3) {
+        let reclaim_bytes = (p.rss_kb / 2) * 1024; // reclaim 50% of RSS
+        match reclaim_process_cgroup(p.pid, reclaim_bytes) {
+            Ok(()) => {
+                mgd_common::sync_print!(
+                    "[reclaim] Proactively pushed ~{}MB of background PID {} ({}) to Zram",
+                    reclaim_bytes / (1024 * 1024),
+                    p.pid,
+                    p.name
+                );
+                log.log(&LogEntry::new(
+                    "EARLY_RECLAIM",
+                    p.pid,
+                    &p.name,
+                    (reclaim_bytes / (1024 * 1024)) as f64,
+                    "pushed to zram via cgroup reclaim",
+                ));
+            }
+            Err(e) => {
+                // Ignore transient errors, log at debug
+                mgd_common::sync_print!(
+                    "[reclaim] Early reclaim failed for PID {} ({}): {}",
+                    p.pid,
+                    p.name,
+                    e
+                );
+            }
+        }
     }
 }
