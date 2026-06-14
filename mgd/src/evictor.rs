@@ -1,5 +1,5 @@
 
-use std::collections::HashSet;
+use std::collections::{HashSet, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
@@ -66,9 +66,20 @@ pub fn run(
     let mut current_state = ControlState::Calm;
     let mut pending_state = ControlState::Calm;
     let mut pending_ticks = 0usize;
+    let mut background_tracker: HashMap<String, std::time::Instant> = HashMap::new();
+    let mut throttled_states: HashMap<String, ThrottledState> = HashMap::new();
+    let mut last_idle_reclaim_check = std::time::Instant::now();
+    let mut last_active_pid = None;
 
     loop {
-        if crate::should_shutdown() { return; }
+        if crate::should_shutdown() {
+            // Cleanup CPU throttling on shutdown
+            for path in throttled_states.keys() {
+                let _ = write_cgroup_cpu_weight(path, 100);
+                let _ = write_cgroup_cpu_max(path, "max 100000");
+            }
+            return;
+        }
 
         if crate::should_reload() {
             crate::config::reload();
@@ -201,9 +212,37 @@ pub fn run(
             );
         }
 
+        // Background CPU Throttling and Idle cgroup reclaim manager
+        let config = crate::config::get();
+        let active_pid = crate::plugin_server::get_active_foreground_pid();
+        let now_inst = std::time::Instant::now();
+        let idle_reclaim_interval_elapsed = now_inst.duration_since(last_idle_reclaim_check).as_secs() >= config.idle_reclaim_global_cooldown_sec;
+        let active_pid_changed = active_pid != last_active_pid;
+
+        if active_pid_changed || idle_reclaim_interval_elapsed {
+            last_active_pid = active_pid;
+            if idle_reclaim_interval_elapsed {
+                last_idle_reclaim_check = now_inst;
+            }
+
+            let procs = monitor::process::list_processes();
+            let frozen_set: HashSet<u32> = frozen.lock().unwrap().frozen_pids().into_iter().collect();
+            let plan_procs: Vec<&Process> = procs.iter()
+                .filter(|p| !frozen_set.contains(&p.pid))
+                .collect();
+
+            // Update CPU throttling (tiered, debounced)
+            update_cpu_throttling(&plan_procs, active_pid, &mut background_tracker, &mut throttled_states);
+
+            // Idle cgroup reclaim: only runs at Normal/Calm pressure
+            if effective_level == PressureLevel::Normal {
+                if config.idle_reclaim_enabled {
+                    check_idle_process_reclaim(&plan_procs, active_pid, &mut background_tracker, &log);
+                }
+            }
+        }
+
         if effective_level == PressureLevel::Normal {
-            // We just recovered to Normal, or the 1s trigger fired but the 10s EMA 
-            // hasn't crossed the 5.0% threshold yet. Do nothing.
             continue;
         }
 
@@ -536,6 +575,281 @@ fn check_early_process_reclaim(
                     e
                 );
             }
+        }
+    }
+}
+
+fn check_idle_process_reclaim(
+    plan_procs: &[&Process],
+    active_pid: Option<u32>,
+    background_tracker: &mut HashMap<String, std::time::Instant>,
+    log: &Logger,
+) {
+    let config = crate::config::get();
+    
+    // Safety gates: swap/zram occupancy
+    let meminfo = crate::monitor::meminfo::read_meminfo();
+    if meminfo.swap_total_kb > 0 {
+        let swap_used_pct = meminfo.swap_used_pct();
+        if swap_used_pct > config.idle_reclaim_max_swap_occupancy_pct {
+            return;
+        }
+        let swap_free_mb = meminfo.swap_free_kb / 1024;
+        if swap_free_mb < 1500 {
+            return; // Less than 1.5 GB swap free
+        }
+    }
+
+    // 1. Group processes by cgroup path
+    let mut cgroup_groups: HashMap<String, Vec<&Process>> = HashMap::new();
+    for p in plan_procs {
+        if let Some(cgroup_path) = get_process_cgroup_path(p.pid) {
+            cgroup_groups.entry(cgroup_path).or_default().push(p);
+        }
+    }
+
+    // 2. Identify the active foreground cgroup path (if any)
+    let foreground_cgroup_path = active_pid.and_then(|pid| get_process_cgroup_path(pid));
+
+    // 3. Prune dead cgroups from background tracker
+    let active_cgroups: HashSet<&String> = cgroup_groups.keys().collect();
+    background_tracker.retain(|path, _| active_cgroups.contains(path));
+
+    let mut reclaimed_count = 0;
+    for (cgroup_path, processes) in &cgroup_groups {
+        if Some(cgroup_path) == foreground_cgroup_path.as_ref() {
+            background_tracker.remove(cgroup_path);
+            continue;
+        }
+
+        // Sum the total RSS of processes in this cgroup
+        let total_rss_kb: u64 = processes.iter().map(|p| p.rss_kb).sum();
+        
+        // Find minimum priority in this cgroup
+        let mut min_priority = 100;
+        let mut debug_name = String::new();
+        for p in processes {
+            let prio = get_priority(&p.name, p.exe_basename.as_deref());
+            if prio < min_priority {
+                min_priority = prio;
+                debug_name = p.name.clone();
+            }
+        }
+
+        if min_priority < 50 || total_rss_kb < config.idle_reclaim_rss_min_mb * 1024 {
+            background_tracker.remove(cgroup_path);
+            continue;
+        }
+
+        // Track duration in background
+        let background_duration = background_tracker
+            .entry(cgroup_path.clone())
+            .or_insert_with(std::time::Instant::now)
+            .elapsed()
+            .as_secs();
+
+        if background_duration >= config.idle_reclaim_sec {
+            // Qualifies for reclaim!
+            let reclaim_bytes = (total_rss_kb * config.idle_reclaim_pct / 100) * 1024;
+            if reclaim_bytes > 0 {
+                // Write to the cgroup's memory.reclaim
+                let reclaim_path = std::path::Path::new("/sys/fs/cgroup")
+                    .join(cgroup_path.trim_start_matches('/'))
+                    .join("memory.reclaim");
+                
+                if reclaim_path.exists() {
+                    match std::fs::write(&reclaim_path, format!("{}", reclaim_bytes)) {
+                        Ok(()) => {
+                            mgd_common::sync_print!(
+                                "[reclaim] Proactively reclaimed ~{}MB from idle background cgroup {} (e.g. {})",
+                                reclaim_bytes / (1024 * 1024),
+                                cgroup_path,
+                                debug_name
+                            );
+                            // Log using the PID of the largest process in the cgroup for compatibility with log tools
+                            let max_proc = processes.iter().max_by_key(|p| p.rss_kb);
+                            if let Some(p) = max_proc {
+                                log.log(&LogEntry::new(
+                                    "EARLY_RECLAIM",
+                                    p.pid,
+                                    &p.name,
+                                    (reclaim_bytes / (1024 * 1024)) as f64,
+                                    "proactively pushed idle cgroup to zram",
+                                ));
+                            }
+
+                            // Reset the timer in tracker to serve as per-process cooldown
+                            background_tracker.insert(cgroup_path.clone(), std::time::Instant::now());
+
+                            reclaimed_count += 1;
+                            if reclaimed_count >= 3 {
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            mgd_common::sync_print!(
+                                "[reclaim] Proactive idle reclaim failed for cgroup {} ({}): {}",
+                                cgroup_path,
+                                debug_name,
+                                e
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ThrottledState {
+    None,
+    WeightOnly,
+    Full,
+}
+
+fn get_process_cgroup_path(pid: u32) -> Option<String> {
+    let cgroup_file = format!("/proc/{}/cgroup", pid);
+    let content = std::fs::read_to_string(&cgroup_file).ok()?;
+    for line in content.lines() {
+        if let Some(path) = line.strip_prefix("0::") {
+            let path = path.trim();
+            if path != "/" {
+                return Some(path.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn write_cgroup_cpu_weight(cgroup_path: &str, weight: u32) -> Result<(), std::io::Error> {
+    let path = std::path::Path::new("/sys/fs/cgroup")
+        .join(cgroup_path.trim_start_matches('/'))
+        .join("cpu.weight");
+    if path.exists() {
+        std::fs::write(&path, format!("{}", weight))?;
+        return Ok(());
+    }
+    Err(std::io::Error::new(std::io::ErrorKind::NotFound, "cpu.weight not found"))
+}
+
+fn write_cgroup_cpu_max(cgroup_path: &str, max_limit: &str) -> Result<(), std::io::Error> {
+    let path = std::path::Path::new("/sys/fs/cgroup")
+        .join(cgroup_path.trim_start_matches('/'))
+        .join("cpu.max");
+    if path.exists() {
+        std::fs::write(&path, max_limit)?;
+        return Ok(());
+    }
+    Err(std::io::Error::new(std::io::ErrorKind::NotFound, "cpu.max not found"))
+}
+
+fn update_cpu_throttling(
+    plan_procs: &[&Process],
+    active_pid: Option<u32>,
+    background_tracker: &mut HashMap<String, std::time::Instant>,
+    throttled_states: &mut HashMap<String, ThrottledState>,
+) {
+    // 1. Group processes by cgroup path
+    let mut cgroup_groups: HashMap<String, Vec<&Process>> = HashMap::new();
+    for p in plan_procs {
+        if let Some(cgroup_path) = get_process_cgroup_path(p.pid) {
+            cgroup_groups.entry(cgroup_path).or_default().push(p);
+        }
+    }
+
+    // 2. Identify the active foreground cgroup path (if any)
+    let foreground_cgroup_path = active_pid.and_then(|pid| get_process_cgroup_path(pid));
+
+    // 3. Prune dead cgroups from trackers
+    let active_cgroups: HashSet<&String> = cgroup_groups.keys().collect();
+    background_tracker.retain(|path, _| active_cgroups.contains(path));
+    throttled_states.retain(|path, _| active_cgroups.contains(path));
+
+    // 4. Update cgroup throttling states
+    for (cgroup_path, processes) in &cgroup_groups {
+        let current_throttled = throttled_states.get(cgroup_path).copied().unwrap_or(ThrottledState::None);
+
+        if Some(cgroup_path) == foreground_cgroup_path.as_ref() {
+            // Foreground cgroup must be unthrottled instantly
+            if current_throttled != ThrottledState::None {
+                let _ = write_cgroup_cpu_weight(cgroup_path, 100);
+                let _ = write_cgroup_cpu_max(cgroup_path, "max 100000");
+                throttled_states.insert(cgroup_path.clone(), ThrottledState::None);
+                mgd_common::sync_print!("[throttle] Restored foreground cgroup {} to normal CPU shares", cgroup_path);
+            }
+            background_tracker.remove(cgroup_path);
+            continue;
+        }
+
+        // Background cgroup: find minimum priority of processes inside it
+        let mut min_priority = 100;
+        let mut debug_name = String::new();
+        for p in processes {
+            let prio = get_priority(&p.name, p.exe_basename.as_deref());
+            if prio < min_priority {
+                min_priority = prio;
+                debug_name = p.name.clone();
+            }
+        }
+
+        if min_priority < 20 {
+            // Critical cgroups are never throttled
+            if current_throttled != ThrottledState::None {
+                let _ = write_cgroup_cpu_weight(cgroup_path, 100);
+                let _ = write_cgroup_cpu_max(cgroup_path, "max 100000");
+                throttled_states.insert(cgroup_path.clone(), ThrottledState::None);
+            }
+            background_tracker.remove(cgroup_path);
+            continue;
+        }
+
+        // Track duration in background
+        let background_duration = background_tracker
+            .entry(cgroup_path.clone())
+            .or_insert_with(std::time::Instant::now)
+            .elapsed()
+            .as_secs();
+
+        // Target throttled state
+        let target_throttled = if background_duration >= 10 { // 10s debounce
+            if min_priority >= 60 {
+                ThrottledState::Full
+            } else {
+                ThrottledState::WeightOnly
+            }
+        } else {
+            ThrottledState::None
+        };
+
+        if target_throttled != current_throttled {
+            match target_throttled {
+                ThrottledState::None => {
+                    let _ = write_cgroup_cpu_weight(cgroup_path, 100);
+                    let _ = write_cgroup_cpu_max(cgroup_path, "max 100000");
+                    mgd_common::sync_print!("[throttle] Unthrottled cgroup {}", cgroup_path);
+                }
+                ThrottledState::WeightOnly => {
+                    if write_cgroup_cpu_weight(cgroup_path, 1).is_ok() {
+                        let _ = write_cgroup_cpu_max(cgroup_path, "max 100000");
+                        mgd_common::sync_print!(
+                            "[throttle] Set weight=1 for background cgroup {} (e.g. {})",
+                            cgroup_path,
+                            debug_name
+                        );
+                    }
+                }
+                ThrottledState::Full => {
+                    if write_cgroup_cpu_weight(cgroup_path, 1).is_ok() && write_cgroup_cpu_max(cgroup_path, "50000 100000").is_ok() {
+                        mgd_common::sync_print!(
+                            "[throttle] Capped CPU & weight=1 for low-priority cgroup {} (e.g. {})",
+                            cgroup_path,
+                            debug_name
+                        );
+                    }
+                }
+            }
+            throttled_states.insert(cgroup_path.clone(), target_throttled);
         }
     }
 }

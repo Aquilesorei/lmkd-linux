@@ -45,6 +45,8 @@ struct RawConfig {
     #[serde(default)]
     cache_drop: CacheDrop,
     #[serde(default)]
+    idle_reclaim: IdleReclaim,
+    #[serde(default)]
     thresholds: Thresholds,
     #[serde(default)]
     psi: Psi,
@@ -181,6 +183,42 @@ fn default_cache_enabled() -> bool { true }
 fn default_cache_trigger() -> String { "High".to_string() }
 fn default_cache_cooldown() -> u64 { 5 }
 
+#[derive(Deserialize)]
+struct IdleReclaim {
+    #[serde(default = "default_idle_reclaim_enabled")]
+    enabled: bool,
+    #[serde(default = "default_idle_reclaim_sec")]
+    idle_sec: u64,
+    #[serde(default = "default_idle_reclaim_rss_min_mb")]
+    rss_min_mb: u64,
+    #[serde(default = "default_idle_reclaim_reclaim_pct")]
+    reclaim_pct: u64,
+    #[serde(default = "default_idle_reclaim_global_cooldown_sec")]
+    global_cooldown_sec: u64,
+    #[serde(default = "default_idle_reclaim_max_swap_occupancy_pct")]
+    max_swap_occupancy_pct: f64,
+}
+
+impl Default for IdleReclaim {
+    fn default() -> Self {
+        IdleReclaim {
+            enabled: default_idle_reclaim_enabled(),
+            idle_sec: default_idle_reclaim_sec(),
+            rss_min_mb: default_idle_reclaim_rss_min_mb(),
+            reclaim_pct: default_idle_reclaim_reclaim_pct(),
+            global_cooldown_sec: default_idle_reclaim_global_cooldown_sec(),
+            max_swap_occupancy_pct: default_idle_reclaim_max_swap_occupancy_pct(),
+        }
+    }
+}
+
+fn default_idle_reclaim_enabled() -> bool { true }
+fn default_idle_reclaim_sec() -> u64 { 180 }
+fn default_idle_reclaim_rss_min_mb() -> u64 { 50 }
+fn default_idle_reclaim_reclaim_pct() -> u64 { 20 }
+fn default_idle_reclaim_global_cooldown_sec() -> u64 { 30 }
+fn default_idle_reclaim_max_swap_occupancy_pct() -> f64 { 60.0 }
+
 
 #[derive(Deserialize)]
 struct Defaults {
@@ -258,6 +296,12 @@ pub struct CompiledConfig {
     pub cache_drop_cooldown_secs: u64,
     /// Directory-tree patterns (~ and single-* per segment) to drop cache for.
     pub cache_drop_paths: Vec<String>,
+    pub idle_reclaim_enabled: bool,
+    pub idle_reclaim_sec: u64,
+    pub idle_reclaim_rss_min_mb: u64,
+    pub idle_reclaim_pct: u64,
+    pub idle_reclaim_global_cooldown_sec: u64,
+    pub idle_reclaim_max_swap_occupancy_pct: f64,
     /// (regex, priority, checkpoint_override)
     entries: Vec<(Regex, u8, Option<bool>)>,
     /// Patterns that must never be touched
@@ -444,6 +488,12 @@ fn compile(content: &str) -> Result<CompiledConfig, String> {
             }),
         cache_drop_cooldown_secs: raw.cache_drop.cooldown_min.saturating_mul(60),
         cache_drop_paths: raw.cache_drop.paths,
+        idle_reclaim_enabled: raw.idle_reclaim.enabled,
+        idle_reclaim_sec: raw.idle_reclaim.idle_sec,
+        idle_reclaim_rss_min_mb: raw.idle_reclaim.rss_min_mb,
+        idle_reclaim_pct: raw.idle_reclaim.reclaim_pct,
+        idle_reclaim_global_cooldown_sec: raw.idle_reclaim.global_cooldown_sec,
+        idle_reclaim_max_swap_occupancy_pct: raw.idle_reclaim.max_swap_occupancy_pct,
         psi,
         entries,
         protected,

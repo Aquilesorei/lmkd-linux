@@ -76,6 +76,21 @@ cooldown_min = 10                 # cooldown floor between reclaim cycles
 min_zram_used_mb = 2048           # skip when the pool holds less compressed RAM
 decompressed_headroom_mult = 1.5  # OOM guard: avail must exceed decompressed × this
 
+# ── continuous idle cgroup reclaim (unprivileged) ────────────────────────────
+# Rather than waiting for crisis-level memory pressure, mgd continuously checks for
+# background processes (priority >= 50, RSS > 50MB, not the active window) that
+# have been idle/inactive for `idle_sec` seconds, and proactively reclaims a portion
+# of their RSS (default 20%) via their cgroup `memory.reclaim` node to push cold
+# pages to zram. Only runs at Normal/Calm pressure levels. Fully unprivileged.
+# Bypassed if swap usage is high to prevent zram exhaustion.
+[idle_reclaim]
+enabled = true
+idle_sec = 180                 # background idle time in seconds to qualify as cold
+rss_min_mb = 50                # min RSS of the process to qualify
+reclaim_pct = 20               # percentage of process RSS to reclaim per cycle
+global_cooldown_sec = 30       # minimum seconds between any idle reclaim operations
+max_swap_occupancy_pct = 60.0  # skip if swap/zram usage exceeds this percentage
+
 # ── page-cache drop before freeze ────────────────────────────────────────────
 # Under pressure the kernel often evicts app pages to swap while keeping file
 # cache (build artifacts, node_modules, browser cache) that won't be read again
