@@ -194,7 +194,17 @@ pub fn run(
             pending_ticks = 0;
         }
 
-        let effective_level = current_state.to_pressure_level();
+        let mut effective_level = current_state.to_pressure_level();
+
+        let swap_exhausted = meminfo.swap_total_kb > 0 && meminfo.swap_used_pct() >= 95.0;
+        if swap_exhausted && effective_level < PressureLevel::Critical {
+            effective_level = PressureLevel::Critical;
+            mgd_common::sync_print!(
+                "[controller] Swap exhausted ({:.1}% used) — forcing effective pressure to CRITICAL to trigger eviction",
+                meminfo.swap_used_pct()
+            );
+        }
+
         last_level = effective_level.clone();
 
         // Passive calibration (Phase D): feed the raw PSI sample before any
@@ -267,7 +277,7 @@ pub fn run(
         check_early_process_reclaim(&effective_level, &plan_procs, active_pid, &log);
         check_cache_drop(&effective_level, &log);
 
-        let decisions = plan(&effective_level, &plan_procs, meminfo.available_kb, meminfo.total_kb);
+        let decisions = plan(&effective_level, &plan_procs, meminfo.available_kb, meminfo.total_kb, swap_exhausted);
         if decisions.is_empty() {
             mgd_common::sync_print!("✓ No action needed.");
         } else {
@@ -793,12 +803,13 @@ fn update_cpu_throttling(
             }
         }
 
-        if min_priority < 20 {
-            // Critical cgroups are never throttled
+        if min_priority < 60 {
+            // Exclude priorities < 60 (system, high, normal apps like IDEs/browsers) from CPU throttling
             if current_throttled != ThrottledState::None {
                 let _ = write_cgroup_cpu_weight(cgroup_path, 100);
                 let _ = write_cgroup_cpu_max(cgroup_path, "max 100000");
                 throttled_states.insert(cgroup_path.clone(), ThrottledState::None);
+                mgd_common::sync_print!("[throttle] Restored background cgroup {} to normal CPU shares (priority < 60)", cgroup_path);
             }
             background_tracker.remove(cgroup_path);
             continue;
@@ -813,7 +824,7 @@ fn update_cpu_throttling(
 
         // Target throttled state
         let target_throttled = if background_duration >= 10 { // 10s debounce
-            if min_priority >= 60 {
+            if min_priority >= 80 {
                 ThrottledState::Full
             } else {
                 ThrottledState::WeightOnly

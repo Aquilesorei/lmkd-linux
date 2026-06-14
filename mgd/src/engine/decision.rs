@@ -65,6 +65,7 @@ pub fn plan(
     procs: &[&Process],
     available_kb: u64,
     total_kb: u64,
+    swap_exhausted: bool,
 ) -> Vec<Decision> {
     if *level == PressureLevel::Normal {
         return vec![];
@@ -129,7 +130,7 @@ pub fn plan(
         };
 
         let checkpoint_override = cfg.checkpoint_override(&proc.name);
-        let action = decide_action(level, prio, swap_ratio, checkpoint_override);
+        let action = decide_action(level, prio, swap_ratio, checkpoint_override, swap_exhausted);
 
         if action == Action::None {
             continue;
@@ -172,7 +173,12 @@ fn decide_action(
     prio: u8,
     swap_ratio: f64,
     checkpoint_override: Option<bool>,
+    swap_exhausted: bool,
 ) -> Action {
+    if swap_exhausted && prio >= 80 {
+        return Action::Kill;
+    }
+
     match level {
         PressureLevel::Normal => Action::None,
 
@@ -226,14 +232,14 @@ mod tests {
     #[test]
     fn normal_pressure_produces_no_decisions() {
         let procs = vec![proc("firefox", 500_000, 0)];
-        let decisions = plan(&PressureLevel::Normal, &procs.iter().collect::<Vec<_>>(), 4_000_000, 16_000_000);
+        let decisions = plan(&PressureLevel::Normal, &procs.iter().collect::<Vec<_>>(), 4_000_000, 16_000_000, false);
         assert!(decisions.is_empty());
     }
 
     #[test]
     fn elevated_freezes_low_priority_only() {
         let procs = vec![proc("baloo_file_extractor", 200_000, 0)];
-        let decisions = plan(&PressureLevel::Elevated, &procs.iter().collect::<Vec<_>>(), 1_000_000, 16_000_000);
+        let decisions = plan(&PressureLevel::Elevated, &procs.iter().collect::<Vec<_>>(), 1_000_000, 16_000_000, false);
         assert_eq!(decisions.len(), 1);
         assert_eq!(decisions[0].action, Action::Freeze);
     }
@@ -241,21 +247,21 @@ mod tests {
     #[test]
     fn elevated_skips_normal_tier_entirely() {
         let procs = vec![proc("some_app", 500_000, 0)]; // default priority 50
-        let decisions = plan(&PressureLevel::Elevated, &procs.iter().collect::<Vec<_>>(), 1_000_000, 16_000_000);
+        let decisions = plan(&PressureLevel::Elevated, &procs.iter().collect::<Vec<_>>(), 1_000_000, 16_000_000, false);
         assert!(decisions.is_empty());
     }
 
     #[test]
     fn critical_never_touches_system_tier() {
         let procs = vec![proc("kwin_wayland", 300_000, 0)];
-        let decisions = plan(&PressureLevel::Critical, &procs.iter().collect::<Vec<_>>(), 500_000, 16_000_000);
+        let decisions = plan(&PressureLevel::Critical, &procs.iter().collect::<Vec<_>>(), 500_000, 16_000_000, false);
         assert!(decisions.is_empty());
     }
 
     #[test]
     fn critical_kills_high_swap_ratio() {
         let procs = vec![proc("msedge", 100_000, 200_000)];
-        let decisions = plan(&PressureLevel::Critical, &procs.iter().collect::<Vec<_>>(), 500_000, 16_000_000);
+        let decisions = plan(&PressureLevel::Critical, &procs.iter().collect::<Vec<_>>(), 500_000, 16_000_000, false);
         assert_eq!(decisions.len(), 1);
         assert_eq!(decisions[0].action, Action::Kill);
     }
@@ -263,7 +269,7 @@ mod tests {
     #[test]
     fn emergency_kills_everything_non_critical() {
         let procs = vec![proc("firefox", 500_000, 0)];
-        let decisions = plan(&PressureLevel::Emergency, &procs.iter().collect::<Vec<_>>(), 500_000, 16_000_000);
+        let decisions = plan(&PressureLevel::Emergency, &procs.iter().collect::<Vec<_>>(), 500_000, 16_000_000, false);
         assert_eq!(decisions.len(), 1);
         assert_eq!(decisions[0].action, Action::Kill);
     }
@@ -275,7 +281,7 @@ mod tests {
             proc("msedge", 2_000_000, 0),
         ];
         // deficit = 16M*0.15 - 1M = 1.4M KB; first 2M kill covers it.
-        let decisions = plan(&PressureLevel::Emergency, &procs.iter().collect::<Vec<_>>(), 1_000_000, 16_000_000);
+        let decisions = plan(&PressureLevel::Emergency, &procs.iter().collect::<Vec<_>>(), 1_000_000, 16_000_000, false);
         assert_eq!(decisions.len(), 1);
     }
 
@@ -290,7 +296,7 @@ mod tests {
             proc("baloo_file_extractor", 200_000, 0),
         ];
         let target = 16_000_000 * 15 / 100;
-        let decisions = plan(&PressureLevel::Elevated, &procs.iter().collect::<Vec<_>>(), target as u64 - 1024, 16_000_000);
+        let decisions = plan(&PressureLevel::Elevated, &procs.iter().collect::<Vec<_>>(), target as u64 - 1024, 16_000_000, false);
         assert_eq!(decisions.len(), 4);
         assert!(decisions.iter().all(|d| d.action == Action::Freeze));
     }
@@ -298,7 +304,7 @@ mod tests {
     #[test]
     fn ignores_tiny_processes() {
         let procs = vec![proc("tiny", 5_000, 0)];
-        let decisions = plan(&PressureLevel::Emergency, &procs.iter().collect::<Vec<_>>(), 500_000, 16_000_000);
+        let decisions = plan(&PressureLevel::Emergency, &procs.iter().collect::<Vec<_>>(), 500_000, 16_000_000, false);
         assert!(decisions.is_empty());
     }
 
@@ -310,7 +316,7 @@ mod tests {
             proc("msedge", 2_000_000, 0),
             proc("msedge", 2_000_000, 0),
         ];
-        let decisions = plan(&PressureLevel::High, &procs.iter().collect::<Vec<_>>(), 1_000_000, 16_000_000);
+        let decisions = plan(&PressureLevel::High, &procs.iter().collect::<Vec<_>>(), 1_000_000, 16_000_000, false);
         assert_eq!(decisions.len(), 1);
         assert_eq!(decisions[0].action, Action::Terminate);
         assert_eq!(decisions[0].rss_mb as u64, 1953); // 2_000_000 KB / 1024
@@ -326,5 +332,14 @@ mod tests {
     fn ram_deficit_negative_when_plenty() {
         let deficit = ram_deficit_kb(8_000_000, 16_000_000);
         assert!(deficit < 0);
+    }
+
+    #[test]
+    fn swap_exhausted_escalates_expendable_to_kill() {
+        let procs = vec![proc("msedge", 500_000, 0)]; // priority 90 (EXPENDABLE)
+        // Deficit must be positive for plan to evaluate candidates (e.g. 15% target on 16M is 2.4M, avail is 1M, so deficit is 1.4M)
+        let decisions = plan(&PressureLevel::Elevated, &procs.iter().collect::<Vec<_>>(), 1_000_000, 16_000_000, true);
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].action, Action::Kill);
     }
 }
