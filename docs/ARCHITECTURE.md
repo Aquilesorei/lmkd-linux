@@ -326,10 +326,9 @@ re-run. See §9 and `PRIVILEGE_DESIGN.md` §3.
 
 ---
 
-## 8. System-level reclaim (free RAM without touching processes)
+## 8. Non-destructive Reclaim (System-level & Early Process Reclaim)
 
-These act on the *system*, not a process, and run before `plan()` so their
-savings reduce the work the evictor must do.
+These act on the *system* or specific *background processes* before `plan()`, freeing RAM or pushing memory to swap/zram without destroying application state, reducing the need for destructive evictions.
 
 ### zram compaction (`monitor/zram.rs`, inline pre-action, Elevated+)
 
@@ -350,6 +349,15 @@ pages are written back first). Hand-rolled `~` + single-`*`-per-segment glob
 (no glob dependency). Bounded: `MAX_DEPTH = 8`, a **global** `MAX_FILES = 50_000`
 budget across all patterns, symlinks skipped (so the walk can't escape the tree).
 Cooldown-gated so a sustained High spell doesn't re-walk every 5 s.
+
+### early background process cgroup reclaim (`evictor.rs`, inline pre-action, Elevated)
+
+To proactively free RAM before pressure escalates, `mgd` implements early background cgroup reclaim. When pressure is `Elevated`, it selects up to 3 background processes that:
+- Have a priority $\ge 50$ (expendable/user applications).
+- Have an RSS $> 20$ MB.
+- Are not the currently active foreground process (reported by plugins).
+
+It reclaims $50\%$ of their RSS by writing the target bytes to their cgroup's `memory.reclaim` node (e.g., `/sys/fs/cgroup/user.slice/.../memory.reclaim`). Since the cgroup file hierarchy under the user's slice is owned by the user, this is fully unprivileged and does not require elevated privileges (`CAP_SYS_ADMIN`). A $30$ s cooldown is enforced between runs.
 
 ### proactive swap reclaim (`maintenance.rs`, maintenance thread, Normal only)
 
@@ -473,7 +481,7 @@ time), shared via `Arc<Logger>` (so rotation runs once, not per-thread). `LogEnt
 result }` is the structured line format. Rotation keeps the newest `log_keep`
 files (default 10; 0 = unlimited). Actions seen in logs: `FREEZE`, `UNFREEZE`,
 `TERMINATE`, `KILL`, `CHECKPOINT`, `RESTORE`/`RESTORE_FAIL`/`RESTORE_ABANDON`,
-`ZRAM`, `RECLAIM`, `CACHE`, `REAP`, `RESTART`.
+`ZRAM`, `RECLAIM`, `CACHE`, `REAP`, `RESTART`, `EARLY_RECLAIM`.
 
 ---
 
@@ -494,6 +502,7 @@ Everything mgd senses comes from procfs/sysfs — no kernel module, no BPF:
 | `/proc/swaps` | zram device discovery |
 | `/sys/block/zramN/mm_stat` | compressed + decompressed pool size |
 | `/sys/block/zramN/compact` | trigger compaction (privileged write) |
+| `/sys/fs/cgroup/.../memory.reclaim` | trigger proactive cgroup memory reclaim (user write) |
 
 ---
 
