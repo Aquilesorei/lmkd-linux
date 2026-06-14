@@ -3,50 +3,41 @@ use std::fs;
 use std::io;
 use std::path::PathBuf;
 use std::sync::OnceLock;
-
-/// criu locations, probed in order. Never a PATH search: a capped criu invoked
-/// by bare name would let a planted criu run with the caps. All root-controlled.
-const CRIU_CANDIDATES: &[&str] = &[
-    "/usr/sbin/criu",
-    "/usr/bin/criu",
-    "/sbin/criu",
-    "/bin/criu",
-    "/usr/local/sbin/criu",
-    "/usr/local/bin/criu",
-];
-
 use std::sync::atomic::{AtomicBool, Ordering};
 
-static CRIU_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
-static CRIU_DISABLED: AtomicBool = AtomicBool::new(false);
+static HELPER_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
+static CHECKPOINT_DISABLED: AtomicBool = AtomicBool::new(false);
 
-/// Check if checkpointing is supported (CRIU is present and has not failed with EACCES)
+/// Check if checkpointing is supported (mgd-checkpoint helper is present and has not been disabled)
 pub fn is_checkpoint_supported() -> bool {
-    let _ = criu_path();
-    !CRIU_DISABLED.load(Ordering::Relaxed)
+    let _ = helper_path();
+    !CHECKPOINT_DISABLED.load(Ordering::Relaxed)
 }
 
-/// Force disable checkpointing (e.g. after a privilege error)
+/// Force disable checkpointing (e.g. after a privilege or security error)
 pub fn disable_checkpoint() {
-    CRIU_DISABLED.store(true, Ordering::Relaxed);
+    CHECKPOINT_DISABLED.store(true, Ordering::Relaxed);
 }
 
-/// Absolute path to criu, resolved once. None if not installed.
-pub fn criu_path() -> Option<&'static PathBuf> {
-    let path = CRIU_PATH
-        .get_or_init(|| resolve_in(CRIU_CANDIDATES));
+/// Absolute path to the mgd-checkpoint helper, resolved once. None if not found.
+pub fn helper_path() -> Option<&'static PathBuf> {
+    let path = HELPER_PATH.get_or_init(|| {
+        // Probe /usr/local/bin/mgd-checkpoint first
+        let system_path = PathBuf::from("/usr/local/bin/mgd-checkpoint");
+        if is_executable(&system_path) {
+            return Some(system_path);
+        }
+        // Probe ~/.local/bin/mgd-checkpoint next
+        let local_path = mgd_common::util::home_dir().join(".local/bin/mgd-checkpoint");
+        if is_executable(&local_path) {
+            return Some(local_path);
+        }
+        None
+    });
     if path.is_none() {
-        CRIU_DISABLED.store(true, Ordering::Relaxed);
+        CHECKPOINT_DISABLED.store(true, Ordering::Relaxed);
     }
     path.as_ref()
-}
-
-/// First existing+executable candidate. Pure, for testing.
-fn resolve_in(candidates: &[&str]) -> Option<PathBuf> {
-    candidates
-        .iter()
-        .map(PathBuf::from)
-        .find(|p| is_executable(p))
 }
 
 fn is_executable(path: &std::path::Path) -> bool {
@@ -55,8 +46,7 @@ fn is_executable(path: &std::path::Path) -> bool {
     unsafe { libc::access(c.as_ptr(), libc::X_OK) == 0 }
 }
 
-/// Whether criu stderr looks like a capability shortfall vs a per-process restore
-/// failure — drives the "run setcap" hint. Inference-based to avoid a libcap dep.
+/// Whether stderr looks like a capability/privilege shortfall or a security error
 pub fn looks_like_privilege_error(stderr: &str) -> bool {
     let s = stderr.to_ascii_lowercase();
     s.contains("operation not permitted")
@@ -65,6 +55,8 @@ pub fn looks_like_privilege_error(stderr: &str) -> bool {
         || s.contains("cap_checkpoint_restore")
         || s.contains("permission denied")
         || (s.contains("ptrace") && s.contains("denied"))
+        || s.contains("security error")
+        || s.contains("capability warning")
 }
 
 #[derive(Debug)]
@@ -83,7 +75,7 @@ pub struct RestoreResult {
     pub error: Option<String>,
 }
 
-/// CRIU dump to disk, then SIGKILL on success.
+/// Checkpoint a process using the mgd-checkpoint helper wrapper, then SIGKILL on success.
 pub fn checkpoint(pid: u32, name: &str) -> CheckpointResult {
     // comm may contain '/' (prctl-set), which would escape the snapshot dir.
     let safe_name: String = name
@@ -115,26 +107,21 @@ pub fn checkpoint(pid: u32, name: &str) -> CheckpointResult {
         }
     };
 
-    let Some(criu) = criu_path() else {
+    let Some(helper) = helper_path() else {
         let _ = fs::remove_dir_all(&snapshot_dir);
         return CheckpointResult {
             pid,
             success: false,
             snapshot_dir: None,
-            error: Some("criu not found (install criu to enable checkpointing)".to_string()),
+            error: Some("mgd-checkpoint helper not found (please install it to enable checkpointing)".to_string()),
         };
     };
 
-    let output = Command::new(criu)
+    let output = Command::new(helper)
         .args([
             "dump",
-            "--tree", &pid.to_string(),
-            "--images-dir", &snapshot_dir_str,
-            "--shell-job",
-            "--leave-stopped",  // stop process after dump (we kill it next)
-            "--ext-unix-sk",
-            "--tcp-established",
-            "--file-locks",
+            &pid.to_string(),
+            &snapshot_dir_str,
         ])
         .output();
 
@@ -163,14 +150,14 @@ pub fn checkpoint(pid: u32, name: &str) -> CheckpointResult {
         Ok(out) => {
             let _ = fs::remove_dir_all(&snapshot_dir);
             let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-            let is_priv_err = looks_like_privilege_error(&stderr);
+            let is_priv_err = looks_like_privilege_error(&stderr) || out.status.code() == Some(2); // 2 is EXIT_SECURITY_FAIL
             if is_priv_err {
                 disable_checkpoint();
             }
             let error = if is_priv_err {
                 format!(
-                    "criu lacks privilege (run: setcap cap_checkpoint_restore,cap_sys_ptrace+ep {}): {stderr}",
-                    criu.display()
+                    "mgd-checkpoint lacks privilege (run: sudo setcap cap_checkpoint_restore,cap_sys_ptrace,cap_net_admin+ep {}): {stderr}",
+                    helper.display()
                 )
             } else {
                 stderr
@@ -187,7 +174,7 @@ pub fn checkpoint(pid: u32, name: &str) -> CheckpointResult {
                 pid,
                 success: false,
                 snapshot_dir: None,
-                error: Some(format!("Failed to run criu: {e}")),
+                error: Some(format!("Failed to run mgd-checkpoint helper: {e}")),
             }
         }
     }
@@ -213,19 +200,17 @@ pub fn restore(snapshot_dir: &std::path::Path) -> RestoreResult {
         }
     };
 
-    let Some(criu) = criu_path() else {
+    let Some(helper) = helper_path() else {
         return RestoreResult {
             success: false,
-            error: Some("criu not found (install criu to enable restore)".to_string()),
+            error: Some("mgd-checkpoint helper not found (please install it to enable restore)".to_string()),
         };
     };
 
-    let output = Command::new(criu)
+    let output = Command::new(helper)
         .args([
             "restore",
-            "--images-dir", &snapshot_dir_str,
-            "--shell-job",
-            "--restore-detached",
+            &snapshot_dir_str,
         ])
         .output();
 
@@ -235,14 +220,14 @@ pub fn restore(snapshot_dir: &std::path::Path) -> RestoreResult {
         }
         Ok(out) => {
             let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-            let error = if looks_like_privilege_error(&stderr) {
+            let is_priv_err = looks_like_privilege_error(&stderr) || out.status.code() == Some(2); // 2 is EXIT_SECURITY_FAIL
+            let error = if is_priv_err {
                 format!(
-                    "criu restore lacks privilege (run: setcap cap_checkpoint_restore,cap_sys_ptrace+ep {}; \
-                     add cap_net_admin for --tcp-established): {stderr}",
-                    criu.display()
+                    "mgd-checkpoint restore lacks privilege (run: sudo setcap cap_checkpoint_restore,cap_sys_ptrace,cap_net_admin+ep {}): {stderr}",
+                    helper.display()
                 )
             } else {
-                format!("CRIU restore failed: {stderr}")
+                format!("mgd-checkpoint restore failed: {stderr}")
             };
             RestoreResult {
                 success: false,
@@ -252,7 +237,7 @@ pub fn restore(snapshot_dir: &std::path::Path) -> RestoreResult {
         Err(e) => {
             RestoreResult {
                 success: false,
-                error: Some(format!("Failed to run criu: {e}")),
+                error: Some(format!("Failed to run mgd-checkpoint helper: {e}")),
             }
         }
     }
@@ -263,34 +248,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn resolve_in_finds_first_executable() {
-        let candidates = ["/nonexistent/criu", "/bin/sh"];
-        assert_eq!(resolve_in(&candidates), Some(PathBuf::from("/bin/sh")));
-    }
-
-    #[test]
-    fn resolve_in_none_when_all_absent() {
-        let candidates = ["/nope/a", "/nope/b"];
-        assert_eq!(resolve_in(&candidates), None);
-    }
-
-    #[test]
-    fn resolve_in_respects_order() {
-        let candidates = ["/bin/sh", "/bin/cat"]; // earlier wins
-        assert_eq!(resolve_in(&candidates), Some(PathBuf::from("/bin/sh")));
-    }
-
-    #[test]
-    fn resolve_in_empty_is_none() {
-        assert_eq!(resolve_in(&[]), None);
-    }
-
-    #[test]
     fn privilege_error_detection() {
         assert!(looks_like_privilege_error("Operation not permitted"));
         assert!(looks_like_privilege_error("can't seize task: Operation not permitted"));
         assert!(looks_like_privilege_error("Unable to ptrace: permission denied"));
         assert!(looks_like_privilege_error("requires CAP_SYS_PTRACE"));
+        assert!(looks_like_privilege_error("Security Error: target process is not owned by the calling user"));
+        assert!(looks_like_privilege_error("Capability Warning: capget failed"));
         // A normal restore failure must NOT be flagged as a privilege issue.
         assert!(!looks_like_privilege_error("Can't restore tcp connection: address in use"));
         assert!(!looks_like_privilege_error("image file not found"));

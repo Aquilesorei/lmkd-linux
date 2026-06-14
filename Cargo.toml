@@ -9,6 +9,7 @@ members = [
     "mgd-kde",
     "mgd-gnome",
     "mgd-cosmic",
+    "mgd-checkpoint",
 ]
 resolver = "2"
 

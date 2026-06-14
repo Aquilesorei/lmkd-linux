@@ -73,6 +73,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "mgd-checkpoint"
+version = "0.4.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "mgd-common"
 version = "0.4.0"
 dependencies = [
