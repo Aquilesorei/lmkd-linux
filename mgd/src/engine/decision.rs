@@ -81,11 +81,16 @@ pub fn plan(
   
     let count_gpu = *level >= PressureLevel::High;
 
+    let active_pid = crate::plugin_server::get_active_foreground_pid();
+
     // (priority, sort_footprint_kb, proc). gpu read once per candidate.
     let mut candidates: Vec<(u8, u64, &Process)> = procs.iter()
         .filter(|p| p.rss_kb + p.swap_kb > 10 * 1024)
         .map(|p| {
-            let prio = cfg.priority_for(&p.name, p.exe_basename.as_deref());
+            let mut prio = cfg.priority_for(&p.name, p.exe_basename.as_deref());
+            if Some(p.pid) == active_pid {
+                prio = prio.saturating_sub(25);
+            }
             let gpu_kb = if count_gpu {
                 crate::plugin_server::get_gpu_kb(p.pid)
             } else {

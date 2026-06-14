@@ -48,6 +48,11 @@ pub enum PluginMessage {
     QueryGpu {
         pid: u32,
     },
+
+    /// Active window change reported by a desktop watcher plugin.
+    ActiveWindow {
+        pid: Option<u32>,
+    },
 }
 
 /// Typed metric kinds a plugin can report.

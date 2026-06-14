@@ -15,12 +15,27 @@ static PLUGIN_CLIENTS: LazyLock<Mutex<Vec<Sender<CoreMessage>>>> = LazyLock::new
 /// Cached observations from plugins
 static GPU_CACHE: LazyLock<Mutex<HashMap<u32, u64>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// Active foreground process PID reported by DE plugins
+static ACTIVE_FOREGROUND_PID: LazyLock<Mutex<Option<u32>>> = LazyLock::new(|| Mutex::new(None));
+
 pub fn get_gpu_kb(pid: u32) -> u64 {
     *GPU_CACHE.lock().unwrap().get(&pid).unwrap_or(&0)
 }
 
 pub fn set_gpu_kb(pid: u32, kb: u64) {
     GPU_CACHE.lock().unwrap().insert(pid, kb);
+}
+
+pub fn get_total_gpu_kb() -> u64 {
+    GPU_CACHE.lock().unwrap().values().sum()
+}
+
+pub fn get_active_foreground_pid() -> Option<u32> {
+    *ACTIVE_FOREGROUND_PID.lock().unwrap()
+}
+
+pub fn set_active_foreground_pid(pid: Option<u32>) {
+    *ACTIVE_FOREGROUND_PID.lock().unwrap() = pid;
 }
 
 /// Detect environment and spawn appropriate plugins.
@@ -193,6 +208,9 @@ fn process_plugin_line(line: &str) {
             let response = CoreMessage::GpuObservation { pid, kb };
             let mut clients = PLUGIN_CLIENTS.lock().unwrap();
             clients.retain(|tx| tx.send(response.clone()).is_ok());
+        }
+        PluginMessage::ActiveWindow { pid } => {
+            set_active_foreground_pid(pid);
         }
     }
 }

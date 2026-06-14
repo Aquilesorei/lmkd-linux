@@ -14,7 +14,26 @@ use crate::monitor::meminfo::MemInfo;
 use crate::monitor::process::Process;
 use crate::monitor::psi::PressureLevel;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ControlState {
+    Calm,
+    Warning,
+    Evicting,
+    Critical,
+    Emergency,
+}
 
+impl ControlState {
+    fn to_pressure_level(self) -> PressureLevel {
+        match self {
+            ControlState::Calm => PressureLevel::Normal,
+            ControlState::Warning => PressureLevel::Elevated,
+            ControlState::Evicting => PressureLevel::High,
+            ControlState::Critical => PressureLevel::Critical,
+            ControlState::Emergency => PressureLevel::Emergency,
+        }
+    }
+}
 
 /// Set once on zram-compact EACCES (grant absent) to log only once per session.
 static ZRAM_COMPACT_DISABLED: std::sync::atomic::AtomicBool =
@@ -39,6 +58,11 @@ pub fn run(
     }
 
     let mut last_level = PressureLevel::Normal;
+    let mut last_time = std::time::Instant::now();
+    let mut last_score = 0.0;
+    let mut current_state = ControlState::Calm;
+    let mut pending_state = ControlState::Calm;
+    let mut pending_ticks = 0usize;
 
     loop {
         if crate::should_shutdown() { return; }
@@ -73,9 +97,90 @@ pub fn run(
             }
         };
 
-        let level = monitor::psi::pressure_level(&pressure);
         let meminfo = crate::monitor::meminfo::read_meminfo();
-        let effective_level = escalate_for_swap(&level, &meminfo);
+
+        // Calculate continuous pressure score: 60% PSI, 25% Swap used, 15% GPU UMA overhead
+        let psi_val = (pressure.some_avg10 / 100.0).clamp(0.0, 1.0);
+        let swap_val = if meminfo.swap_total_kb > 0 {
+            (meminfo.swap_used_pct() / 100.0).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let total_gpu = crate::plugin_server::get_total_gpu_kb();
+        let gpu_val = if meminfo.total_kb > 0 {
+            (total_gpu as f64 / meminfo.total_kb as f64).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let p_score = 0.60 * psi_val + 0.25 * swap_val + 0.15 * gpu_val;
+
+        // Calculate trend (dP/dt)
+        let now = std::time::Instant::now();
+        let dt = now.duration_since(last_time).as_secs_f64();
+        let trend = if dt > 0.1 {
+            (p_score - last_score) / dt
+        } else {
+            0.0
+        };
+        last_score = p_score;
+        last_time = now;
+
+        // Determine target state based on score & trend
+        let target_state = if p_score >= 0.70 || (p_score >= 0.55 && trend > 0.05) {
+            ControlState::Emergency
+        } else if p_score >= 0.50 || (p_score >= 0.35 && trend > 0.03) {
+            ControlState::Critical
+        } else if p_score >= 0.30 || (p_score >= 0.20 && trend > 0.02) {
+            ControlState::Evicting
+        } else if p_score >= 0.15 {
+            ControlState::Warning
+        } else {
+            ControlState::Calm
+        };
+
+        // State transitions with hysteresis
+        if target_state > current_state {
+            // Escalation: Needs 2 ticks of persistence, unless it's a massive spike (instant)
+            let instant_escalate = (target_state == ControlState::Emergency || target_state == ControlState::Critical) && trend > 0.08;
+            if target_state == pending_state && !instant_escalate {
+                pending_ticks += 1;
+                if pending_ticks >= 2 {
+                    current_state = target_state;
+                    pending_ticks = 0;
+                }
+            } else if instant_escalate {
+                mgd_common::sync_print!("[controller] Instant escalation triggered due to rapid pressure spike (trend: {:.3})", trend);
+                current_state = target_state;
+                pending_state = target_state;
+                pending_ticks = 0;
+            } else {
+                pending_state = target_state;
+                pending_ticks = 1;
+            }
+        } else if target_state < current_state {
+            // Recovery: Needs longer persistence
+            let required_ticks = match target_state {
+                ControlState::Calm => 12,    // 1 minute of Calm at 5s polling
+                ControlState::Warning => 6, // 30s
+                _ => 4,                     // 20s
+            };
+            if target_state == pending_state {
+                pending_ticks += 1;
+                if pending_ticks >= required_ticks {
+                    current_state = target_state;
+                    pending_ticks = 0;
+                }
+            } else {
+                pending_state = target_state;
+                pending_ticks = 1;
+            }
+        } else {
+            // Target matches current state: reset pending state
+            pending_state = current_state;
+            pending_ticks = 0;
+        }
+
+        let effective_level = current_state.to_pressure_level();
         last_level = effective_level.clone();
 
         // Passive calibration (Phase D): feed the raw PSI sample before any
@@ -136,19 +241,6 @@ pub fn run(
     }
 }
 
-/// Escalate one tier when swap is nearly full — PSI misses a slow swap fill.
-fn escalate_for_swap(level: &PressureLevel, m: &MemInfo) -> PressureLevel {
-    if m.swap_total_kb < 256 * 1024 || m.swap_used_pct() < 85.0 {
-        return level.clone();
-    }
-    match level {
-        PressureLevel::Normal    => PressureLevel::Elevated,
-        PressureLevel::Elevated  => PressureLevel::High,
-        PressureLevel::High      => PressureLevel::Critical,
-        PressureLevel::Critical  => PressureLevel::Emergency,
-        PressureLevel::Emergency => PressureLevel::Emergency,
-    }
-}
 
 
 /// Compact zram at Elevated+ to free fragmented pages before touching a process.
