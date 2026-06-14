@@ -26,6 +26,14 @@ fn main() {
     let mut writer = stream.try_clone().expect("clone stream");
     let mut reader = BufReader::new(stream);
     
+    // Load KWin active window tracker script and start the journal watcher
+    if load_kwin_script().is_some() {
+        mgd_common::sync_print!("[mgd-kde] KWin active window tracker script loaded and running.");
+        watch_active_window(writer.try_clone().expect("clone writer"));
+    } else {
+        mgd_common::sync_print!("[mgd-kde] Failed to load KWin active window tracker script. Foreground PID tracking unavailable.");
+    }
+    
     let current_level = Arc::new(Mutex::new("normal".to_string()));
     let level_clone = current_level.clone();
     
@@ -174,4 +182,86 @@ fn check_plasma_discover(writer: &mut UnixStream, tracker: &mut DiscoverTracker)
             LAST_PD_REAP.store(now, Ordering::SeqCst);
         }
     }
+}
+
+fn load_kwin_script() -> Option<i32> {
+    let home = std::env::var("HOME").ok()?;
+    let script_path = format!("{}/.config/mgd/active_window.js", home);
+    let script_content = r#"
+        workspace.windowActivated.connect(function(window) {
+            if (window && window.pid > 0) {
+                print("ACTIVE_WINDOW_PID:" + window.pid);
+            }
+        });
+    "#;
+    std::fs::create_dir_all(format!("{}/.config/mgd", home)).ok()?;
+    std::fs::write(&script_path, script_content).ok()?;
+
+    // Unload first
+    let _ = std::process::Command::new("busctl")
+        .args(&["--user", "call", "org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting", "unloadScript", "s", "mgd-active-window"])
+        .output();
+
+    // Load
+    let out = std::process::Command::new("busctl")
+        .args(&["--user", "call", "org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting", "loadScript", "ss", &script_path, "mgd-active-window"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // Parse "i <id>"
+    let id_str = stdout.trim().split_whitespace().nth(1)?;
+    let id: i32 = id_str.parse().ok()?;
+    
+    // Run
+    let script_obj_path = format!("/Scripting/Script{}", id);
+    let run_out = std::process::Command::new("busctl")
+        .args(&["--user", "call", "org.kde.KWin", &script_obj_path, "org.kde.kwin.Script", "run"])
+        .output();
+    if let Ok(o) = run_out {
+        if o.status.success() {
+            return Some(id);
+        }
+    }
+    None
+}
+
+fn watch_active_window(writer: std::os::unix::net::UnixStream) {
+    let mut child = match std::process::Command::new("journalctl")
+        .args(&["--user", "-f", "-o", "cat", "-n", "0"])
+        .stdout(std::process::Stdio::piped())
+        .spawn() 
+    {
+        Ok(c) => c,
+        Err(e) => {
+            mgd_common::sync_print!("[mgd-kde] Failed to spawn journalctl: {}", e);
+            return;
+        }
+    };
+
+    let stdout = child.stdout.take().unwrap();
+    let reader = std::io::BufReader::new(stdout);
+    let mut writer_clone = writer.try_clone().expect("clone socket");
+
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        for line_res in reader.lines() {
+            if let Ok(l) = line_res {
+                if let Some(pid_str) = l.trim().strip_prefix("ACTIVE_WINDOW_PID:") {
+                    if let Ok(pid) = pid_str.trim().parse::<u32>() {
+                        let msg = PluginMessage::ActiveWindow { pid: Some(pid) };
+                        if let Ok(json) = serde_json::to_string(&msg) {
+                            if writeln!(writer_clone, "{}", json).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            line.clear();
+        }
+        let _ = child.kill();
+    });
 }
