@@ -70,6 +70,8 @@ pub fn run(
     let mut throttled_states: HashMap<String, ThrottledState> = HashMap::new();
     let mut last_idle_reclaim_check = std::time::Instant::now();
     let mut last_active_pid = None;
+    let mut recently_killed_cgroups: HashMap<String, std::time::Instant> = HashMap::new();
+    let mut sustained_critical_swap_start: Option<std::time::Instant> = None;
 
     loop {
         if crate::should_shutdown() {
@@ -196,13 +198,36 @@ pub fn run(
 
         let mut effective_level = current_state.to_pressure_level();
 
-        let swap_exhausted = meminfo.swap_total_kb > 0 && meminfo.swap_used_pct() >= 95.0;
+        let swap_used_pct = meminfo.swap_used_pct();
+        let swap_exhausted = meminfo.swap_total_kb > 0 && swap_used_pct >= 95.0;
         if swap_exhausted && effective_level < PressureLevel::Critical {
             effective_level = PressureLevel::Critical;
             mgd_common::sync_print!(
                 "[controller] Swap exhausted ({:.1}% used) — forcing effective pressure to CRITICAL to trigger eviction",
-                meminfo.swap_used_pct()
+                swap_used_pct
             );
+        }
+
+        // Track sustained critical swap pressure (>= 98% swap used with Critical+ effective pressure)
+        let swap_near_full = meminfo.swap_total_kb > 0 && swap_used_pct >= 98.0;
+        if swap_near_full && effective_level >= PressureLevel::Critical {
+            if sustained_critical_swap_start.is_none() {
+                sustained_critical_swap_start = Some(std::time::Instant::now());
+            }
+        } else {
+            sustained_critical_swap_start = None;
+        }
+
+        // Escalate to Emergency if Critical+ and swap exhausted for 45s
+        if let Some(start) = sustained_critical_swap_start {
+            let elapsed = start.elapsed().as_secs();
+            if elapsed >= 45 && effective_level < PressureLevel::Emergency {
+                effective_level = PressureLevel::Emergency;
+                mgd_common::sync_print!(
+                    "[controller] Sustained Critical pressure with exhausted swap (>=98% used for {}s) — escalating to EMERGENCY to evict HIGH-tier candidates",
+                    elapsed
+                );
+            }
         }
 
         last_level = effective_level.clone();
@@ -267,10 +292,22 @@ pub fn run(
         // deficit. zram compact (cheaper) first, then cache drop.
         compact_zram(&effective_level, &log);
 
-        // Exclude frozen PIDs so their RSS isn't double-counted toward the deficit.
+        // Cleanup expired recently killed cgroups (cooldown = 45s)
+        let now_inst = std::time::Instant::now();
+        recently_killed_cgroups.retain(|_, time| now_inst.duration_since(*time).as_secs() < 45);
+
+        // Exclude frozen PIDs and recently killed cgroups so their RSS isn't double-counted toward the deficit.
         let frozen_set: HashSet<u32> = frozen.lock().unwrap().frozen_pids().into_iter().collect();
         let plan_procs: Vec<&Process> = procs.iter()
             .filter(|p| !frozen_set.contains(&p.pid))
+            .filter(|p| {
+                if let Some(cgroup_path) = get_process_cgroup_path(p.pid) {
+                    if recently_killed_cgroups.contains_key(&cgroup_path) {
+                        return false; // Skip recently targeted cgroup
+                    }
+                }
+                true
+            })
             .collect();
 
         let active_pid = crate::plugin_server::get_active_foreground_pid();
@@ -287,6 +324,13 @@ pub fn run(
 
                 let result_str = execute_decision(d, &frozen, &checkpointed, &log);
                 mgd_common::sync_print!("  {:<10} {:<8} {:<22} {:>6.1}MB  {}", d.action, d.pid, d.name, d.rss_mb, result_str);
+
+                // Track recently terminated/killed cgroups
+                if d.action == Action::Kill || d.action == Action::Terminate {
+                    if let Some(cgroup_path) = get_process_cgroup_path(d.pid) {
+                        recently_killed_cgroups.insert(cgroup_path, std::time::Instant::now());
+                    }
+                }
             }
             // Ring the doorbell — recovery thread may have new work.
             let (lock, cvar) = &*recovery_wake;

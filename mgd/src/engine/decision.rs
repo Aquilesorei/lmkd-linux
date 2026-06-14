@@ -201,8 +201,9 @@ fn decide_action(
         }
 
         PressureLevel::Critical => {
+            let cp_supported = crate::executor::checkpoint::is_checkpoint_supported();
             if let Some(cp) = checkpoint_override {
-                return if cp { Action::Checkpoint } else {
+                return if cp && cp_supported { Action::Checkpoint } else {
                     if swap_ratio > 0.5 { Action::Kill } else { Action::Terminate }
                 };
             }
@@ -212,8 +213,11 @@ fn decide_action(
                 Action::Kill
             } else if prio >= 75 {
                 Action::Terminate
-            } else {
+            } else if cp_supported {
                 Action::Checkpoint
+            } else {
+                // If checkpointing is not supported, fall back to terminating or killing based on priority
+                if prio >= 60 { Action::Terminate } else { Action::Kill }
             }
         }
 

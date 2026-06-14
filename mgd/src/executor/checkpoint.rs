@@ -15,13 +15,30 @@ const CRIU_CANDIDATES: &[&str] = &[
     "/usr/local/bin/criu",
 ];
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 static CRIU_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
+static CRIU_DISABLED: AtomicBool = AtomicBool::new(false);
+
+/// Check if checkpointing is supported (CRIU is present and has not failed with EACCES)
+pub fn is_checkpoint_supported() -> bool {
+    let _ = criu_path();
+    !CRIU_DISABLED.load(Ordering::Relaxed)
+}
+
+/// Force disable checkpointing (e.g. after a privilege error)
+pub fn disable_checkpoint() {
+    CRIU_DISABLED.store(true, Ordering::Relaxed);
+}
 
 /// Absolute path to criu, resolved once. None if not installed.
 pub fn criu_path() -> Option<&'static PathBuf> {
-    CRIU_PATH
-        .get_or_init(|| resolve_in(CRIU_CANDIDATES))
-        .as_ref()
+    let path = CRIU_PATH
+        .get_or_init(|| resolve_in(CRIU_CANDIDATES));
+    if path.is_none() {
+        CRIU_DISABLED.store(true, Ordering::Relaxed);
+    }
+    path.as_ref()
 }
 
 /// First existing+executable candidate. Pure, for testing.
@@ -146,7 +163,11 @@ pub fn checkpoint(pid: u32, name: &str) -> CheckpointResult {
         Ok(out) => {
             let _ = fs::remove_dir_all(&snapshot_dir);
             let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-            let error = if looks_like_privilege_error(&stderr) {
+            let is_priv_err = looks_like_privilege_error(&stderr);
+            if is_priv_err {
+                disable_checkpoint();
+            }
+            let error = if is_priv_err {
                 format!(
                     "criu lacks privilege (run: setcap cap_checkpoint_restore,cap_sys_ptrace+ep {}): {stderr}",
                     criu.display()
