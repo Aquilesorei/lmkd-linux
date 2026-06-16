@@ -12,8 +12,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::Duration;
 
+use std::collections::HashMap;
 use crate::executor::registry::{CheckpointRegistry, FrozenRegistry};
 use crate::monitor;
+use crate::throttle::{ThrottledState, get_process_cgroup_path};
+
+type ThrottleSnapshot = Arc<Mutex<HashMap<String, ThrottledState>>>;
 
 const MAX_CONNECTIONS: usize = 32;
 
@@ -54,6 +58,7 @@ fn bind_socket(path: &std::path::Path) -> Option<UnixListener> {
 pub fn run_server(
     frozen: Arc<Mutex<FrozenRegistry>>,
     checkpointed: Arc<Mutex<CheckpointRegistry>>,
+    throttle_snapshot: ThrottleSnapshot,
 ) {
     let path = mgd_common::socket::socket_path();
 
@@ -76,11 +81,12 @@ pub fn run_server(
                 }
                 let f = Arc::clone(&frozen);
                 let c = Arc::clone(&checkpointed);
+                let t = Arc::clone(&throttle_snapshot);
                 let a = Arc::clone(&active_conns);
                 a.fetch_add(1, Ordering::Relaxed);
                 thread::spawn(move || {
                     let _guard = ConnGuard(a); // decrements on drop, even on panic
-                    route_ipc_connection(stream, f, c);
+                    route_ipc_connection(stream, f, c, t);
                 });
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -108,6 +114,7 @@ fn route_ipc_connection(
     mut stream: UnixStream,
     frozen: Arc<Mutex<FrozenRegistry>>,
     checkpointed: Arc<Mutex<CheckpointRegistry>>,
+    throttle_snapshot: ThrottleSnapshot,
 ) {
     stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
 
@@ -131,7 +138,7 @@ fn route_ipc_connection(
         return;
     }
 
-    let response = dispatch(line.trim(), &frozen, &checkpointed);
+    let response = dispatch(line.trim(), &frozen, &checkpointed, &throttle_snapshot);
     let _ = writeln!(stream, "{response}");
 }
 
@@ -139,6 +146,7 @@ fn dispatch(
     raw: &str,
     frozen: &Arc<Mutex<FrozenRegistry>>,
     checkpointed: &Arc<Mutex<CheckpointRegistry>>,
+    throttle_snapshot: &ThrottleSnapshot,
 ) -> String {
     let parts: Vec<&str> = raw.splitn(2, ' ').collect();
     let cmd = parts[0];
@@ -146,7 +154,7 @@ fn dispatch(
 
     match cmd {
         "status"   => cmd_status(frozen, checkpointed),
-        "list"     => cmd_list(frozen),
+        "list"     => cmd_list(frozen, throttle_snapshot),
         "reload"   => cmd_reload(),
         "unfreeze" => {
             if arg.is_empty() {
@@ -183,17 +191,45 @@ fn cmd_status(
     ))
 }
 
-fn cmd_list(frozen: &Arc<Mutex<FrozenRegistry>>) -> String {
-    let reg = frozen.lock().unwrap();
-    let mut entries = reg.list();
-    if entries.is_empty() {
-        return ok("(no frozen processes)");
+fn cmd_list(frozen: &Arc<Mutex<FrozenRegistry>>, throttle_snapshot: &ThrottleSnapshot) -> String {
+    let frozen_reg = frozen.lock().unwrap();
+    let frozen_pids: std::collections::HashSet<u32> =
+        frozen_reg.frozen_pids().into_iter().collect();
+    let throttle = throttle_snapshot.lock().unwrap();
+    let procs = monitor::process::list_processes();
+
+    let mut lines: Vec<String> = Vec::new();
+
+    // Frozen processes (from registry — may not appear in /proc if already killed)
+    let mut frozen_entries = frozen_reg.list();
+    frozen_entries.sort_by_key(|(pid, _, _)| *pid);
+    for (pid, name, ts) in &frozen_entries {
+        lines.push(format!("  pid={pid:<8} name={name:<24} frozen_at={ts} [FROZEN]"));
     }
-    entries.sort_by_key(|(pid, _, _)| *pid);
-    let lines: Vec<String> = entries
+
+    // Running processes that are throttled
+    let mut throttled: Vec<(u32, &str, &str)> = procs
         .iter()
-        .map(|(pid, name, ts)| format!("  pid={pid:<8} name={name:<24} frozen_at={ts}"))
+        .filter(|p| !frozen_pids.contains(&p.pid))
+        .filter_map(|p| {
+            let cgroup = get_process_cgroup_path(p.pid)?;
+            let state = throttle.get(&cgroup)?;
+            let tag = match state {
+                ThrottledState::WeightOnly => "[THROTTLED:light]",
+                ThrottledState::Full       => "[THROTTLED:heavy]",
+                ThrottledState::None       => return None,
+            };
+            Some((p.pid, p.name.as_str(), tag))
+        })
         .collect();
+    throttled.sort_by_key(|(pid, _, _)| *pid);
+    for (pid, name, tag) in &throttled {
+        lines.push(format!("  pid={pid:<8} name={name:<24} {tag}"));
+    }
+
+    if lines.is_empty() {
+        return ok("(no frozen or throttled processes)");
+    }
     ok(&lines.join("\n"))
 }
 

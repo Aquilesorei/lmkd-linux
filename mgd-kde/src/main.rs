@@ -108,8 +108,9 @@ fn get_process_ticks(pid: u32) -> Option<u64> {
 fn check_plasma_gpu(writer: &mut UnixStream, cache: &Arc<Mutex<u64>>) {
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
     let last_restart = LAST_PLASMA_RESTART.load(Ordering::SeqCst);
-    if now.saturating_sub(last_restart) < 600 {
-        return; // 10 minute cooldown
+    let cooldown_min = read_config_val("plasma", "min_restart_interval_min", 30);
+    if now.saturating_sub(last_restart) < cooldown_min * 60 {
+        return; // cooldown
     }
 
     let Some(pid) = mgd_common::process::find_pid_by_name("plasmashell") else { return };
@@ -121,11 +122,12 @@ fn check_plasma_gpu(writer: &mut UnixStream, cache: &Arc<Mutex<u64>>) {
     // Use the currently cached value
     let gpu_kb = *cache.lock().unwrap();
 
-    if gpu_kb / 1024 > 250 {
+    let threshold_mb = read_config_val("plasma", "gpu_leak_threshold_mb", 1024);
+    if gpu_kb / 1024 > threshold_mb {
         let act = PluginMessage::ActionRequest {
             plugin: PLUGIN_NAME.to_string(),
             action: PluginAction::RestartProcess { name: "plasmashell".to_string() },
-            reason: format!("gpu memory {}MB > 250MB", gpu_kb / 1024),
+            reason: format!("gpu memory {}MB > {}MB", gpu_kb / 1024, threshold_mb),
         };
         let _ = writeln!(writer, "{}", serde_json::to_string(&act).unwrap());
         // Reset cache so we don't spam requests while waiting for core response
@@ -137,8 +139,9 @@ fn check_plasma_discover(writer: &mut UnixStream, tracker: &mut DiscoverTracker)
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
     
     let last_reap = LAST_PD_REAP.load(Ordering::SeqCst);
-    if now.saturating_sub(last_reap) < 60 {
-        return; // 1 minute cooldown between reap attempts
+    let reap_cooldown_secs = read_config_val("plasma_discover", "cooldown_min", 30) * 60;
+    if now.saturating_sub(last_reap) < reap_cooldown_secs {
+        return; // cooldown between reap attempts
     }
 
     let Some(pid) = mgd_common::process::find_pid_by_name("plasma-discover") else { 
@@ -160,8 +163,9 @@ fn check_plasma_discover(writer: &mut UnixStream, tracker: &mut DiscoverTracker)
         return; // not idle
     }
 
-    if now.saturating_sub(tracker.idle_since) >= 60 {
-        // Idle for at least 60 seconds
+    let idle_check_secs = read_config_val("plasma_discover", "idle_check_secs", 60);
+    if now.saturating_sub(tracker.idle_since) >= idle_check_secs {
+        // Idle for at least configured seconds
         let status_path = format!("/proc/{pid}/status");
         let Ok(status) = fs::read_to_string(&status_path) else { return };
         let mut rss_kb = 0;
@@ -172,11 +176,12 @@ fn check_plasma_discover(writer: &mut UnixStream, tracker: &mut DiscoverTracker)
             }
         }
 
-        if rss_kb / 1024 > 150 {
+        let rss_threshold_mb = read_config_val("plasma_discover", "rss_threshold_mb", 400);
+        if rss_kb / 1024 > rss_threshold_mb {
             let req = PluginMessage::ActionRequest {
                 plugin: PLUGIN_NAME.to_string(),
                 action: PluginAction::KillPid { pid },
-                reason: format!("RSS {}MB > 150MB and idle for 60s", rss_kb / 1024),
+                reason: format!("RSS {}MB > {}MB and idle for {}s", rss_kb / 1024, rss_threshold_mb, idle_check_secs),
             };
             let _ = writeln!(writer, "{}", serde_json::to_string(&req).unwrap());
             LAST_PD_REAP.store(now, Ordering::SeqCst);
@@ -264,4 +269,37 @@ fn watch_active_window(writer: std::os::unix::net::UnixStream) {
         }
         let _ = child.kill();
     });
+}
+
+fn read_config_val(section: &str, key: &str, default: u64) -> u64 {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let paths = [
+        std::path::PathBuf::from(home).join(".config/mgd/priorities.toml"),
+        std::path::PathBuf::from("/etc/mgd/priorities.toml"),
+    ];
+
+    for path in &paths {
+        if let Ok(content) = std::fs::read_to_string(path) {
+            let mut current_section = "";
+            for line in content.lines() {
+                let line = line.trim();
+                if line.starts_with('[') && line.ends_with(']') {
+                    current_section = &line[1..line.len()-1];
+                    continue;
+                }
+                if current_section == section {
+                    // strip comments
+                    let line = line.split('#').next().unwrap_or("").trim();
+                    if let Some(rest) = line.strip_prefix(key) {
+                        if let Some(val_str) = rest.trim_start().strip_prefix('=') {
+                            if let Ok(val) = val_str.trim().parse::<u64>() {
+                                return val;
+                              }
+                          }
+                      }
+                  }
+              }
+          }
+      }
+      default
 }

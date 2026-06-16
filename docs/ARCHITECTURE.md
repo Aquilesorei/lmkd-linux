@@ -101,10 +101,11 @@ The core daemon (`mgd`) runs four cooperating threads ("actors"), spawned in
 
 ### Why these specific threads
 
-- **PressureResponder (evictor, 5 s):** the hot loop. Reads PSI, decides and
-  executes freeze/terminate/kill/checkpoint, and runs the two *quick* system
-  pre-actions (zram compact, page-cache drop). Must stay responsive, so nothing
-  that blocks for long lives here.
+- **PressureResponder (evictor, 5 s):** the hot loop. Reads PSI, updates the
+  continuous pressure controller, runs CPU throttling and idle cgroup reclaim at
+  Normal pressure, executes freeze/terminate/kill/checkpoint at Elevated+, and runs
+  the two *quick* system pre-actions (zram compact, page-cache drop). Must stay
+  responsive, so nothing that blocks for long lives here.
 - **RecoveryManager (3 s):** acts **only at Normal pressure**. Unfreezes
   processes that have been frozen long enough, and restores checkpointed
   processes one at a time — both gated by a learned RAM baseline so the system
@@ -312,17 +313,21 @@ Both are **persisted to disk** in `~/.local/share/mgd/state/*.json`. A daemon re
 
 ### CRIU specifics
 
-Dump: `criu dump --tree <pid> --images-dir <dir> --shell-job --leave-stopped
---ext-unix-sk --tcp-established --file-locks`, then SIGKILL on success. Snapshots
-live in `~/.local/share/mgd/snapshots/<pid>_<name>/`. Restore:
+Checkpoint/restore is mediated by the `mgd-checkpoint` wrapper binary (see §9).
+`checkpoint.rs` resolves `mgd-checkpoint` by absolute path (sibling of the `mgd`
+binary, or `~/.local/bin/mgd-checkpoint`), then execs:
+
+Dump: `mgd-checkpoint dump <pid> <images-dir>` → wrapper validates and execs
+`criu dump --tree <pid> --images-dir <dir> --shell-job --leave-stopped --ext-unix-sk
+--tcp-established --file-locks`. SIGKILL on success. Snapshots live in
+`~/.local/share/mgd/snapshots/<pid>_<name>/`.
+
+Restore: `mgd-checkpoint restore <images-dir>` → wrapper execs
 `criu restore --images-dir <dir> --shell-job --restore-detached`.
 
-criu is resolved to an **absolute path** from a fixed candidate list
-(`/usr/sbin`, `/usr/bin`, `/sbin`, `/bin`, `/usr/local/{s}bin`) and never via a
-`PATH` search — because the binary may be capped, and a `PATH`-search invocation
-of a capped binary is a hijack vector. Privilege failures are inferred from
-stderr (no libcap dependency) and annotated with the exact `setcap` command to
-re-run. See §9 and `PRIVILEGE_DESIGN.md` §3.
+If `mgd-checkpoint` is absent, `checkpoint.rs` falls back to direct criu invocation
+(legacy path); if criu itself is missing or exits non-zero, falls back to SIGKILL
+and logs once. See §9 and `PRIVILEGE_DESIGN.md` §3.
 
 ---
 
@@ -359,6 +364,19 @@ To proactively free RAM before pressure escalates, `mgd` implements early backgr
 
 It reclaims $50\%$ of their RSS by writing the target bytes to their cgroup's `memory.reclaim` node (e.g., `/sys/fs/cgroup/user.slice/.../memory.reclaim`). Since the cgroup file hierarchy under the user's slice is owned by the user, this is fully unprivileged and does not require elevated privileges (`CAP_SYS_ADMIN`). A $30$ s cooldown is enforced between runs.
 
+### idle background process cgroup reclaim (`evictor.rs`, Normal pressure only)
+
+At Normal pressure, `check_idle_process_reclaim()` identifies background processes that:
+- Are not the active foreground process (reported by plugins via `ActiveWindow`).
+- Have priority ≥ 50 and RSS ≥ `idle_reclaim_rss_min_mb` (default 50 MB).
+- Have been continuously in the background for ≥ `idle_sec` (default 180 s).
+
+It writes `reclaim_pct`% of their RSS (default 20%) to `memory.reclaim` for their cgroup.
+Skipped if swap occupancy exceeds `max_swap_occupancy_pct` (default 60%) — pushing more
+into an already-full swap would be counterproductive. A global cooldown of
+`global_cooldown_sec` (default 30 s) prevents back-to-back sweeps. Fully unprivileged.
+Gated by `[idle_reclaim] enabled` (on by default).
+
 ### proactive swap reclaim (`maintenance.rs`, maintenance thread, Normal only)
 
 The headline fix for the MGLRU lazy-swap-in problem. When calm, cycle the zram
@@ -376,13 +394,40 @@ gates live in the unprivileged daemon:
 
 ---
 
-## 8.5 Plugins (`mgd-kde`, `mgd-gpu-intel`, etc.)
+## 8.5 CPU throttling / App Nap (`evictor.rs`, per-cycle)
 
-Historically, environment-specific watchers lived inside `mgd`. They are now decoupled into standalone plugin processes that connect to the IPC server using the `mgd-common` library:
-- **`mgd-kde`**: Handles restarting the KDE `plasmashell` on GPU leaks, and reaping `plasma-discover` on CPU idle.
-- **`mgd-gpu-intel`**: Scans `/proc/<pid>/fdinfo/` (DRM) to account for UMA graphics memory as part of process footprint.
+Background processes that have been out of the foreground for ≥ 10 s (debounce) have their
+cgroup CPU weight reduced via `cpu.weight` and `cpu.max`. `ThrottledState` is a two-tier
+enum (Light / Heavy) mapped by priority tier and background duration. Hard rules:
 
-Plugins observe the system and request actions from the core daemon (`ActionRequest`), keeping the core portable.
+- The active foreground cgroup (from `ACTIVE_FOREGROUND_PID`) is restored to full CPU
+  weight instantly whenever the active window changes.
+- Priority < 60 processes are never throttled (IDEs, DBs — low-priority but interactive).
+- All throttled cgroups are restored on daemon shutdown.
+
+This is unprivileged: `cpu.weight` and `cpu.max` under `user.slice` are user-writable.
+The evictor reads the active foreground PID from `plugin_server::get_active_foreground_pid()`
+(updated by DE plugins via `PluginMessage::ActiveWindow`).
+
+---
+
+## 8.6 Plugins (`mgd-kde`, `mgd-gpu-intel`, etc.)
+
+Historically, environment-specific watchers lived inside `mgd`. They are now decoupled into
+standalone plugin processes. `plugin_server::init_plugins()` (called at daemon startup)
+auto-detects and spawns the right binaries:
+- **DE detection**: reads `$XDG_CURRENT_DESKTOP` → spawns `mgd-kde`, `mgd-gnome`, or `mgd-cosmic`.
+- **GPU detection**: reads `/sys/class/drm/*/device/driver` symlinks → `i915`/`xe` spawns
+  `mgd-gpu-intel`; `amdgpu` spawns `mgd-gpu-amd`.
+
+Active plugins:
+- **`mgd-kde`**: Handles restarting the KDE `plasmashell` on GPU leaks, and reaping
+  `plasma-discover` on CPU idle. Reports active window PID via `ActiveWindow`.
+- **`mgd-gpu-intel`**: Scans `/proc/<pid>/fdinfo/` (DRM) to account for UMA graphics memory.
+
+Plugins observe the system and send `PluginMessage` to core; core routes via
+`plugin_server::serve_plugin_connection()`. Core broadcasts `CoreMessage::PressureChanged`
+each evictor cycle so plugins can adapt their polling rate.
 
 ---
 
@@ -398,7 +443,7 @@ which is honored regardless of who launches the process.
 |-----------|---------|-----------|---------|
 | zram compact | none (tmpfiles sysfs grant on `compact` node) | none | on |
 | swap reclaim | `mgd-zram-reclaim` (3rd binary) | `CAP_SYS_ADMIN` | **off** |
-| CRIU dump/restore | the system `criu` binary, capped | `CAP_CHECKPOINT_RESTORE` + `CAP_SYS_PTRACE` (+`CAP_NET_ADMIN` for live TCP) | on if capped |
+| CRIU dump/restore | `mgd-checkpoint` wrapper → execs capped `criu` | `CAP_CHECKPOINT_RESTORE` + `CAP_SYS_PTRACE` (+`CAP_NET_ADMIN` for live TCP) | on if criu present |
 
 Principles: narrowest capability never root; smallest carrier (prefer a sysfs
 grant over a binary, a fixed-function binary over a flexible one); **policy stays
@@ -421,12 +466,21 @@ Self-contained, libc-only, **no argv, no env, no subprocess**. It:
   refused-unsafe / 4 no-meminfo) so the daemon can tell "uncapped" (disable for
   session) from "transient" (retry).
 
-### Why CRIU has no custom helper
+### `mgd-checkpoint` (CRIU validating wrapper)
 
-`criu` is already its own external binary mgd execs, so the caps go directly on
-it (Option A). A validating wrapper (`mgd-checkpoint`, Option B) is documented as
-the multi-user hardening upgrade but deliberately not built for the single-user
-desktop threat model.
+`criu` is already its own external binary, so caps could go directly on it (Option A).
+Instead, `mgd-checkpoint` (`mgd-checkpoint/src/main.rs`) is a thin validating wrapper
+(Option B) that mgd execs in place of criu directly. It:
+- Accepts only `dump <pid> <images-dir>` or `restore <images-dir>` — no other argv.
+- Validates caller owns the target PID (`/proc/<pid>` uid check), the process lives in
+  `user.slice` (cgroup path check), and the images dir exists under the caller's home.
+- Raises ambient capabilities (`CAP_CHECKPOINT_RESTORE`, `CAP_SYS_PTRACE`,
+  `CAP_NET_ADMIN`) onto the inheritable set so they are inherited by the child `criu`
+  process, then execs criu with `env_clear()`.
+- Exit codes: 0 = ok, 1 = bad args, 2 = security validation failed, 3 = criu failed.
+
+This keeps the caps off the `criu` binary itself and adds a security validation layer
+even in the single-user desktop case.
 
 ---
 
@@ -445,8 +499,11 @@ Each tunable section follows the **config triple** pattern:
 
 Sections: `[defaults]`, `[[apps]]` (priority regexes + per-app `checkpoint`
 override), `[[protect]]` (never-touch regexes), `[category_priorities]`
-(`.desktop` fallback), `[plasma]`, `[plasma_discover]`, `[zram]`, `[reclaim]`,
-`[cache_drop]`.
+(`.desktop` fallback), `[zram]`, `[reclaim]`, `[cache_drop]`, `[psi]` (pressure-tier
+boundaries, validated as a set), `[idle_reclaim]` (idle background cgroup reclaim
+— `enabled`, `idle_sec`, `rss_min_mb`, `reclaim_pct`, `global_cooldown_sec`,
+`max_swap_occupancy_pct`), `[thresholds]` (`target_available_pct` — explicit override
+above the passive calibration file and RAM-scaling defaults).
 
 Reload is triggered by SIGHUP or `mgctl reload`; the responder picks it up at the
 top of its next cycle. `.desktop` files are re-scanned on each load to rebuild the

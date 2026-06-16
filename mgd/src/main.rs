@@ -7,6 +7,7 @@ mod recovery;
 mod maintenance;
 mod ipc;
 mod plugin_server;
+mod throttle;
 
 use std::sync::{Arc, Condvar, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -32,6 +33,8 @@ fn main() {
     if handle_legacy_cli(&args) {
         return;
     }
+
+    try_elevate_scheduler_priority();
 
     cleanup_orphaned_snapshots();
     print_startup_banner();
@@ -59,6 +62,10 @@ fn main() {
     // Recovery sleeps on it when both registries are empty.
     let recovery_wake: Arc<(Mutex<bool>, Condvar)> = Arc::new((Mutex::new(false), Condvar::new()));
 
+    // Throttle state snapshot: written by evictor, read by IPC for `mgctl list`.
+    let throttle_snapshot: Arc<Mutex<std::collections::HashMap<String, throttle::ThrottledState>>> =
+        Arc::new(Mutex::new(std::collections::HashMap::new()));
+
     // ── Actor threads ─────────────────────────────────────────────────────────
     let responder = {
         let f = Arc::clone(&frozen);
@@ -66,7 +73,8 @@ fn main() {
         let l = Arc::clone(&logger);
         let w = Arc::clone(&recovery_wake);
         let cal = Arc::clone(&calibrator);
-        thread::spawn(move || evictor::run(f, c, l, w, cal))
+        let ts = Arc::clone(&throttle_snapshot);
+        thread::spawn(move || evictor::run(f, c, l, w, cal, ts))
     };
 
     let recovery = {
@@ -80,7 +88,8 @@ fn main() {
     let ipc = {
         let f = Arc::clone(&frozen);
         let c = Arc::clone(&checkpointed);
-        thread::spawn(move || ipc::run_server(f, c))
+        let ts = Arc::clone(&throttle_snapshot);
+        thread::spawn(move || ipc::run_server(f, c, ts))
     };
 
     let maintenance = {
@@ -201,4 +210,26 @@ extern "C" fn handle_sigterm(_: libc::c_int) {
 /// SIGHUP → reload config on next responder cycle
 extern "C" fn handle_sighup(_: libc::c_int) {
     RELOAD_CONFIG.store(true, Ordering::Relaxed);
+}
+
+fn try_elevate_scheduler_priority() {
+    unsafe {
+        let mut param = libc::sched_param { sched_priority: 20 };
+        // Set policy to SCHED_RR (Real-Time Round Robin) with priority 20
+        if libc::sched_setscheduler(0, libc::SCHED_RR, &mut param) == 0 {
+            locked_print("[core] Successfully set scheduler policy to SCHED_RR (priority 20)");
+        } else {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EPERM) {
+                // If unprivileged and CAP_SYS_NICE is missing, fall back to setting highest normal priority (nice -20)
+                if libc::setpriority(libc::PRIO_PROCESS, 0, -20) == 0 {
+                    locked_print("[core] Set scheduler priority to nice -20 (highest normal priority)");
+                } else {
+                    locked_print("[core] Running with standard priority (CAP_SYS_NICE missing for RT/Nice elevation)");
+                }
+            } else {
+                locked_print(&format!("[core] Warning: failed to set scheduler policy: {}", err));
+            }
+        }
+    }
 }

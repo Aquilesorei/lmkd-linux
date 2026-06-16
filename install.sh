@@ -62,7 +62,22 @@ fi
 
 # ── install binary ────────────────────────────────────────────────────────────
 mkdir -p "$BIN_DIR"
-cp target/release/mgd   "$BIN_DIR/mgd"
+if [[ "$WITH_PRIVILEGED" == 1 ]]; then
+    DAEMON_DEST="/usr/local/bin/mgd"
+    sudo install -m 0755 target/release/mgd "$DAEMON_DEST"
+    if sudo setcap cap_sys_nice+ep "$DAEMON_DEST"; then
+        ok "Daemon binary installed + capped with CAP_SYS_NICE at $DAEMON_DEST"
+    else
+        warn "Could not setcap CAP_SYS_NICE on daemon binary"
+    fi
+    # Remove local unprivileged binary to avoid path confusion
+    rm -f "$BIN_DIR/mgd"
+else
+    cp target/release/mgd   "$BIN_DIR/mgd"
+    if [[ -f "/usr/local/bin/mgd" ]]; then
+        sudo rm -f "/usr/local/bin/mgd"
+    fi
+fi
 cp target/release/mgctl "$BIN_DIR/mgctl"
 cp target/release/mgd-checkpoint "$BIN_DIR/mgd-checkpoint"
 cp target/release/mgd-kde "$BIN_DIR/mgd-kde"
@@ -71,11 +86,15 @@ cp target/release/mgd-gpu-amd "$BIN_DIR/mgd-gpu-amd"
 cp target/release/mgd-gnome "$BIN_DIR/mgd-gnome"
 cp target/release/mgd-cosmic "$BIN_DIR/mgd-cosmic"
 chmod +x "$BIN_DIR"/mgd*
-ok "Binaries installed to $BIN_DIR/"
+ok "Binaries installed"
 
 # ── install service ───────────────────────────────────────────────────────────
 mkdir -p "$SERVICE_DIR"
 cp config/mgd.service "$SERVICE_DIR/$SERVICE_NAME"
+if [[ "$WITH_PRIVILEGED" == 1 ]]; then
+    sed -i 's|ExecStart=.*|ExecStart=/usr/local/bin/mgd\nCPUWeight=10000|g' "$SERVICE_DIR/$SERVICE_NAME"
+    ok "Service file updated for CPU weight"
+fi
 systemctl --user daemon-reload
 ok "Service file installed to $SERVICE_DIR/$SERVICE_NAME"
 
