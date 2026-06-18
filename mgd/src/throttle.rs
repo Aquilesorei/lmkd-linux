@@ -161,3 +161,119 @@ pub(crate) fn write_cgroup_cpu_max(cgroup_path: &str, max_limit: &str) -> Result
     }
     Err(std::io::Error::new(std::io::ErrorKind::NotFound, "cpu.max not found"))
 }
+
+// ---------------------------------------------------------------------------
+// Memory cap management: memory.max on background cgroups at High+ pressure
+// ---------------------------------------------------------------------------
+
+/// Caps `memory.max` on expendable background cgroups at High+ pressure.
+/// Restored automatically when pressure drops below High or on daemon shutdown.
+pub(crate) struct MemCapManager {
+    /// cgroup_path → cap in bytes currently written
+    capped: HashMap<String, u64>,
+    /// cgroup_path → when the process entered background (for 10s debounce)
+    tracker: HashMap<String, std::time::Instant>,
+}
+
+impl MemCapManager {
+    pub(crate) fn new() -> Self {
+        Self { capped: HashMap::new(), tracker: HashMap::new() }
+    }
+
+    /// Apply `memory.max` caps to eligible background cgroups at High+ pressure.
+    /// No-op below High (caller is responsible for calling `restore_all` then).
+    pub(crate) fn update(
+        &mut self,
+        plan_procs: &[&Process],
+        active_pid: Option<u32>,
+        level: &crate::monitor::psi::PressureLevel,
+    ) {
+        use crate::monitor::psi::PressureLevel;
+        if *level < PressureLevel::High {
+            return;
+        }
+
+        let foreground_cgroup = active_pid.and_then(|apid| {
+            plan_procs.iter()
+                .find(|p| p.pid == apid)
+                .and_then(|p| p.cgroup_path.clone())
+        });
+
+        let mut cgroup_groups: HashMap<String, (u8, u64)> = HashMap::new();
+        for p in plan_procs {
+            if let Some(path) = p.cgroup_path.as_ref() {
+                let prio = crate::engine::decision::get_priority(&p.name, p.exe_basename.as_deref());
+                let entry = cgroup_groups.entry(path.clone()).or_insert((100u8, 0u64));
+                entry.0 = entry.0.min(prio);
+                entry.1 = entry.1.saturating_add(p.rss_kb);
+            }
+        }
+
+        let active_paths: std::collections::HashSet<&String> = cgroup_groups.keys().collect();
+        self.tracker.retain(|p, _| active_paths.contains(p));
+        // Don't evict capped entries for dead paths — restore handles cleanup.
+
+        for (cgroup_path, (min_priority, total_rss_kb)) in &cgroup_groups {
+            // Never cap foreground or system/critical tier
+            if Some(cgroup_path) == foreground_cgroup.as_ref() || *min_priority < 60 {
+                if self.capped.remove(cgroup_path).is_some() {
+                    restore_cgroup_memory(cgroup_path);
+                }
+                self.tracker.remove(cgroup_path);
+                continue;
+            }
+
+            // Skip already-capped cgroups
+            if self.capped.contains_key(cgroup_path) {
+                continue;
+            }
+
+            // 10s debounce: don't cap a process that just moved to background
+            let bg_secs = self.tracker
+                .entry(cgroup_path.clone())
+                .or_insert_with(std::time::Instant::now)
+                .elapsed()
+                .as_secs();
+            if bg_secs < 10 {
+                continue;
+            }
+
+            // Cap = current RSS + 512 MB headroom (bytes)
+            let cap_bytes = (*total_rss_kb + 512 * 1024) * 1024;
+            if write_memory_max(cgroup_path, cap_bytes).is_ok() {
+                self.capped.insert(cgroup_path.clone(), cap_bytes);
+                mgd_common::sync_print!(
+                    "[memcap] Set memory.max={} MB for background cgroup {}",
+                    cap_bytes / 1024 / 1024, cgroup_path
+                );
+            }
+        }
+    }
+
+    /// Restore all capped cgroups to unlimited. Called on pressure drop and shutdown.
+    pub(crate) fn restore_all(&mut self) {
+        for path in self.capped.keys() {
+            restore_cgroup_memory(path);
+        }
+        self.capped.clear();
+        self.tracker.clear();
+    }
+}
+
+fn restore_cgroup_memory(path: &str) {
+    let p = cgroup_sysfs_path(path, "memory.max");
+    if p.exists() {
+        if std::fs::write(&p, "max\n").is_ok() {
+            mgd_common::sync_print!("[memcap] Restored memory.max for cgroup {}", path);
+        }
+    }
+}
+
+fn write_memory_max(cgroup_path: &str, bytes: u64) -> Result<(), std::io::Error> {
+    let path = cgroup_sysfs_path(cgroup_path, "memory.max");
+    if path.exists() {
+        std::fs::write(&path, format!("{}\n", bytes))?;
+        return Ok(());
+    }
+    Err(std::io::Error::new(std::io::ErrorKind::NotFound, "memory.max not found"))
+}

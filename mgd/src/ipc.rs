@@ -21,6 +21,14 @@ type ThrottleSnapshot = Arc<Mutex<HashMap<String, ThrottledState>>>;
 
 const MAX_CONNECTIONS: usize = 32;
 
+fn format_ts(ts: u64) -> String {
+    // Simple HH:MM:SS formatting from unix epoch seconds (local time via libc)
+    let t = ts as libc::time_t;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    unsafe { libc::localtime_r(&t, &mut tm) };
+    format!("{:02}:{:02}:{:02}", tm.tm_hour, tm.tm_min, tm.tm_sec)
+}
+
 /// RAII guard that decrements active_conns on drop — runs even if the thread panics.
 struct ConnGuard(Arc<AtomicUsize>);
 impl Drop for ConnGuard {
@@ -59,6 +67,7 @@ pub fn run_server(
     frozen: Arc<Mutex<FrozenRegistry>>,
     checkpointed: Arc<Mutex<CheckpointRegistry>>,
     throttle_snapshot: ThrottleSnapshot,
+    event_log: crate::events::EventLog,
 ) {
     let path = mgd_common::socket::socket_path();
 
@@ -82,11 +91,12 @@ pub fn run_server(
                 let f = Arc::clone(&frozen);
                 let c = Arc::clone(&checkpointed);
                 let t = Arc::clone(&throttle_snapshot);
+                let e = Arc::clone(&event_log);
                 let a = Arc::clone(&active_conns);
                 a.fetch_add(1, Ordering::Relaxed);
                 thread::spawn(move || {
                     let _guard = ConnGuard(a); // decrements on drop, even on panic
-                    route_ipc_connection(stream, f, c, t);
+                    route_ipc_connection(stream, f, c, t, e);
                 });
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -115,6 +125,7 @@ fn route_ipc_connection(
     frozen: Arc<Mutex<FrozenRegistry>>,
     checkpointed: Arc<Mutex<CheckpointRegistry>>,
     throttle_snapshot: ThrottleSnapshot,
+    event_log: crate::events::EventLog,
 ) {
     stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
 
@@ -138,7 +149,7 @@ fn route_ipc_connection(
         return;
     }
 
-    let response = dispatch(line.trim(), &frozen, &checkpointed, &throttle_snapshot);
+    let response = dispatch(line.trim(), &frozen, &checkpointed, &throttle_snapshot, &event_log);
     let _ = writeln!(stream, "{response}");
 }
 
@@ -147,20 +158,51 @@ fn dispatch(
     frozen: &Arc<Mutex<FrozenRegistry>>,
     checkpointed: &Arc<Mutex<CheckpointRegistry>>,
     throttle_snapshot: &ThrottleSnapshot,
+    event_log: &crate::events::EventLog,
 ) -> String {
     let parts: Vec<&str> = raw.splitn(2, ' ').collect();
     let cmd = parts[0];
     let arg = parts.get(1).copied().unwrap_or("").trim();
 
     match cmd {
-        "status"   => cmd_status(frozen, checkpointed),
-        "list"     => cmd_list(frozen, throttle_snapshot),
+        "status"   => cmd_status(frozen, checkpointed, throttle_snapshot),
+        "list"     => cmd_list(frozen, checkpointed, throttle_snapshot),
+        "ps"       => cmd_ps(frozen, throttle_snapshot),
+        "events"   => cmd_events(event_log),
         "reload"   => cmd_reload(),
         "unfreeze" => {
             if arg.is_empty() {
                 err("usage: unfreeze <pid|name>")
             } else {
                 cmd_unfreeze(arg, frozen)
+            }
+        }
+        "freeze" => {
+            if arg.is_empty() {
+                err("usage: freeze <pid|name>")
+            } else {
+                cmd_freeze(arg, frozen)
+            }
+        }
+        "restore" => {
+            if arg.is_empty() {
+                err("usage: restore <pid|name>")
+            } else {
+                cmd_restore(arg, checkpointed)
+            }
+        }
+        "kill" => {
+            if arg.is_empty() {
+                err("usage: kill <pid|name>")
+            } else {
+                cmd_kill(arg, event_log)
+            }
+        }
+        "info" => {
+            if arg.is_empty() {
+                err("usage: info <pid|name>")
+            } else {
+                cmd_info(arg, frozen, checkpointed, throttle_snapshot)
             }
         }
         _ => err(&format!("unknown command: {cmd}")),
@@ -172,6 +214,7 @@ fn dispatch(
 fn cmd_status(
     frozen: &Arc<Mutex<FrozenRegistry>>,
     checkpointed: &Arc<Mutex<CheckpointRegistry>>,
+    throttle_snapshot: &ThrottleSnapshot,
 ) -> String {
     let pressure = monitor::psi::read_pressure()
         .map(|p| {
@@ -183,15 +226,29 @@ fn cmd_status(
     let mem = monitor::meminfo::read_meminfo();
     let frozen_count = frozen.lock().unwrap().count();
     let cp_count = checkpointed.lock().unwrap().count();
+    let throttle_count = throttle_snapshot.lock().unwrap()
+        .values()
+        .filter(|s| **s != ThrottledState::None)
+        .count();
+
+    let swap_str = if mem.swap_total_kb > 0 {
+        format!(" | swap={:.0}%", mem.swap_used_pct())
+    } else {
+        " | swap=none".to_string()
+    };
 
     ok(&format!(
-        "pressure={pressure} | avail={:.0}MB/{:.0}MB | frozen={frozen_count} | checkpointed={cp_count}",
+        "pressure={pressure} | avail={:.0}MB/{:.0}MB{swap_str} | frozen={frozen_count} | checkpointed={cp_count} | throttled={throttle_count}",
         mem.available_kb as f64 / 1024.0,
         mem.total_kb as f64 / 1024.0,
     ))
 }
 
-fn cmd_list(frozen: &Arc<Mutex<FrozenRegistry>>, throttle_snapshot: &ThrottleSnapshot) -> String {
+fn cmd_list(
+    frozen: &Arc<Mutex<FrozenRegistry>>,
+    checkpointed: &Arc<Mutex<CheckpointRegistry>>,
+    throttle_snapshot: &ThrottleSnapshot,
+) -> String {
     let frozen_reg = frozen.lock().unwrap();
     let frozen_pids: std::collections::HashSet<u32> =
         frozen_reg.frozen_pids().into_iter().collect();
@@ -205,6 +262,17 @@ fn cmd_list(frozen: &Arc<Mutex<FrozenRegistry>>, throttle_snapshot: &ThrottleSna
     frozen_entries.sort_by_key(|(pid, _, _)| *pid);
     for (pid, name, ts) in &frozen_entries {
         lines.push(format!("  pid={pid:<8} name={name:<24} frozen_at={ts} [FROZEN]"));
+    }
+
+    // Checkpointed processes (killed after snapshot — no longer in /proc)
+    let cp_reg = checkpointed.lock().unwrap();
+    let mut cp_entries = cp_reg.entries_lightest_first();
+    cp_entries.sort_by_key(|(pid, _, _, _, _)| *pid);
+    for (pid, name, _, rss_kb, attempts) in &cp_entries {
+        lines.push(format!(
+            "  pid={pid:<8} name={name:<24} rss_at_cp={:.0}MB restore_attempts={attempts} [CHECKPOINTED]",
+            *rss_kb as f64 / 1024.0,
+        ));
     }
 
     // Running processes that are throttled
@@ -228,7 +296,7 @@ fn cmd_list(frozen: &Arc<Mutex<FrozenRegistry>>, throttle_snapshot: &ThrottleSna
     }
 
     if lines.is_empty() {
-        return ok("(no frozen or throttled processes)");
+        return ok("(no frozen, checkpointed, or throttled processes)");
     }
     ok(&lines.join("\n"))
 }
@@ -277,6 +345,220 @@ fn cmd_unfreeze(arg: &str, frozen: &Arc<Mutex<FrozenRegistry>>) -> String {
     ok(&results.join("\n"))
 }
 
+fn cmd_freeze(arg: &str, frozen: &Arc<Mutex<FrozenRegistry>>) -> String {
+    let target_pid: Option<u32> = arg.parse().ok();
+    let arg_lower = arg.to_lowercase();
+
+    let procs = monitor::process::list_processes();
+    let candidates: Vec<_> = procs
+        .iter()
+        .filter(|p| {
+            if let Some(tpid) = target_pid { p.pid == tpid }
+            else { p.name.to_lowercase().contains(&arg_lower) }
+        })
+        .collect();
+
+    if candidates.is_empty() {
+        return err(&format!("no running process matching '{arg}'"));
+    }
+
+    let mut results = Vec::new();
+    for p in candidates {
+        if frozen.lock().unwrap().is_frozen(p.pid) {
+            results.push(format!("  pid={} ({}) already frozen", p.pid, p.name));
+            continue;
+        }
+        let r = crate::executor::freezer::freeze(p.pid);
+        if r.success {
+            frozen.lock().unwrap().add(p.pid, &p.name);
+            results.push(format!("✓ froze pid={} ({})", p.pid, p.name));
+        } else {
+            results.push(format!("✗ pid={} ({}): {}", p.pid, p.name, r.error.unwrap_or_default()));
+        }
+    }
+    ok(&results.join("\n"))
+}
+
+fn cmd_restore(arg: &str, checkpointed: &Arc<Mutex<CheckpointRegistry>>) -> String {
+    let target_pid: Option<u32> = arg.parse().ok();
+    let arg_lower = arg.to_lowercase();
+
+    let entries: Vec<_> = {
+        let reg = checkpointed.lock().unwrap();
+        reg.entries_lightest_first()
+            .into_iter()
+            .filter(|(pid, name, _, _, _)| {
+                if let Some(tpid) = target_pid { *pid == tpid }
+                else { name.to_lowercase().contains(&arg_lower) }
+            })
+            .map(|(pid, name, dir, _, _)| (pid, name, dir))
+            .collect()
+    };
+
+    if entries.is_empty() {
+        return err(&format!("no checkpointed process matching '{arg}'"));
+    }
+
+    let mut results = Vec::new();
+    for (pid, name, snapshot_dir) in entries {
+        let r = crate::executor::checkpoint::restore(&snapshot_dir);
+        if r.success {
+            checkpointed.lock().unwrap().remove(pid);
+            results.push(format!("✓ restored pid={pid} ({name})"));
+        } else {
+            results.push(format!("✗ pid={pid} ({name}): {}", r.error.unwrap_or_default()));
+        }
+    }
+    ok(&results.join("\n"))
+}
+
+fn cmd_info(
+    arg: &str,
+    frozen: &Arc<Mutex<FrozenRegistry>>,
+    checkpointed: &Arc<Mutex<CheckpointRegistry>>,
+    throttle_snapshot: &ThrottleSnapshot,
+) -> String {
+    let target_pid: Option<u32> = arg.parse().ok();
+    let arg_lower = arg.to_lowercase();
+
+    let procs = monitor::process::list_processes();
+    let live: Vec<_> = procs
+        .iter()
+        .filter(|p| {
+            if let Some(tpid) = target_pid { p.pid == tpid }
+            else { p.name.to_lowercase().contains(&arg_lower) }
+        })
+        .collect();
+
+    let frozen_reg = frozen.lock().unwrap();
+    let cp_reg = checkpointed.lock().unwrap();
+    let throttle = throttle_snapshot.lock().unwrap();
+    let cp_entries: Vec<_> = cp_reg.entries_lightest_first()
+        .into_iter()
+        .filter(|(pid, name, _, _, _)| {
+            if let Some(tpid) = target_pid { *pid == tpid }
+            else { name.to_lowercase().contains(&arg_lower) }
+        })
+        .collect();
+
+    if live.is_empty() && cp_entries.is_empty() {
+        return err(&format!("no process matching '{arg}'"));
+    }
+
+    let mut lines = Vec::new();
+
+    for p in live {
+        let state = if frozen_reg.is_frozen(p.pid) {
+            "FROZEN".to_string()
+        } else {
+            match p.cgroup_path.as_deref().and_then(|cg| throttle.get(cg)) {
+                Some(ThrottledState::Full)       => "THROTTLED:heavy".to_string(),
+                Some(ThrottledState::WeightOnly) => "THROTTLED:light".to_string(),
+                _                                => "normal".to_string(),
+            }
+        };
+        let priority = crate::engine::decision::get_priority(&p.name, p.exe_basename.as_deref());
+        lines.push(format!(
+            "pid={:<8} name={:<24} state={:<16} rss={:.0}MB swap={:.0}MB oom={} priority={} cgroup={}",
+            p.pid, p.name, state,
+            p.rss_kb as f64 / 1024.0,
+            p.swap_kb as f64 / 1024.0,
+            p.oom_score, priority,
+            p.cgroup_path.as_deref().unwrap_or("none"),
+        ));
+    }
+
+    for (pid, name, _, rss_kb, attempts) in cp_entries {
+        lines.push(format!(
+            "pid={:<8} name={:<24} state=CHECKPOINTED      rss_at_cp={:.0}MB restore_attempts={attempts}",
+            pid, name, rss_kb as f64 / 1024.0,
+        ));
+    }
+
+    ok(&lines.join("\n"))
+}
+
+fn cmd_ps(
+    frozen: &Arc<Mutex<FrozenRegistry>>,
+    throttle_snapshot: &ThrottleSnapshot,
+) -> String {
+    let procs = monitor::process::list_processes();
+    let frozen_reg = frozen.lock().unwrap();
+    let throttle = throttle_snapshot.lock().unwrap();
+
+    if procs.is_empty() {
+        return ok("(no monitored processes)");
+    }
+
+    let mut lines = Vec::new();
+    let mut sorted = procs;
+    sorted.sort_by(|a, b| b.rss_kb.cmp(&a.rss_kb));
+
+    for p in &sorted {
+        let state = if frozen_reg.is_frozen(p.pid) {
+            "FROZEN"
+        } else {
+            match p.cgroup_path.as_deref().and_then(|cg| throttle.get(cg)) {
+                Some(ThrottledState::Full)       => "THROTTLED:heavy",
+                Some(ThrottledState::WeightOnly) => "THROTTLED:light",
+                _                                => "normal",
+            }
+        };
+        let priority = crate::engine::decision::get_priority(&p.name, p.exe_basename.as_deref());
+        lines.push(format!(
+            "  pid={:<7} name={:<22} rss={:>6.0}MB swap={:>5.0}MB cpu={:>5.1}% prio={:<3} state={}",
+            p.pid, p.name,
+            p.rss_kb as f64 / 1024.0,
+            p.swap_kb as f64 / 1024.0,
+            p.cpu_pct,
+            priority,
+            state,
+        ));
+    }
+    ok(&lines.join("\n"))
+}
+
+fn cmd_kill(arg: &str, event_log: &crate::events::EventLog) -> String {
+    let target_pid: Option<u32> = arg.parse().ok();
+    let arg_lower = arg.to_lowercase();
+
+    let procs = monitor::process::list_processes();
+    let candidates: Vec<_> = procs
+        .iter()
+        .filter(|p| {
+            if let Some(tpid) = target_pid { p.pid == tpid }
+            else { p.name.to_lowercase().contains(&arg_lower) }
+        })
+        .collect();
+
+    if candidates.is_empty() {
+        return err(&format!("no running process matching '{arg}'"));
+    }
+
+    let mut results = Vec::new();
+    for p in candidates {
+        let r = crate::executor::killer::sigkill(p.pid);
+        if r.success {
+            crate::events::push(event_log, "KILL_MANUAL", p.pid, &p.name, "killed via mgctl");
+            results.push(format!("✓ killed pid={} ({})", p.pid, p.name));
+        } else {
+            results.push(format!("✗ pid={} ({}): {}", p.pid, p.name, r.error.unwrap_or_default()));
+        }
+    }
+    ok(&results.join("\n"))
+}
+
+fn cmd_events(event_log: &crate::events::EventLog) -> String {
+    let q = event_log.lock().unwrap();
+    if q.is_empty() {
+        return ok("(no events recorded)");
+    }
+    let lines: Vec<String> = q.iter().map(|e| {
+        format!("  {} {:<14} pid={:<7} name={:<22} {}", format_ts(e.timestamp), e.action, e.pid, e.name, e.detail)
+    }).collect();
+    ok(&lines.join("\n"))
+}
+
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 fn ok(data: &str) -> String {
@@ -285,4 +567,81 @@ fn ok(data: &str) -> String {
 
 fn err(msg: &str) -> String {
     format!("ERR {msg}")
+}
+
+// ── tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::executor::registry::{CheckpointRegistry, FrozenRegistry};
+    use crate::events;
+    use std::sync::{Arc, Mutex};
+    use std::collections::HashMap;
+
+    fn empty_frozen() -> Arc<Mutex<FrozenRegistry>> {
+        Arc::new(Mutex::new(FrozenRegistry::new()))
+    }
+
+    fn empty_checkpointed() -> Arc<Mutex<CheckpointRegistry>> {
+        Arc::new(Mutex::new(CheckpointRegistry::new()))
+    }
+
+    fn empty_throttle() -> Arc<Mutex<HashMap<String, ThrottledState>>> {
+        Arc::new(Mutex::new(HashMap::new()))
+    }
+
+    fn empty_events() -> events::EventLog {
+        events::new_log()
+    }
+
+    #[test]
+    fn freeze_no_match_returns_err() {
+        let r = cmd_freeze("no_such_process_xyz_99999", &empty_frozen());
+        assert!(r.starts_with("ERR"), "expected ERR, got: {r}");
+    }
+
+    #[test]
+    fn restore_no_match_returns_err() {
+        let r = cmd_restore("no_such_process_xyz_99999", &empty_checkpointed());
+        assert!(r.starts_with("ERR"), "expected ERR, got: {r}");
+    }
+
+    #[test]
+    fn info_no_match_returns_err() {
+        let r = cmd_info(
+            "no_such_process_xyz_99999",
+            &empty_frozen(),
+            &empty_checkpointed(),
+            &empty_throttle(),
+        );
+        assert!(r.starts_with("ERR"), "expected ERR, got: {r}");
+    }
+
+    #[test]
+    fn kill_no_match_returns_err() {
+        let r = cmd_kill("no_such_process_xyz_99999", &empty_events());
+        assert!(r.starts_with("ERR"), "expected ERR, got: {r}");
+    }
+
+    #[test]
+    fn events_empty_returns_ok() {
+        let r = cmd_events(&empty_events());
+        assert!(r.starts_with("OK"), "expected OK, got: {r}");
+    }
+
+    #[test]
+    fn events_records_and_retrieves() {
+        let log = empty_events();
+        events::push(&log, "FREEZE", 42, "test_proc", "frozen");
+        let r = cmd_events(&log);
+        assert!(r.contains("FREEZE"), "expected FREEZE in: {r}");
+        assert!(r.contains("test_proc"), "expected test_proc in: {r}");
+    }
+
+    #[test]
+    fn ps_returns_ok() {
+        let r = cmd_ps(&empty_frozen(), &empty_throttle());
+        assert!(r.starts_with("OK"), "expected OK, got: {r}");
+    }
 }

@@ -50,6 +50,8 @@ struct RawConfig {
     thresholds: Thresholds,
     #[serde(default)]
     psi: Psi,
+    #[serde(default)]
+    emergency: EmergencyConfig,
 }
 
 /// `[psi]` — pressure-tier boundaries (some_avg10 %) and the full_avg10
@@ -222,6 +224,20 @@ fn default_idle_reclaim_reclaim_pct() -> u64 { 20 }
 fn default_idle_reclaim_global_cooldown_sec() -> u64 { 30 }
 fn default_idle_reclaim_max_swap_occupancy_pct() -> f64 { 60.0 }
 
+/// `[emergency]` — last-resort actions when pressure stays at Emergency level.
+#[derive(Deserialize)]
+struct EmergencyConfig {
+    /// Seconds of sustained Emergency before triggering `systemctl hibernate`.
+    /// 0 (default) = disabled. Requires working hibernate (swap partition ≥ RAM).
+    #[serde(default)]
+    hibernate_after_sec: u64,
+}
+
+impl Default for EmergencyConfig {
+    fn default() -> Self {
+        EmergencyConfig { hibernate_after_sec: 0 }
+    }
+}
 
 #[derive(Deserialize)]
 struct Defaults {
@@ -306,6 +322,7 @@ pub struct CompiledConfig {
     pub idle_reclaim_global_cooldown_sec: u64,
     pub idle_reclaim_max_swap_occupancy_pct: f64,
     pub idle_reclaim_freeze_after_sec: Option<u64>,
+    pub emergency_hibernate_after_sec: u64,
     /// (regex, priority, checkpoint_override)
     entries: Vec<(Regex, u8, Option<bool>)>,
     /// Patterns that must never be touched
@@ -512,6 +529,7 @@ fn compile(content: &str) -> Result<CompiledConfig, String> {
         idle_reclaim_global_cooldown_sec: raw.idle_reclaim.global_cooldown_sec,
         idle_reclaim_max_swap_occupancy_pct: raw.idle_reclaim.max_swap_occupancy_pct,
         idle_reclaim_freeze_after_sec: raw.idle_reclaim.freeze_after_sec,
+        emergency_hibernate_after_sec: raw.emergency.hibernate_after_sec,
         psi,
         entries,
         protected,

@@ -53,6 +53,8 @@ pub fn run(
             return;
         }
 
+        crate::plugin_server::check_and_restart_plugins();
+
         let pressure = monitor::psi::read_pressure().ok();
         // A PSI read error counts as not-calm.
         let calm = pressure

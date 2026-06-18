@@ -53,6 +53,7 @@ pub fn run(
     recovery_wake: Arc<(Mutex<bool>, Condvar)>,
     calibrator: Arc<Mutex<crate::engine::calibrate::Calibrator>>,
     throttle_snapshot: Arc<Mutex<HashMap<String, crate::throttle::ThrottledState>>>,
+    event_log: crate::events::EventLog,
 ) {
     mgd_common::sync_print!("[responder] PSI source: {}", monitor::psi::pressure_source());
     let psi_trigger = monitor::psi::PsiTrigger::new().ok();
@@ -75,10 +76,15 @@ pub fn run(
     let mut last_active_pid = None;
     let mut recently_killed_cgroups: HashMap<String, std::time::Instant> = HashMap::new();
     let mut sustained_critical_swap_start: Option<std::time::Instant> = None;
+    let (mut last_pswpin, mut last_pswpout) = crate::monitor::meminfo::read_vmstat_swap_counters();
+    let mut memcap = crate::throttle::MemCapManager::new();
+    let mut sustained_emergency_start: Option<std::time::Instant> = None;
+    let mut hibernate_triggered = false;
 
     loop {
         if crate::should_shutdown() {
             throttle.restore_all();
+            memcap.restore_all();
             return;
         }
 
@@ -138,7 +144,20 @@ pub fn run(
 
         let meminfo = crate::monitor::meminfo::read_meminfo();
 
-        // Calculate continuous pressure score: 60% PSI, 25% Swap used, 15% GPU UMA overhead
+        let now = std::time::Instant::now();
+        let dt = now.duration_since(last_time).as_secs_f64();
+
+        // Swap I/O rate: pswpin + pswpout delta over last cycle, pages → KB/s.
+        // Normalized at 50 MB/s (51200 KB/s) total I/O — above that = thrash.
+        let (cur_pswpin, cur_pswpout) = crate::monitor::meminfo::read_vmstat_swap_counters();
+        let swap_io_pages = cur_pswpin.saturating_sub(last_pswpin)
+            .saturating_add(cur_pswpout.saturating_sub(last_pswpout));
+        last_pswpin = cur_pswpin;
+        last_pswpout = cur_pswpout;
+        let swap_io_kbs = if dt > 0.1 { (swap_io_pages * 4) as f64 / dt } else { 0.0 };
+        let swap_io_val = (swap_io_kbs / 51200.0).clamp(0.0, 1.0);
+
+        // Continuous pressure score: 55% PSI + 20% swap used + 15% GPU UMA + 10% swap I/O rate
         let psi_val = (pressure.some_avg10 / 100.0).clamp(0.0, 1.0);
         let swap_val = if meminfo.swap_total_kb > 0 {
             (meminfo.swap_used_pct() / 100.0).clamp(0.0, 1.0)
@@ -151,11 +170,9 @@ pub fn run(
         } else {
             0.0
         };
-        let p_score = 0.60 * psi_val + 0.25 * swap_val + 0.15 * gpu_val;
+        let p_score = 0.55 * psi_val + 0.20 * swap_val + 0.15 * gpu_val + 0.10 * swap_io_val;
 
         // Calculate trend (dP/dt)
-        let now = std::time::Instant::now();
-        let dt = now.duration_since(last_time).as_secs_f64();
         let trend = if dt > 0.1 {
             (p_score - last_score) / dt
         } else {
@@ -256,6 +273,22 @@ pub fn run(
 
         last_level = effective_level.clone();
 
+        // Hibernate last-resort: if Emergency sustained beyond threshold (disabled by default)
+        if effective_level >= PressureLevel::Emergency {
+            let start = sustained_emergency_start.get_or_insert(now);
+            let threshold = crate::config::get().emergency_hibernate_after_sec;
+            if !hibernate_triggered && threshold > 0 && now.duration_since(*start).as_secs() >= threshold {
+                hibernate_triggered = true;
+                mgd_common::sync_print!(
+                    "[responder] CRITICAL: Emergency pressure sustained {}s — triggering systemctl hibernate",
+                    threshold
+                );
+                let _ = std::process::Command::new("systemctl").arg("hibernate").spawn();
+            }
+        } else {
+            sustained_emergency_start = None;
+        }
+
         // Passive calibration (Phase D): feed the raw PSI sample before any
         // action this cycle. Samples taken while interventions are in flight
         // are excluded inside observe() — the daemon must not calibrate off
@@ -318,12 +351,20 @@ pub fn run(
             throttle.update(&plan_procs, active_pid);
             *throttle_snapshot.lock().unwrap() = throttle.snapshot();
 
+            // Cap memory.max on expendable background cgroups at High+ pressure
+            memcap.update(&plan_procs, active_pid, &effective_level);
+
             // Idle cgroup reclaim: only runs at Normal/Calm pressure
             if effective_level == PressureLevel::Normal {
                 if config.idle_reclaim_enabled {
                     check_idle_process_reclaim(&plan_procs, active_pid, &mut idle_reclaim_pid_tracker, &mut idle_freeze_pid_tracker, &frozen, &log);
                 }
             }
+        }
+
+        // Restore memory caps when pressure drops below High
+        if effective_level < PressureLevel::High {
+            memcap.restore_all();
         }
 
         if effective_level == PressureLevel::Normal {
@@ -371,7 +412,7 @@ pub fn run(
             for d in &decisions {
                 if frozen.lock().unwrap().is_frozen(d.pid) { continue; }
 
-                let result_str = execute_decision(d, &frozen, &checkpointed, &log);
+                let result_str = execute_decision(d, &frozen, &checkpointed, &log, &event_log);
                 mgd_common::sync_print!("  {:<10} {:<8} {:<22} {:>6.1}MB  {}", d.action, d.pid, d.name, d.rss_mb, result_str);
 
                 // Track recently terminated/killed cgroups
@@ -614,6 +655,7 @@ fn execute_decision(
     frozen: &Arc<Mutex<FrozenRegistry>>,
     checkpointed: &Arc<Mutex<CheckpointRegistry>>,
     log: &Logger,
+    event_log: &crate::events::EventLog,
 ) -> String {
     let (action_name, s) = match d.action {
         Action::Freeze => ("FREEZE", freeze_process(d, frozen)),
@@ -623,6 +665,7 @@ fn execute_decision(
         Action::None => return String::new(),
     };
     log.log(&LogEntry::new(action_name, d.pid, &d.name, d.rss_mb, &s));
+    crate::events::push(event_log, action_name, d.pid, &d.name, &s);
     s
 }
 
@@ -914,6 +957,7 @@ mod tests {
             swap_kb: 0,
             oom_score: 0,
             cgroup_path: None,
+            cpu_pct: 0.0,
         }
     }
 

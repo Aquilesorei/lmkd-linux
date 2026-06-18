@@ -1,6 +1,8 @@
+use std::collections::HashMap;
 use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
+use std::sync::{LazyLock, Mutex};
 
 use mgd_common::error::MgdError;
 
@@ -16,6 +18,25 @@ pub struct Process {
     /// Unified cgroup v2 path (e.g. `/user.slice/user-1000.slice/…`), cached to
     /// avoid re-reading `/proc/PID/cgroup` multiple times per evictor cycle.
     pub cgroup_path: Option<String>,
+    /// CPU usage percent over the last sample interval (0.0 on first observation).
+    pub cpu_pct: f32,
+}
+
+/// pid → (total_ticks, unix_timestamp_secs) from previous list_processes() call.
+static CPU_CACHE: LazyLock<Mutex<HashMap<u32, (u64, u64)>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+static CLK_TCK: LazyLock<u64> =
+    LazyLock::new(|| unsafe { libc::sysconf(libc::_SC_CLK_TCK).max(1) as u64 });
+
+fn read_cpu_ticks(_pid: u32, path: &Path) -> Option<u64> {
+    let stat = fs::read_to_string(path.join("stat")).ok()?;
+    // After the last ')': state(0) ppid(1) ... utime(11) stime(12)
+    let after_comm = stat.rsplit_once(") ")?.1;
+    let mut it = after_comm.split_whitespace().skip(11);
+    let utime: u64 = it.next()?.parse().ok()?;
+    let stime: u64 = it.next()?.parse().ok()?;
+    Some(utime + stime)
 }
 
 /// Read all user processes from /proc, excluding ourselves and system processes
@@ -76,9 +97,33 @@ fn read_process(pid: u32, path: &Path) -> Result<Process, MgdError> {
         .ok()
         .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()));
 
-    Ok(Process { pid, name, exe_basename, rss_kb, swap_kb, oom_score, cgroup_path })
+    let cpu_pct = compute_cpu_pct(pid, path);
+
+    Ok(Process { pid, name, exe_basename, rss_kb, swap_kb, oom_score, cgroup_path, cpu_pct })
 }
 
+
+fn compute_cpu_pct(pid: u32, path: &Path) -> f32 {
+    let now = mgd_common::util::unix_timestamp_secs();
+    let ticks = match read_cpu_ticks(pid, path) {
+        Some(t) => t,
+        None => return 0.0,
+    };
+    let mut cache = CPU_CACHE.lock().unwrap();
+    let cpu_pct = if let Some(&(prev_ticks, prev_time)) = cache.get(&pid) {
+        let delta_ticks = ticks.saturating_sub(prev_ticks) as f32;
+        let delta_secs = now.saturating_sub(prev_time).max(1) as f32;
+        (delta_ticks / *CLK_TCK as f32 / delta_secs * 100.0).min(100.0 * num_cpus())
+    } else {
+        0.0
+    };
+    cache.insert(pid, (ticks, now));
+    cpu_pct
+}
+
+fn num_cpus() -> f32 {
+    unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN).max(1) as f32 }
+}
 
 fn parse_status_field(status: &str, field: &str) -> Option<String> {
     status.lines()

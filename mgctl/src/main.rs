@@ -1,6 +1,7 @@
 /// mgctl — control client for the mgd daemon.
 mod calibrate;
 mod doctor;
+mod watch;
 ///
 /// Talks to the running mgd daemon via its Unix domain socket for live
 /// introspection, and shells out to `systemctl --user` for lifecycle control
@@ -8,15 +9,22 @@ mod doctor;
 /// daemon is down, or must outlive the daemon process itself).
 ///
 /// Usage:
-///   mgctl status              — show current pressure + frozen count   (socket)
-///   mgctl list                — list all frozen processes              (socket)
-///   mgctl unfreeze <pid|name> — manually unfreeze by PID or name        (socket)
-///   mgctl reload              — hot-reload daemon config without restart (socket)
-///   mgctl restart             — restart the mgd service              (systemctl)
-///   mgctl start               — start the mgd service                (systemctl)
-///   mgctl stop                — stop the mgd service                 (systemctl)
-///   mgctl service             — show systemd unit status             (systemctl)
-///   mgctl logs [-f]           — show daemon logs (-f to follow)      (journalctl)
+///   mgctl status              — pressure, avail RAM, swap, managed counts  (socket)
+///   mgctl list                — frozen, checkpointed, and throttled procs  (socket)
+///   mgctl ps                  — all live monitored processes with CPU/RSS   (socket)
+///   mgctl info <pid|name>     — per-process detail: RSS, swap, priority    (socket)
+///   mgctl events              — recent daemon actions (ring buffer)         (socket)
+///   mgctl watch               — live refreshing dashboard                  (socket)
+///   mgctl freeze <pid|name>   — manually freeze by PID or name             (socket)
+///   mgctl unfreeze <pid|name> — manually unfreeze by PID or name           (socket)
+///   mgctl restore <pid|name>  — restore a checkpointed process             (socket)
+///   mgctl kill <pid|name>     — manually SIGKILL by PID or name            (socket)
+///   mgctl reload              — hot-reload daemon config without restart    (socket)
+///   mgctl restart             — restart the mgd service                 (systemctl)
+///   mgctl start               — start the mgd service                   (systemctl)
+///   mgctl stop                — stop the mgd service                    (systemctl)
+///   mgctl service             — show systemd unit state                (systemctl)
+///   mgctl logs [-f]           — show daemon logs (-f to follow)         (journalctl)
 
 use std::io::{BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
@@ -26,10 +34,17 @@ const SERVICE: &str = "mgd.service";
 
 fn usage() {
     eprintln!("Usage:");
-    eprintln!("  mgctl status                  (daemon: pressure + frozen count)");
-    eprintln!("  mgctl list");
-    eprintln!("  mgctl unfreeze <pid|name>");
-    eprintln!("  mgctl reload");
+    eprintln!("  mgctl status                  (pressure, avail RAM, swap, managed process counts)");
+    eprintln!("  mgctl list                    (all frozen, checkpointed, and throttled processes)");
+    eprintln!("  mgctl ps                      (all live monitored processes: RSS, swap, CPU, priority)");
+    eprintln!("  mgctl info <pid|name>         (per-process detail: RSS, swap, priority, state)");
+    eprintln!("  mgctl events                  (recent daemon actions: freeze/kill/checkpoint history)");
+    eprintln!("  mgctl watch                   (live refreshing dashboard: status + ps + events)");
+    eprintln!("  mgctl freeze <pid|name>       (manually freeze a process)");
+    eprintln!("  mgctl unfreeze <pid|name>     (manually unfreeze a frozen process)");
+    eprintln!("  mgctl restore <pid|name>      (restore a checkpointed process)");
+    eprintln!("  mgctl kill <pid|name>         (manually SIGKILL a process)");
+    eprintln!("  mgctl reload                  (hot-reload config without restart)");
     eprintln!("  mgctl restart | start | stop");
     eprintln!("  mgctl service                 (systemd unit state)");
     eprintln!("  mgctl logs [-f]");
@@ -55,19 +70,22 @@ fn main() {
         "logs"      => std::process::exit(run_logs(&args[2..])),
         "calibrate" => std::process::exit(calibrate::run(&args[2..])),
         "doctor"    => std::process::exit(doctor::run()),
+        "watch"     => std::process::exit(watch::run()),
         _ => {}
     }
 
     let request = match cmd {
         "status"   => "status".to_string(),
         "list"     => "list".to_string(),
+        "ps"       => "ps".to_string(),
+        "events"   => "events".to_string(),
         "reload"   => "reload".to_string(),
-        "unfreeze" => {
+        "unfreeze" | "freeze" | "restore" | "info" | "kill" => {
             if args.len() < 3 {
-                eprintln!("Usage: mgctl unfreeze <pid|name>");
+                eprintln!("Usage: mgctl {cmd} <pid|name>");
                 std::process::exit(1);
             }
-            format!("unfreeze {}", args[2])
+            format!("{cmd} {}", args[2])
         }
         other => {
             eprintln!("mgctl: unknown command '{other}'");

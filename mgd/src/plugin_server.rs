@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex, LazyLock};
 use std::sync::mpsc::{channel, Sender};
 use std::collections::HashMap;
 use std::thread;
+use std::time::{Duration, Instant};
 
 use mgd_common::protocol::{CoreMessage, PluginMessage, PluginAction};
 
@@ -12,22 +13,42 @@ use crate::executor::registry::{FrozenRegistry, CheckpointRegistry};
 /// Senders to all active plugin connections
 static PLUGIN_CLIENTS: LazyLock<Mutex<Vec<Sender<CoreMessage>>>> = LazyLock::new(|| Mutex::new(Vec::new()));
 
-/// Cached observations from plugins
-static GPU_CACHE: LazyLock<Mutex<HashMap<u32, u64>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+const GPU_CACHE_TTL: Duration = Duration::from_secs(30);
+
+/// Cached GPU observations from plugins. Keyed by pid; entries expire after
+/// GPU_CACHE_TTL so dead processes don't accumulate stale data.
+static GPU_CACHE: LazyLock<Mutex<HashMap<u32, (u64, Instant)>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Active foreground process PID reported by DE plugins
 static ACTIVE_FOREGROUND_PID: LazyLock<Mutex<Option<u32>>> = LazyLock::new(|| Mutex::new(None));
 
+/// Tracked child processes for crash-restart watchdog. Keyed by plugin name.
+static PLUGIN_CHILDREN: LazyLock<Mutex<HashMap<String, (std::process::Child, Instant)>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
 pub fn get_gpu_kb(pid: u32) -> u64 {
-    *GPU_CACHE.lock().unwrap().get(&pid).unwrap_or(&0)
+    let now = Instant::now();
+    GPU_CACHE.lock().unwrap()
+        .get(&pid)
+        .filter(|(_, at)| now.duration_since(*at) < GPU_CACHE_TTL)
+        .map(|(kb, _)| *kb)
+        .unwrap_or(0)
 }
 
 pub fn set_gpu_kb(pid: u32, kb: u64) {
-    GPU_CACHE.lock().unwrap().insert(pid, kb);
+    let now = Instant::now();
+    let mut cache = GPU_CACHE.lock().unwrap();
+    cache.retain(|_, (_, at)| now.duration_since(*at) < GPU_CACHE_TTL);
+    cache.insert(pid, (kb, now));
 }
 
 pub fn get_total_gpu_kb() -> u64 {
-    GPU_CACHE.lock().unwrap().values().sum()
+    let now = Instant::now();
+    GPU_CACHE.lock().unwrap()
+        .values()
+        .filter(|(_, at)| now.duration_since(*at) < GPU_CACHE_TTL)
+        .map(|(kb, _)| *kb)
+        .sum()
 }
 
 pub fn get_active_foreground_pid() -> Option<u32> {
@@ -100,8 +121,40 @@ fn spawn_plugin_binary(name: &str) {
     }
 
     match std::process::Command::new(&candidate).spawn() {
-        Ok(_) => mgd_common::sync_print!("[core] Autospawned plugin: {}", name),
+        Ok(child) => {
+            mgd_common::sync_print!("[core] Autospawned plugin: {}", name);
+            PLUGIN_CHILDREN.lock().unwrap().insert(name.to_string(), (child, Instant::now()));
+        }
         Err(e) => mgd_common::sync_print!("[core] Failed to spawn {}: {}", name, e),
+    }
+}
+
+/// Check all tracked plugins; restart any that have exited.
+/// Called from the maintenance loop (~60s interval).
+pub fn check_and_restart_plugins() {
+    let now = Instant::now();
+    let dead: Vec<String> = {
+        let mut children = PLUGIN_CHILDREN.lock().unwrap();
+        let dead: Vec<String> = children
+            .iter_mut()
+            .filter_map(|(name, (child, spawned_at))| {
+                child.try_wait().ok().flatten().map(|status| {
+                    let uptime = now.duration_since(*spawned_at).as_secs();
+                    mgd_common::sync_print!(
+                        "[core] Plugin {} exited ({}) after {}s — restarting",
+                        name, status, uptime
+                    );
+                    name.clone()
+                })
+            })
+            .collect();
+        for name in &dead {
+            children.remove(name);
+        }
+        dead
+    };
+    for name in dead {
+        spawn_plugin_binary(&name);
     }
 }
 

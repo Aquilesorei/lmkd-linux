@@ -160,8 +160,8 @@ in `engine/decision.rs`.
 | Module | Reads | Provides |
 |--------|-------|----------|
 | `psi.rs` | `/proc/pressure/memory` | `MemoryPressure` (some/full avg10/60/300) → `PressureLevel` |
-| `meminfo.rs` | `/proc/meminfo` | `MemInfo { available, total, swap_free, swap_total }`, `swap_used_pct()` |
-| `process.rs` | `/proc/<pid>/{status,stat,oom_score,exe,cgroup}` | `Process` list, `cpu_jiffies()` for idle detection |
+| `meminfo.rs` | `/proc/meminfo`, `/proc/vmstat` | `MemInfo { available, total, swap_free, swap_total }`, `swap_used_pct()`; `read_vmstat_swap_counters()` → cumulative `pswpin`/`pswpout` page counters for I/O rate |
+| `process.rs` | `/proc/<pid>/{status,stat,oom_score,exe,cgroup}` | `Process` list including `cpu_pct` (delta from `/proc/<pid>/stat`), `cgroup_path` |
 | `zram.rs` | `/proc/swaps`, `/sys/block/zramN/mm_stat` | device list, compressed + decompressed sizes, `compact()` |
 | `gpu.rs` | `/proc/<pid>/fdinfo/*` (DRM) | per-process GPU residency (UMA), plasmashell restart |
 | `cache.rs` | configured dir trees | `posix_fadvise(DONTNEED)` page-cache drop |
@@ -173,11 +173,12 @@ Emergency`), derived `PartialOrd`/`Ord` so callers can gate on
 `level >= Elevated`. Instead of mapping raw PSI directly, the core daemon uses a **damped feedback controller** to determine the active level:
 
 1. **Pressure Score ($P$):** A normalized score ($0.0$ to $1.0$) representing overall memory stress:
-   $$P = w_{\text{PSI}} \cdot S_{\text{PSI}} + w_{\text{swap}} \cdot S_{\text{swap}} + w_{\text{GPU}} \cdot S_{\text{GPU}}$$
-   where the weights are $w_{\text{PSI}} = 0.60$, $w_{\text{swap}} = 0.25$, and $w_{\text{GPU}} = 0.15$. The sub-scores are normalized between $0.0$ and $1.0$:
+   $$P = 0.55 \cdot S_{\text{PSI}} + 0.20 \cdot S_{\text{swap}} + 0.15 \cdot S_{\text{GPU}} + 0.10 \cdot S_{\text{swapIO}}$$
+   The sub-scores are normalized between $0.0$ and $1.0$:
    *   $S_{\text{PSI}} = \text{clamp}\left(\frac{\text{PSI}_{\text{some\_avg10}}}{100.0},\, 0.0,\, 1.0\right)$
-   *   $S_{\text{swap}} = \text{clamp}\left(\frac{\text{Swap}_{\text{used\_pct}}}{100.0},\, 0.0,\, 1.0\right)$ (defaults to $0.0$ if no swap exists)
-   *   $S_{\text{GPU}} = \text{clamp}\left(\frac{\text{GPU}_{\text{UMA\_kb}}}{\text{RAM}_{\text{total\_kb}}},\, 0.0,\, 1.0\right)$ (total GPU residency reported by driver plugins)
+   *   $S_{\text{swap}} = \text{clamp}\left(\frac{\text{Swap}_{\text{used\_pct}}}{100.0},\, 0.0,\, 1.0\right)$ (defaults to $0.0$ if no swap)
+   *   $S_{\text{GPU}} = \text{clamp}\left(\frac{\text{GPU}_{\text{UMA\_kb}}}{\text{RAM}_{\text{total\_kb}}},\, 0.0,\, 1.0\right)$ (total GPU residency reported by driver plugins via `plugin_server::GPU_CACHE`, 30 s TTL)
+   *   $S_{\text{swapIO}} = \text{clamp}\left(\frac{(\Delta\text{pswpin} + \Delta\text{pswpout}) \cdot 4\,\text{KB/page}}{\Delta t \cdot 51200\,\text{KB/s}},\, 0.0,\, 1.0\right)$ — total swap I/O rate from `/proc/vmstat`, normalized at 50 MB/s (full-thrash signal). Catches fast-onset thrashing before the PSI 10 s moving average smooths it out.
 2. **Trend ($T$):** The derivative ($dP/dt$) calculated dynamically across cycles to measure pressure velocity (change per second):
    $$T = \frac{dP}{dt} \approx \frac{P_t - P_{t-1}}{\Delta t}$$
    where $\Delta t$ is the precise time elapsed (in seconds) since the last cycle.
@@ -394,7 +395,20 @@ gates live in the unprivileged daemon:
 
 ---
 
-## 8.5 CPU throttling / App Nap (`evictor.rs`, per-cycle)
+## 8.5 `memory.max` cgroup caps (`throttle.rs` / `evictor.rs`, High+ pressure)
+
+At High+ pressure, `MemCapManager` writes `memory.max` to expendable background cgroups (priority ≥ 60, not foreground) that have been continuously in the background for ≥ 10 s. The cap is set to `current_RSS + 512 MB` — generous enough to avoid intra-cgroup OOM while preventing unbounded further growth. The kernel then reclaims from those cgroups first under further pressure.
+
+Caps are **restored to `max` (unlimited)** when:
+- Pressure drops below High (every cycle).
+- The process becomes the active foreground window.
+- The daemon shuts down.
+
+This is fully unprivileged: `memory.max` under `user.slice` is user-writable when systemd delegates the cgroup subtree. Writes that fail (EPERM) are silently skipped — the cgroup simply isn't capped that cycle.
+
+---
+
+## 8.6 CPU throttling / App Nap (`evictor.rs`, per-cycle)
 
 Background processes that have been out of the foreground for ≥ 10 s (debounce) have their
 cgroup CPU weight reduced via `cpu.weight` and `cpu.max`. `ThrottledState` is a two-tier
@@ -411,7 +425,21 @@ The evictor reads the active foreground PID from `plugin_server::get_active_fore
 
 ---
 
-## 8.6 Plugins (`mgd-kde`, `mgd-gpu-intel`, etc.)
+## 8.7 Emergency hibernate (`evictor.rs`, opt-in)
+
+Last-resort fallback when pressure stays at Emergency level beyond a configurable threshold. Disabled by default (`hibernate_after_sec = 0`). When enabled, a one-shot `systemctl hibernate` is triggered after N seconds of sustained Emergency. The timer resets when pressure drops below Emergency. Only fires once per daemon run.
+
+Configure in `priorities.toml`:
+```toml
+[emergency]
+hibernate_after_sec = 120   # 0 = disabled
+```
+
+Requires a working hibernate setup (swap space ≥ RAM). If hibernate is unreliable on the platform, leave this at 0 — the existing Emergency kill path is sufficient.
+
+---
+
+## 8.8 Plugins (`mgd-kde`, `mgd-gpu-intel`, etc.)
 
 Historically, environment-specific watchers lived inside `mgd`. They are now decoupled into
 standalone plugin processes. `plugin_server::init_plugins()` (called at daemon startup)
@@ -422,8 +450,15 @@ auto-detects and spawns the right binaries:
 
 Active plugins:
 - **`mgd-kde`**: Handles restarting the KDE `plasmashell` on GPU leaks, and reaping
-  `plasma-discover` on CPU idle. Reports active window PID via `ActiveWindow`.
-- **`mgd-gpu-intel`**: Scans `/proc/<pid>/fdinfo/` (DRM) to account for UMA graphics memory.
+  `plasma-discover` on CPU idle. Reports active window PID via `ActiveWindow` by loading
+  a KWin JS script (via DBus/busctl) that emits `ACTIVE_WINDOW_PID:<pid>` to the journal,
+  then tailing `journalctl --user -f`. When the active window changes, the evictor immediately
+  unfreezes that process if frozen, and `MemCapManager`/`ThrottleManager` restore it to full
+  CPU and memory limits.
+- **`mgd-gpu-intel`**: Scans `/proc/<pid>/fdinfo/` (DRM, `drm-resident-*` fields) every 5 s
+  to account for UMA graphics memory. Sends `Observation { metric: GpuResidentKb }` per-pid
+  to core; core stores in `plugin_server::GPU_CACHE` (30 s TTL). Auto-spawned for `i915` or
+  `xe` drivers detected in `/sys/class/drm/*/device/driver`.
 
 Plugins observe the system and send `PluginMessage` to core; core routes via
 `plugin_server::serve_plugin_connection()`. Core broadcasts `CoreMessage::PressureChanged`
@@ -503,7 +538,9 @@ override), `[[protect]]` (never-touch regexes), `[category_priorities]`
 boundaries, validated as a set), `[idle_reclaim]` (idle background cgroup reclaim
 — `enabled`, `idle_sec`, `rss_min_mb`, `reclaim_pct`, `global_cooldown_sec`,
 `max_swap_occupancy_pct`), `[thresholds]` (`target_available_pct` — explicit override
-above the passive calibration file and RAM-scaling defaults).
+above the passive calibration file and RAM-scaling defaults), `[emergency]`
+(`hibernate_after_sec` — seconds of sustained Emergency before triggering
+`systemctl hibernate`; 0 = disabled, default).
 
 Reload is triggered by SIGHUP or `mgctl reload`; the responder picks it up at the
 top of its next cycle. `.desktop` files are re-scanned on each load to rebuild the
@@ -519,11 +556,9 @@ at `$XDG_RUNTIME_DIR/mgd.sock` (fallback `/tmp/mgd-<uid>.sock`). Responses are
 `MAX_CONNECTIONS = 8`; a stale socket from a crash is detected and rebound.
 
 `mgctl` is the client and splits cleanly into three categories:
-- **socket commands** (daemon must be alive): `status`, `list`, `unfreeze`,
-  `reload`.
+- **socket commands** (daemon must be alive): `status` (pressure + swap + throttle counts), `list` (frozen/checkpointed processes with RSS), `freeze <pid|name>`, `restore <pid|name>`, `info <pid|name>` (process detail), `ps` (all live processes with priority + CPU%), `events` (recent daemon action history), `kill <pid|name>`, `watch` (live 2-second dashboard), `unfreeze <pid|name>`, `reload`.
 - **lifecycle commands** (wrap `systemctl --user` / `journalctl --user`, work
-  even when the daemon is down — which the socket cannot): `restart`, `start`,
-  `stop`, `service` (systemd unit state), `logs [-f]`.
+  even when the daemon is down): `restart`, `start`, `stop`, `service` (systemd unit state), `logs [-f]`.
 - **standalone utility commands**: `doctor` (environment + feature report) and `calibrate` (derive per-machine PSI thresholds).
 
 `status` is the daemon's live view (pressure, frozen counts); `service` is the
@@ -556,10 +591,14 @@ Everything mgd senses comes from procfs/sysfs — no kernel module, no BPF:
 | `/proc/<pid>/exe` | untruncated basename for `.desktop` lookup |
 | `/proc/<pid>/cgroup` | user-session scoping |
 | `/proc/<pid>/fdinfo/*` | per-process GPU residency (DRM) |
+| `/proc/vmstat` | cumulative `pswpin`/`pswpout` page counters → swap I/O rate for pressure score |
 | `/proc/swaps` | zram device discovery |
 | `/sys/block/zramN/mm_stat` | compressed + decompressed pool size |
 | `/sys/block/zramN/compact` | trigger compaction (privileged write) |
 | `/sys/fs/cgroup/.../memory.reclaim` | trigger proactive cgroup memory reclaim (user write) |
+| `/sys/fs/cgroup/.../memory.max` | cap background cgroup memory growth at High+ pressure (user write) |
+| `/sys/fs/cgroup/.../cpu.weight` | CPU weight throttling for background cgroups (user write) |
+| `/sys/fs/cgroup/.../cpu.max` | CPU quota throttling for expendable background cgroups (user write) |
 
 ---
 

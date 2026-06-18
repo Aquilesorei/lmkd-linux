@@ -1,5 +1,3 @@
-use std::io;
-
 use super::{read_start_time, OpResult};
 
 /// Send SIGSTOP to a process — pauses it completely.

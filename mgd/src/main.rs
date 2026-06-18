@@ -1,4 +1,5 @@
 mod config;
+mod events;
 mod monitor;
 mod engine;
 mod executor;
@@ -65,7 +66,9 @@ fn main() {
     let throttle_snapshot: Arc<Mutex<std::collections::HashMap<String, throttle::ThrottledState>>> =
         Arc::new(Mutex::new(std::collections::HashMap::new()));
 
-    //Actotd
+    // Ring buffer of recent daemon actions (freeze/kill/checkpoint), readable via `mgctl events`.
+    let event_log = events::new_log();
+
     let responder = {
         let f = Arc::clone(&frozen);
         let c = Arc::clone(&checkpointed);
@@ -73,7 +76,8 @@ fn main() {
         let w = Arc::clone(&recovery_wake);
         let cal = Arc::clone(&calibrator);
         let ts = Arc::clone(&throttle_snapshot);
-        thread::spawn(move || evictor::run(f, c, l, w, cal, ts))
+        let el = Arc::clone(&event_log);
+        thread::spawn(move || evictor::run(f, c, l, w, cal, ts, el))
     };
 
     let recovery = {
@@ -88,7 +92,8 @@ fn main() {
         let f = Arc::clone(&frozen);
         let c = Arc::clone(&checkpointed);
         let ts = Arc::clone(&throttle_snapshot);
-        thread::spawn(move || ipc::run_server(f, c, ts))
+        let el = Arc::clone(&event_log);
+        thread::spawn(move || ipc::run_server(f, c, ts, el))
     };
 
     let maintenance = {
