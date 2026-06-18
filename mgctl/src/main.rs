@@ -94,41 +94,41 @@ fn main() {
         }
     };
 
-    let path = mgd_common::socket::socket_path();
-    let mut stream = match UnixStream::connect(&path) {
-        Ok(s) => s,
+    match query_socket(&request, 5) {
+        Ok(res) => {
+            println!("{res}");
+        }
         Err(e) => {
-            eprintln!("mgctl: cannot connect to mgd socket at {path:?}: {e}");
-            eprintln!("       Is mgd running? (systemctl --user status mgd)");
+            eprintln!("{e}");
             std::process::exit(1);
         }
-    };
-
-    stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
-    stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
-
-    if let Err(e) = writeln!(stream, "{request}") {
-        eprintln!("mgctl: write error: {e}");
-        std::process::exit(1);
     }
+}
 
-    // Read entire response until server closes the connection — necessary because
-    // multi-entry responses (e.g. "list") embed newlines inside the OK payload.
+pub(crate) fn query_socket(cmd: &str, timeout_secs: u64) -> Result<String, String> {
+    let path = mgd_common::socket::socket_path();
+    let mut stream = UnixStream::connect(&path).map_err(|e| {
+        format!(
+            "mgctl: cannot connect to mgd socket at {path:?}: {e}\n       Is mgd running? (systemctl --user status mgd)"
+        )
+    })?;
+
+    stream.set_write_timeout(Some(Duration::from_secs(timeout_secs))).ok();
+    stream.set_read_timeout(Some(Duration::from_secs(timeout_secs))).ok();
+
+    writeln!(stream, "{cmd}").map_err(|e| format!("mgctl: write error: {e}"))?;
+
     let mut reader = BufReader::new(stream);
     let mut response = String::new();
-    if let Err(e) = reader.read_to_string(&mut response) {
-        eprintln!("mgctl: read error: {e}");
-        std::process::exit(1);
-    }
+    reader.read_to_string(&mut response).map_err(|e| format!("mgctl: read error: {e}"))?;
 
     let response = response.trim();
     if let Some(rest) = response.strip_prefix("OK ") {
-        println!("{rest}");
+        Ok(rest.to_string())
     } else if let Some(rest) = response.strip_prefix("ERR ") {
-        eprintln!("error: {rest}");
-        std::process::exit(1);
+        Err(format!("error: {rest}"))
     } else {
-        println!("{response}");
+        Ok(response.to_string())
     }
 }
 

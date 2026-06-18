@@ -1,7 +1,7 @@
 use serde::{Serialize, Deserialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+
 
 fn state_dir() -> PathBuf {
     mgd_common::util::home_dir().join(".local/share/mgd/state")
@@ -44,10 +44,7 @@ impl FrozenRegistry {
         let Some(start_time) = super::read_start_time(pid) else {
             return false;
         };
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        let now = mgd_common::util::unix_timestamp_secs();
         self.frozen.insert(pid, (name.to_string(), now, start_time));
         self.save();
         true

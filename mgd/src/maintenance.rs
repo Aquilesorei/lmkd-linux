@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use mgd_common::logger::{LogEntry, Logger};
 use crate::engine::calibrate::{render_suggestion, Calibrator};
@@ -169,10 +169,7 @@ fn interruptible_sleep(secs: u64) {
 }
 
 fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+    mgd_common::util::unix_timestamp_secs()
 }
 
 

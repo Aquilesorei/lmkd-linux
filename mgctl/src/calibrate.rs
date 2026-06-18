@@ -16,7 +16,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 
@@ -438,7 +438,7 @@ fn do_apply() -> i32 {
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn now_secs() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
+    mgd_common::util::unix_timestamp_secs()
 }
 
 fn chrono_now() -> String {

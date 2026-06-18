@@ -1,7 +1,7 @@
 
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 
 use crate::engine::health::HealthBaseline;
@@ -16,9 +16,7 @@ const MIN_FREEZE_AGE_SECS: u64 = 15;
 const MAX_UNFREEZE_PER_CYCLE: usize = 4;
 
 
-fn unix_now() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
-}
+
 pub fn run(
     frozen: Arc<Mutex<FrozenRegistry>>,
     checkpointed: Arc<Mutex<CheckpointRegistry>>,
@@ -44,7 +42,7 @@ pub fn run(
 
         let meminfo = crate::monitor::meminfo::read_meminfo();
         baseline.observe(meminfo.available_kb);
-        let now = unix_now();
+        let now = mgd_common::util::unix_timestamp_secs();
 
         unfreeze_pass(&frozen, &baseline, &meminfo, now, &log);
 
