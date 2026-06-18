@@ -42,20 +42,44 @@ pub struct Decision {
     pub reason: String,
 }
 
+
+impl Decision {
+    pub fn new(
+        pid: u32,
+        name: impl Into<String>,
+        action: Action,
+        rss_mb: f64,
+        swap_mb: f64,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self {
+            pid,
+            name: name.into(),
+            action,
+            rss_mb,
+            swap_mb,
+            reason: reason.into(),
+        }
+    }
+}
+
 /// Priority 0-100 (higher = sacrifice first), from config (`[[apps]]` regex,
 /// then `.desktop` category by exe_basename, then default).
 pub fn get_priority(name: &str, exe_basename: Option<&str>) -> u8 {
     crate::config::get().priority_for(name, exe_basename)
 }
 
-/// KB to free to reach the configured free-RAM target.
-/// The target percentage is RAM-scaled by default (see config::ram_scaled_target_pct),
-/// and can be overridden via [thresholds] in priorities.toml or by mgctl calibrate.
-/// Returns negative if already above the target (no action needed).
-pub fn ram_deficit_kb(available_kb: u64, total_kb: u64) -> i64 {
-    let pct = crate::config::get().target_available_pct / 100.0;
-    let target_kb = (total_kb as f64 * pct) as u64;
-    target_kb as i64 - available_kb as i64
+/// Calculate how many KB of RAM need to be freed to meet the target free-RAM threshold.
+///
+/// Returns a positive value if the system is in a deficit (needs to free memory).
+/// Returns a negative value if available memory is comfortably above the target threshold.
+pub fn calculate_ram_deficit_kb(available_kb: u64, total_kb: u64) -> i64 {
+    let target_pct = crate::config::get().target_available_pct / 100.0;
+
+    // Calculate target using f64 for fractional percentages, then cast safely back
+    let target_kb = (total_kb as f64 * target_pct) as i64;
+
+    target_kb - (available_kb as i64)
 }
 
 /// Decide actions for the current pressure level (dry run — no side effects).
@@ -70,26 +94,22 @@ pub fn plan(
     if *level == PressureLevel::Normal {
         return vec![];
     }
-
-    let mut deficit = ram_deficit_kb(available_kb, total_kb);
+    let mut deficit = calculate_ram_deficit_kb(available_kb, total_kb);
     if deficit <= 0 {
         return vec![];
     }
-
-    // One config read for the whole call.
     let cfg = crate::config::get();
-
-  
     let count_gpu = *level >= PressureLevel::High;
-
     let active_pid = crate::plugin_server::get_active_foreground_pid();
-
-    // (priority, sort_footprint_kb, proc). gpu read once per candidate.
+    // (priority, sort_footprint_kb, proc). GPU read once per candidate.
     let mut candidates: Vec<(u8, u64, &Process)> = procs.iter()
         .filter(|p| p.rss_kb + p.swap_kb > 10 * 1024)
         .map(|p| {
             let mut prio = cfg.priority_for(&p.name, p.exe_basename.as_deref());
             if Some(p.pid) == active_pid {
+                // Floor at 20: saturating_sub alone can push a foreground app into the
+                // system/critical tier (<=19), accidentally granting full protection
+                // instead of merely lowering its eviction priority.
                 prio = std::cmp::max(prio.saturating_sub(25), 20);
             }
             let gpu_kb = if count_gpu {
@@ -100,20 +120,17 @@ pub fn plan(
             (prio, p.rss_kb.saturating_add(gpu_kb), *p)
         })
         .collect();
-
+    // Sort: highest priority score first (least important), then largest footprint, then high OOM score.
     candidates.sort_by(|(pa, fa, a), (pb, fb, b)| {
         pb.cmp(pa)
-            .then(fb.cmp(fa)) // rss + resident GPU — sort only
+            .then(fb.cmp(fa))
             .then(b.oom_score.cmp(&a.oom_score))
     });
-
     let mut decisions = vec![];
-
     for (prio, _sort_footprint_kb, proc) in candidates {
         if deficit <= 0 {
             break;
         }
-
         // Never touch the system/critical tier or the protect list.
         if prio <= 19 {
             continue;
@@ -121,21 +138,17 @@ pub fn plan(
         if cfg.is_protected(&proc.name) {
             continue;
         }
-
         let total_memory = proc.rss_kb + proc.swap_kb;
         let swap_ratio = if total_memory > 0 {
             proc.swap_kb as f64 / total_memory as f64
         } else {
             0.0
         };
-
         let checkpoint_override = cfg.checkpoint_override(&proc.name);
-        let action = decide_action(level, prio, swap_ratio, checkpoint_override, swap_exhausted);
-
+        let action = determine_process_action(level, prio, swap_ratio, checkpoint_override, swap_exhausted);
         if action == Action::None {
             continue;
         }
-
         let reason = format!(
             "priority={prio} rss={:.0}MB swap={:.0}MB swap_ratio={:.0}% deficit={:.0}MB",
             proc.rss_kb as f64 / 1024.0,
@@ -143,32 +156,35 @@ pub fn plan(
             swap_ratio * 100.0,
             deficit as f64 / 1024.0,
         );
-
-        // Freeze frees no RAM, so it doesn't count toward the deficit — expendable
-        // procs are still frozen to stop the bleeding, but the loop keeps going.
+        // NOTE: deficit is reduced by bare rss_kb, not rss_kb + gpu_kb, even at
+        // High pressure. GPU memory isn't reclaimed by kill/terminate directly
+        // (the driver frees it asynchronously), so counting it would cause the
+        // planner to underestimate how many processes need to be evicted.
+        // Revisit if gpu_kb becomes synchronously reclaimable.
+        //
+        // Freeze frees no RAM, so it doesn't count toward the deficit — the process
+        // is still frozen to stop allocation growth, but the loop keeps hunting.
         // Kill/Terminate/Checkpoint free full RSS; the next cycle re-measures.
         let freed = match action {
             Action::Freeze => 0,
             _ => proc.rss_kb as i64,
         };
         deficit -= freed;
-
-        decisions.push(Decision {
-            pid: proc.pid,
-            name: proc.name.clone(),
+        decisions.push(Decision::new(
+            proc.pid,
+            &proc.name,
             action,
-            rss_mb: proc.rss_kb as f64 / 1024.0,
-            swap_mb: proc.swap_kb as f64 / 1024.0,
+            proc.rss_kb as f64 / 1024.0,
+            proc.swap_kb as f64 / 1024.0,
             reason,
-        });
+        ));
     }
-
     decisions
 }
 
 /// Action for one process from pressure level, priority, swap ratio, and the
 /// per-process checkpoint override.
-fn decide_action(
+fn determine_process_action(
     level: &PressureLevel,
     prio: u8,
     swap_ratio: f64,
@@ -230,7 +246,7 @@ mod tests {
     use super::*;
 
     fn proc(name: &str, rss_kb: u64, swap_kb: u64) -> Process {
-        Process { pid: 1000, name: name.to_string(), exe_basename: None, rss_kb, swap_kb, oom_score: 0 }
+        Process { pid: 1000, name: name.to_string(), exe_basename: None, rss_kb, swap_kb, oom_score: 0, cgroup_path: None }
     }
 
     #[test]
@@ -328,13 +344,13 @@ mod tests {
 
     #[test]
     fn ram_deficit_positive_when_low() {
-        let deficit = ram_deficit_kb(1_000_000, 16_000_000);
+        let deficit = calculate_ram_deficit_kb(1_000_000, 16_000_000);
         assert!(deficit > 0);
     }
 
     #[test]
     fn ram_deficit_negative_when_plenty() {
-        let deficit = ram_deficit_kb(8_000_000, 16_000_000);
+        let deficit = calculate_ram_deficit_kb(8_000_000, 16_000_000);
         assert!(deficit < 0);
     }
 

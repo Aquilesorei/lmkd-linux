@@ -68,12 +68,36 @@ pub struct CheckpointResult {
     pub error: Option<String>,
 }
 
+impl CheckpointResult {
+    pub fn ok(pid: u32, snapshot_dir: PathBuf) -> Self {
+        Self { pid, success: true, snapshot_dir: Some(snapshot_dir), error: None }
+    }
+
+    pub fn err(pid: u32, error: impl Into<String>) -> Self {
+        Self { pid, success: false, snapshot_dir: None, error: Some(error.into()) }
+    }
+}
+
+
+
 #[derive(Debug)]
 #[allow(dead_code)]
 pub struct RestoreResult {
     pub success: bool,
     pub error: Option<String>,
 }
+
+impl RestoreResult {
+    pub fn ok() -> Self {
+        Self { success: true, error: None }
+    }
+
+    pub fn err(error: impl Into<String>) -> Self {
+        Self { success: false, error: Some(error.into()) }
+    }
+}
+
+
 
 /// Checkpoint a process using the mgd-checkpoint helper wrapper, then SIGKILL on success.
 pub fn checkpoint(pid: u32, name: &str) -> CheckpointResult {
@@ -87,34 +111,22 @@ pub fn checkpoint(pid: u32, name: &str) -> CheckpointResult {
         .join(format!(".local/share/mgd/snapshots/{}_{}", pid, safe_name));
 
     if let Err(e) = fs::create_dir_all(&snapshot_dir) {
-        return CheckpointResult {
-            pid,
-            success: false,
-            snapshot_dir: None,
-            error: Some(format!("Failed to create snapshot dir: {e}")),
-        };
+        return CheckpointResult::err(pid,format!("Failed to create snapshot dir: {e}"));
     }
 
     let snapshot_dir_str = match snapshot_dir.to_str() {
         Some(s) => s.to_string(),
         None => {
-            return CheckpointResult {
-                pid,
-                success: false,
-                snapshot_dir: None,
-                error: Some("snapshot path contains non-UTF8 characters".to_string()),
-            };
+            return CheckpointResult::err(pid,"snapshot path contains non-UTF8 characters");
         }
     };
 
     let Some(helper) = helper_path() else {
         let _ = fs::remove_dir_all(&snapshot_dir);
-        return CheckpointResult {
+        return CheckpointResult::err(
             pid,
-            success: false,
-            snapshot_dir: None,
-            error: Some("mgd-checkpoint helper not found (please install it to enable checkpointing)".to_string()),
-        };
+            "mgd-checkpoint helper not found (please install it to enable checkpointing)"
+        );
     };
 
     let output = Command::new(helper)
@@ -132,20 +144,10 @@ pub fn checkpoint(pid: u32, name: &str) -> CheckpointResult {
             if kill_ret != 0 {
                 let errno = io::Error::last_os_error().raw_os_error().unwrap_or(0);
                 if errno != libc::ESRCH { // ESRCH = already gone
-                    return CheckpointResult {
-                        pid,
-                        success: false,
-                        snapshot_dir: None,
-                        error: Some(format!("CRIU succeeded but SIGKILL failed: {}", io::Error::last_os_error())),
-                    };
+                    return CheckpointResult::err(pid,format!("CRIU succeeded but SIGKILL failed: {}", io::Error::last_os_error()))
                 }
             }
-            CheckpointResult {
-                pid,
-                success: true,
-                snapshot_dir: Some(snapshot_dir),
-                error: None,
-            }
+            CheckpointResult::ok(pid, snapshot_dir)
         }
         Ok(out) => {
             let _ = fs::remove_dir_all(&snapshot_dir);
@@ -162,20 +164,10 @@ pub fn checkpoint(pid: u32, name: &str) -> CheckpointResult {
             } else {
                 stderr
             };
-            CheckpointResult {
-                pid,
-                success: false,
-                snapshot_dir: None,
-                error: Some(error),
-            }
+            CheckpointResult::err(pid, error)
         }
         Err(e) => {
-            CheckpointResult {
-                pid,
-                success: false,
-                snapshot_dir: None,
-                error: Some(format!("Failed to run mgd-checkpoint helper: {e}")),
-            }
+            CheckpointResult::err(pid,format!("Failed to run mgd-checkpoint helper: {e}"))
         }
     }
 }
@@ -184,27 +176,18 @@ pub fn checkpoint(pid: u32, name: &str) -> CheckpointResult {
 #[allow(dead_code)]
 pub fn restore(snapshot_dir: &std::path::Path) -> RestoreResult {
     if !snapshot_dir.exists() {
-        return RestoreResult {
-            success: false,
-            error: Some(format!("Snapshot dir not found: {}", snapshot_dir.display())),
-        };
+        return RestoreResult::err(format!("Snapshot dir not found: {}", snapshot_dir.display()))
     }
 
     let snapshot_dir_str = match snapshot_dir.to_str() {
         Some(s) => s.to_string(),
         None => {
-            return RestoreResult {
-                success: false,
-                error: Some("snapshot path contains non-UTF8 characters".to_string()),
-            };
+            return RestoreResult::err("snapshot path contains non-UTF8 characters")
         }
     };
 
     let Some(helper) = helper_path() else {
-        return RestoreResult {
-            success: false,
-            error: Some("mgd-checkpoint helper not found (please install it to enable restore)".to_string()),
-        };
+        return RestoreResult::err("mgd-checkpoint helper not found (please install it to enable restore)")
     };
 
     let output = Command::new(helper)
@@ -216,7 +199,7 @@ pub fn restore(snapshot_dir: &std::path::Path) -> RestoreResult {
 
     match output {
         Ok(out) if out.status.success() => {
-            RestoreResult { success: true, error: None }
+            RestoreResult::ok()
         }
         Ok(out) => {
             let stderr = String::from_utf8_lossy(&out.stderr).to_string();
@@ -229,16 +212,10 @@ pub fn restore(snapshot_dir: &std::path::Path) -> RestoreResult {
             } else {
                 format!("mgd-checkpoint restore failed: {stderr}")
             };
-            RestoreResult {
-                success: false,
-                error: Some(error),
-            }
+            RestoreResult::err(error)
         }
         Err(e) => {
-            RestoreResult {
-                success: false,
-                error: Some(format!("Failed to run mgd-checkpoint helper: {e}")),
-            }
+            RestoreResult::err(format!("Failed to run mgd-checkpoint helper: {e}"))
         }
     }
 }

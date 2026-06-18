@@ -1,10 +1,10 @@
 
 use std::collections::{HashSet, HashMap};
-use crate::throttle::get_process_cgroup_path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
+use mgd_common::util::unix_timestamp_secs;
 
 
 use crate::engine::decision::{Action, Decision, plan, get_priority};
@@ -69,7 +69,8 @@ pub fn run(
     let mut pending_state = ControlState::Calm;
     let mut pending_ticks = 0usize;
     let mut throttle = crate::throttle::ThrottleManager::new();
-    let mut idle_reclaim_name_tracker: HashMap<String, std::time::Instant> = HashMap::new();
+    let mut idle_reclaim_pid_tracker: HashMap<u32, std::time::Instant> = HashMap::new();
+    let mut idle_freeze_pid_tracker: HashMap<u32, std::time::Instant> = HashMap::new();
     let mut last_idle_reclaim_check = std::time::Instant::now();
     let mut last_active_pid = None;
     let mut recently_killed_cgroups: HashMap<String, std::time::Instant> = HashMap::new();
@@ -110,7 +111,7 @@ pub fn run(
                                     procs.iter().filter(|p| !frozen_set.contains(&p.pid)).collect();
                                 let active_pid = crate::plugin_server::get_active_foreground_pid();
                                 check_idle_process_reclaim(
-                                    &plan_procs, active_pid, &mut idle_reclaim_name_tracker, &frozen, &log,
+                                    &plan_procs, active_pid, &mut idle_reclaim_pid_tracker, &mut idle_freeze_pid_tracker, &frozen, &log,
                                 );
                             }
                         }
@@ -245,6 +246,11 @@ pub fn run(
                     "[controller] Sustained Critical pressure with exhausted swap (>=98% used for {}s) — escalating to EMERGENCY to evict HIGH-tier candidates",
                     elapsed
                 );
+            } else {
+                mgd_common::sync_print!(
+                    "[controller] Escalating to EMERGENCY (composite pressure score threshold exceeded: score={:.2})",
+                    p_score
+                );
             }
         }
 
@@ -315,7 +321,7 @@ pub fn run(
             // Idle cgroup reclaim: only runs at Normal/Calm pressure
             if effective_level == PressureLevel::Normal {
                 if config.idle_reclaim_enabled {
-                    check_idle_process_reclaim(&plan_procs, active_pid, &mut idle_reclaim_name_tracker, &frozen, &log);
+                    check_idle_process_reclaim(&plan_procs, active_pid, &mut idle_reclaim_pid_tracker, &mut idle_freeze_pid_tracker, &frozen, &log);
                 }
             }
         }
@@ -344,8 +350,8 @@ pub fn run(
         let plan_procs: Vec<&Process> = procs.iter()
             .filter(|p| !frozen_set.contains(&p.pid))
             .filter(|p| {
-                if let Some(cgroup_path) = get_process_cgroup_path(p.pid) {
-                    if recently_killed_cgroups.contains_key(&cgroup_path) {
+                if let Some(ref cgroup_path) = p.cgroup_path {
+                    if recently_killed_cgroups.contains_key(cgroup_path) {
                         return false; // Skip recently targeted cgroup
                     }
                 }
@@ -370,7 +376,11 @@ pub fn run(
 
                 // Track recently terminated/killed cgroups
                 if d.action == Action::Kill || d.action == Action::Terminate {
-                    if let Some(cgroup_path) = get_process_cgroup_path(d.pid) {
+                    let cgroup_path = plan_procs.iter()
+                        .find(|p| p.pid == d.pid)
+                        .and_then(|p| p.cgroup_path.clone())
+                        .or_else(|| mgd_common::util::read_process_cgroup_path(d.pid));
+                    if let Some(cgroup_path) = cgroup_path {
                         recently_killed_cgroups.insert(cgroup_path, std::time::Instant::now());
                     }
                 }
@@ -401,6 +411,10 @@ pub(crate) fn apply_swap_overrides(
     let swap_near_full = swap_total_kb > 0 && swap_used_pct >= 98.0;
     let new_sustained = if swap_near_full && effective >= PressureLevel::Critical {
         sustained_start.or(Some(now))
+    } else if effective >= PressureLevel::Emergency {
+        // Already at Emergency (score-driven or prior escalation) — preserve the timer so
+        // a single cycle dip below 98% doesn't restart the 45 s window.
+        sustained_start
     } else {
         None
     };
@@ -415,19 +429,23 @@ pub(crate) fn apply_swap_overrides(
     (effective, new_sustained)
 }
 
+pub(crate) struct IdleReclaimConfig {
+    pub max_swap_occupancy_pct: f64,
+    pub idle_sec: u64,
+    pub rss_min_mb: u64,
+    pub reclaim_pct: u64,
+}
+
 /// Pure: returns (pid, reclaim_bytes) pairs for processes eligible for idle cgroup reclaim.
-/// Keyed by process name in background_tracker. No cgroup writes — caller handles I/O.
+/// Keyed by PID in background_tracker. No cgroup writes — caller handles I/O.
 pub(crate) fn select_idle_candidates(
     procs: &[&crate::monitor::process::Process],
     active_pid: Option<u32>,
-    background_tracker: &std::collections::HashMap<String, std::time::Instant>,
+    background_tracker: &std::collections::HashMap<u32, std::time::Instant>,
     swap_used_pct: f64,
-    max_swap_occupancy_pct: f64,
-    idle_sec: u64,
-    rss_min_mb: u64,
-    reclaim_pct: u64,
+    cfg: &IdleReclaimConfig,
 ) -> Vec<(u32, u64)> {
-    if swap_used_pct > max_swap_occupancy_pct {
+    if swap_used_pct > cfg.max_swap_occupancy_pct {
         return vec![];
     }
     let mut candidates = vec![];
@@ -439,17 +457,17 @@ pub(crate) fn select_idle_candidates(
         if prio < 50 {
             continue;
         }
-        if p.rss_kb < rss_min_mb * 1024 {
+        if p.rss_kb < cfg.rss_min_mb * 1024 {
             continue;
         }
         let duration = background_tracker
-            .get(&p.name)
+            .get(&p.pid)
             .map(|t| t.elapsed().as_secs())
             .unwrap_or(0);
-        if duration < idle_sec {
+        if duration < cfg.idle_sec {
             continue;
         }
-        let reclaim_bytes = (p.rss_kb * reclaim_pct / 100) * 1024;
+        let reclaim_bytes = (p.rss_kb * cfg.reclaim_pct / 100) * 1024;
         candidates.push((p.pid, reclaim_bytes));
     }
     candidates
@@ -525,7 +543,7 @@ fn check_cache_drop(level: &PressureLevel, log: &Logger) {
         return;
     }
 
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let now = unix_timestamp_secs();
     let last = LAST_CACHE_DROP.load(Ordering::Relaxed);
     if last != 0 && now.saturating_sub(last) < cooldown_secs {
         return;
@@ -598,9 +616,9 @@ fn execute_decision(
     log: &Logger,
 ) -> String {
     let (action_name, s) = match d.action {
-        Action::Freeze => ("FREEZE", execute_freeze(d, frozen)),
-        Action::Terminate => ("TERMINATE", execute_terminate(d)),
-        Action::Kill => ("KILL", execute_kill(d)),
+        Action::Freeze => ("FREEZE", freeze_process(d, frozen)),
+        Action::Terminate => ("TERMINATE", terminate_process(d)),
+        Action::Kill => ("KILL", kill_process(d)),
         Action::Checkpoint => ("CHECKPOINT", execute_checkpoint(d, checkpointed)),
         Action::None => return String::new(),
     };
@@ -608,7 +626,7 @@ fn execute_decision(
     s
 }
 
-fn execute_freeze(d: &Decision, frozen: &Arc<Mutex<FrozenRegistry>>) -> String {
+fn freeze_process(d: &Decision, frozen: &Arc<Mutex<FrozenRegistry>>) -> String {
     // Abort if start_time is gone rather than freeze a recycled PID.
     let st = match crate::executor::read_start_time(d.pid) {
         Some(t) => t,
@@ -627,18 +645,21 @@ fn execute_freeze(d: &Decision, frozen: &Arc<Mutex<FrozenRegistry>>) -> String {
     }
 }
 
-fn execute_terminate(d: &Decision) -> String {
+fn terminate_process(d: &Decision) -> String {
     // SIGTERM→wait→SIGKILL blocks up to 5s; run it off-thread so the responder
     // isn't stalled per process at Critical.
     let pid = d.pid;
-    std::thread::spawn(move || { crate::executor::killer::terminate(pid); });
+    std::thread::spawn(move || { crate::executor::killer::sigterm(pid); });
     "terminating (async SIGTERM→SIGKILL)".into()
 }
 
-fn execute_kill(d: &Decision) -> String {
-    let r = crate::executor::killer::kill(d.pid);
-    if r.success { "killed".into() }
-    else { format!("fail: {}", r.error.unwrap_or_default()) }
+fn kill_process(d: &Decision) -> String {
+    let r = crate::executor::killer::sigkill(d.pid);
+
+    match r.error {
+        None => "killed".to_string(),
+        Some(err) => format!("fail: {}", err),
+    }
 }
 
 fn execute_checkpoint(d: &Decision, checkpointed: &Arc<Mutex<CheckpointRegistry>>) -> String {
@@ -649,32 +670,28 @@ fn execute_checkpoint(d: &Decision, checkpointed: &Arc<Mutex<CheckpointRegistry>
             .add(d.pid, &d.name, dir.clone(), d.rss_mb as u64 * 1024);
         format!("checkpointed → {dir:?}")
     } else {
-        let kr = crate::executor::killer::kill(d.pid);
+        let kr = crate::executor::killer::sigkill(d.pid);
         if kr.success { "killed (CRIU failed)".into() }
         else { format!("kill_fail: {}", kr.error.unwrap_or_default()) }
     }
 }
 
-fn reclaim_process_cgroup(pid: u32, bytes: u64) -> Result<(), std::io::Error> {
-    let cgroup_file = format!("/proc/{}/cgroup", pid);
-    let content = std::fs::read_to_string(&cgroup_file)?;
-    for line in content.lines() {
-        if let Some(path) = line.strip_prefix("0::") {
-            let path = path.trim();
-            if path == "/" {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    "cannot reclaim root cgroup",
-                ));
-            }
-            let reclaim_path = std::path::Path::new("/sys/fs/cgroup")
-                .join(path.trim_start_matches('/'))
-                .join("memory.reclaim");
-            if reclaim_path.exists() {
-                std::fs::write(&reclaim_path, format!("{}", bytes))?;
-                return Ok(());
-            }
-        }
+fn reclaim_cgroup(cgroup_path: &str, bytes_size: u64) -> Result<(), std::io::Error> {
+
+    if bytes_size == 0 {
+        return Ok(());
+    }
+
+    if cgroup_path == "/" {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "cannot reclaim root cgroup",
+        ));
+    }
+    let reclaim_path = crate::throttle::cgroup_sysfs_path(cgroup_path, "memory.reclaim");
+    if reclaim_path.exists() {
+        std::fs::write(&reclaim_path, format!("{}", bytes_size))?;
+        return Ok(());
     }
     Err(std::io::Error::new(std::io::ErrorKind::NotFound, "cgroup memory.reclaim not found"))
 }
@@ -689,10 +706,7 @@ fn check_early_process_reclaim(
         return;
     }
 
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+    let now = unix_timestamp_secs();
     let last = LAST_EARLY_RECLAIM.load(Ordering::Relaxed);
     if last != 0 && now.saturating_sub(last) < 30 {
         return; // 30s cooldown
@@ -717,12 +731,13 @@ fn check_early_process_reclaim(
     targets.sort_by_key(|p| std::cmp::Reverse(p.rss_kb));
 
     for p in targets.iter().take(3) {
-        let reclaim_bytes = (p.rss_kb / 2) * 1024; // reclaim 50% of RSS
-        match reclaim_process_cgroup(p.pid, reclaim_bytes) {
+        let reclaim_bytes_size = (p.rss_kb / 2) * 1024; // reclaim 50% of RSS
+        let Some(cgroup) = p.cgroup_path.as_deref() else { continue };
+        match reclaim_cgroup(cgroup, reclaim_bytes_size) {
             Ok(()) => {
                 mgd_common::sync_print!(
                     "[reclaim] Proactively pushed ~{}MB of background PID {} ({}) to Zram",
-                    reclaim_bytes / (1024 * 1024),
+                    reclaim_bytes_size / (1024 * 1024),
                     p.pid,
                     p.name
                 );
@@ -730,17 +745,17 @@ fn check_early_process_reclaim(
                     "EARLY_RECLAIM",
                     p.pid,
                     &p.name,
-                    (reclaim_bytes / (1024 * 1024)) as f64,
+                    (reclaim_bytes_size / (1024 * 1024)) as f64,
                     "pushed to zram via cgroup reclaim",
                 ));
             }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                // EAGAIN: nothing reclaimable right now, skip silently.
+            }
             Err(e) => {
-                // Ignore transient errors, log at debug
                 mgd_common::sync_print!(
                     "[reclaim] Early reclaim failed for PID {} ({}): {}",
-                    p.pid,
-                    p.name,
-                    e
+                    p.pid, p.name, e
                 );
             }
         }
@@ -750,7 +765,8 @@ fn check_early_process_reclaim(
 fn check_idle_process_reclaim(
     plan_procs: &[&Process],
     active_pid: Option<u32>,
-    name_tracker: &mut HashMap<String, std::time::Instant>,
+    pid_tracker: &mut HashMap<u32, std::time::Instant>,
+    freeze_pid_tracker: &mut HashMap<u32, std::time::Instant>,
     frozen: &Arc<Mutex<FrozenRegistry>>,
     log: &Logger,
 ) {
@@ -768,42 +784,43 @@ fn check_idle_process_reclaim(
         0.0
     };
 
-    // Prune dead process-name entries from the tracker
-    let active_names: HashSet<&str> = plan_procs.iter().map(|p| p.name.as_str()).collect();
-    name_tracker.retain(|name, _| active_names.contains(name.as_str()));
+    // Prune entries for processes no longer alive (shared by both reclaim and freeze trackers)
+    let live_pids: HashSet<u32> = plan_procs.iter().map(|p| p.pid).collect();
+    pid_tracker.retain(|pid, _| live_pids.contains(pid));
 
     // Delegate candidate selection to the pure helper
-    let candidates = select_idle_candidates(
-        plan_procs,
-        active_pid,
-        name_tracker,
-        swap_used_pct,
-        config.idle_reclaim_max_swap_occupancy_pct,
-        config.idle_reclaim_sec,
-        config.idle_reclaim_rss_min_mb,
-        config.idle_reclaim_pct,
-    );
+    let idle_cfg = IdleReclaimConfig {
+        max_swap_occupancy_pct: config.idle_reclaim_max_swap_occupancy_pct,
+        idle_sec: config.idle_reclaim_sec,
+        rss_min_mb: config.idle_reclaim_rss_min_mb,
+        reclaim_pct: config.idle_reclaim_pct,
+    };
+    let candidates = select_idle_candidates(plan_procs, active_pid, pid_tracker, swap_used_pct, &idle_cfg);
 
     // Start the background clock for all eligible processes not yet tracked
     for p in plan_procs {
         if Some(p.pid) != active_pid {
-            name_tracker.entry(p.name.clone()).or_insert_with(std::time::Instant::now);
+            pid_tracker.entry(p.pid).or_insert_with(std::time::Instant::now);
         }
     }
 
     // Execute: write to each candidate's cgroup memory.reclaim (cap at 3)
-    for (i, (pid, reclaim_bytes)) in candidates.iter().enumerate() {
+    for (i, (pid, bytes_to_reclaim_size)) in candidates.iter().enumerate() {
         if i >= 3 { break; }
-        if *reclaim_bytes == 0 { continue; }
+        if *bytes_to_reclaim_size == 0 { continue; }
 
         let proc_entry = plan_procs.iter().find(|p| p.pid == *pid).copied();
         let name = proc_entry.map(|p| p.name.as_str()).unwrap_or("unknown");
+        let cgroup = match proc_entry.and_then(|p| p.cgroup_path.as_deref()) {
+            Some(c) => c,
+            None => continue,
+        };
 
-        match reclaim_process_cgroup(*pid, *reclaim_bytes) {
+        match reclaim_cgroup(cgroup, *bytes_to_reclaim_size) {
             Ok(()) => {
                 mgd_common::sync_print!(
                     "[reclaim] Proactively reclaimed ~{}MB from idle background process {} (PID {})",
-                    reclaim_bytes / (1024 * 1024),
+                    bytes_to_reclaim_size / (1024 * 1024),
                     name,
                     pid
                 );
@@ -812,12 +829,17 @@ fn check_idle_process_reclaim(
                         "EARLY_RECLAIM",
                         p.pid,
                         &p.name,
-                        (*reclaim_bytes / (1024 * 1024)) as f64,
+                        (*bytes_to_reclaim_size / (1024 * 1024)) as f64,
                         "proactively pushed idle process to zram",
                     ));
                 }
                 // Reset timer → serves as per-process cooldown
-                name_tracker.insert(name.to_string(), std::time::Instant::now());
+                pid_tracker.insert(*pid, std::time::Instant::now());
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                // EAGAIN: kernel has nothing reclaimable right now — not an error.
+                // Reset timer so we back off for a full idle_sec before retrying.
+                pid_tracker.insert(*pid, std::time::Instant::now());
             }
             Err(e) => {
                 mgd_common::sync_print!(
@@ -828,7 +850,10 @@ fn check_idle_process_reclaim(
         }
     }
 
-    // Proactive idle freeze: SIGSTOP processes idle >= freeze_after_sec
+    // Proactive idle freeze: SIGSTOP processes idle >= freeze_after_sec.
+    // Uses a PID-keyed tracker so duplicate process names don't share timers.
+    freeze_pid_tracker.retain(|pid, _| live_pids.contains(pid));
+
     if let Some(freeze_secs) = config.idle_reclaim_freeze_after_sec {
         let mut freeze_count = 0;
         for p in plan_procs {
@@ -836,9 +861,11 @@ fn check_idle_process_reclaim(
             if Some(p.pid) == active_pid { continue; }
             if p.rss_kb < config.idle_reclaim_rss_min_mb * 1024 { continue; }
 
-            let elapsed = name_tracker.get(&p.name)
-                .map(|t| t.elapsed().as_secs())
-                .unwrap_or(0);
+            let elapsed = freeze_pid_tracker
+                .entry(p.pid)
+                .or_insert_with(std::time::Instant::now)
+                .elapsed()
+                .as_secs();
             if elapsed < freeze_secs { continue; }
 
             let st = match crate::executor::read_start_time(p.pid) {
@@ -859,7 +886,7 @@ fn check_idle_process_reclaim(
                         p.rss_kb as f64 / 1024.0,
                         "proactively froze idle background process",
                     ));
-                    name_tracker.remove(&p.name);
+                    freeze_pid_tracker.remove(&p.pid);
                     freeze_count += 1;
                 } else {
                     crate::executor::freezer::unfreeze(p.pid);
@@ -886,12 +913,17 @@ mod tests {
             rss_kb,
             swap_kb: 0,
             oom_score: 0,
+            cgroup_path: None,
         }
     }
 
-    fn make_tracker(name: &str, secs_ago: u64) -> HashMap<String, Instant> {
+    fn default_idle_cfg() -> IdleReclaimConfig {
+        IdleReclaimConfig { max_swap_occupancy_pct: 60.0, idle_sec: 180, rss_min_mb: 50, reclaim_pct: 20 }
+    }
+
+    fn make_pid_tracker(pid: u32, secs_ago: u64) -> HashMap<u32, Instant> {
         let mut m = HashMap::new();
-        m.insert(name.to_string(), Instant::now() - Duration::from_secs(secs_ago));
+        m.insert(pid, Instant::now() - Duration::from_secs(secs_ago));
         m
     }
 
@@ -970,47 +1002,42 @@ mod tests {
     #[test]
     fn idle_reclaim_skips_foreground_pid() {
         let p = make_process(1234, "firefox", 200_000);
-        let tracker = make_tracker("firefox", 300);
-        let r = select_idle_candidates(&[&p], Some(1234), &tracker, 10.0, 60.0, 180, 50, 20);
+        let r = select_idle_candidates(&[&p], Some(1234), &make_pid_tracker(1234, 300), 10.0, &default_idle_cfg());
         assert!(r.is_empty());
     }
 
     #[test]
     fn idle_reclaim_skips_rss_below_minimum() {
         let p = make_process(5678, "app", 40 * 1024); // 40 MB < 50 MB min
-        let tracker = make_tracker("app", 300);
-        let r = select_idle_candidates(&[&p], None, &tracker, 10.0, 60.0, 180, 50, 20);
+        let r = select_idle_candidates(&[&p], None, &make_pid_tracker(5678, 300), 10.0, &default_idle_cfg());
         assert!(r.is_empty());
     }
 
     #[test]
     fn idle_reclaim_skips_swap_saturated() {
         let p = make_process(5678, "app", 200_000);
-        let tracker = make_tracker("app", 300);
-        let r = select_idle_candidates(&[&p], None, &tracker, 61.0, 60.0, 180, 50, 20);
+        let r = select_idle_candidates(&[&p], None, &make_pid_tracker(5678, 300), 61.0, &default_idle_cfg());
         assert!(r.is_empty());
     }
 
     #[test]
     fn idle_reclaim_skips_not_yet_idle() {
         let p = make_process(5678, "app", 200_000);
-        let tracker = make_tracker("app", 100); // 100s < 180s
-        let r = select_idle_candidates(&[&p], None, &tracker, 10.0, 60.0, 180, 50, 20);
+        let r = select_idle_candidates(&[&p], None, &make_pid_tracker(5678, 100), 10.0, &default_idle_cfg());
         assert!(r.is_empty());
     }
 
     #[test]
     fn idle_reclaim_skips_not_in_tracker() {
         let p = make_process(5678, "app", 200_000);
-        let r = select_idle_candidates(&[&p], None, &HashMap::new(), 10.0, 60.0, 180, 50, 20);
+        let r = select_idle_candidates(&[&p], None, &HashMap::<u32, Instant>::new(), 10.0, &default_idle_cfg());
         assert!(r.is_empty());
     }
 
     #[test]
     fn idle_reclaim_selects_eligible() {
         let p = make_process(5678, "app", 200_000);
-        let tracker = make_tracker("app", 300);
-        let r = select_idle_candidates(&[&p], None, &tracker, 10.0, 60.0, 180, 50, 20);
+        let r = select_idle_candidates(&[&p], None, &make_pid_tracker(5678, 300), 10.0, &default_idle_cfg());
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].0, 5678);
         assert_eq!(r[0].1, 40_000 * 1024); // 20% of 200_000 KB * 1024
@@ -1020,9 +1047,9 @@ mod tests {
     fn idle_reclaim_selects_multiple() {
         let p1 = make_process(100, "app_a", 100_000);
         let p2 = make_process(200, "app_b", 150_000);
-        let mut tracker = make_tracker("app_a", 300);
-        tracker.insert("app_b".to_string(), Instant::now() - Duration::from_secs(250));
-        let r = select_idle_candidates(&[&p1, &p2], None, &tracker, 10.0, 60.0, 180, 50, 10);
+        let mut tracker = make_pid_tracker(100, 300);
+        tracker.insert(200, Instant::now() - Duration::from_secs(250));
+        let r = select_idle_candidates(&[&p1, &p2], None, &tracker, 10.0, &IdleReclaimConfig { max_swap_occupancy_pct: 60.0, idle_sec: 180, rss_min_mb: 50, reclaim_pct: 10 });
         assert_eq!(r.len(), 2);
         let pids: Vec<u32> = r.iter().map(|(pid, _)| *pid).collect();
         assert!(pids.contains(&100));

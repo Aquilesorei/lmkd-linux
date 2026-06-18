@@ -15,7 +15,7 @@ use std::time::Duration;
 use std::collections::HashMap;
 use crate::executor::registry::{CheckpointRegistry, FrozenRegistry};
 use crate::monitor;
-use crate::throttle::{ThrottledState, get_process_cgroup_path};
+use crate::throttle::ThrottledState;
 
 type ThrottleSnapshot = Arc<Mutex<HashMap<String, ThrottledState>>>;
 
@@ -212,8 +212,8 @@ fn cmd_list(frozen: &Arc<Mutex<FrozenRegistry>>, throttle_snapshot: &ThrottleSna
         .iter()
         .filter(|p| !frozen_pids.contains(&p.pid))
         .filter_map(|p| {
-            let cgroup = get_process_cgroup_path(p.pid)?;
-            let state = throttle.get(&cgroup)?;
+            let cgroup = p.cgroup_path.as_deref()?;
+            let state = throttle.get(cgroup)?;
             let tag = match state {
                 ThrottledState::WeightOnly => "[THROTTLED:light]",
                 ThrottledState::Full       => "[THROTTLED:heavy]",

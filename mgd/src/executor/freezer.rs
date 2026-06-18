@@ -17,10 +17,10 @@ pub fn unfreeze(pid: u32) -> OpResult {
 pub fn unfreeze_checked(pid: u32, expected_start_time: u64) -> OpResult {
     match read_start_time(pid) {
         Some(st) if st != expected_start_time => {
-            OpResult { pid, success: true, error: None }
+            OpResult::success(pid)
         }
         None => {
-            OpResult { pid, success: true, error: None }
+            OpResult::success(pid)
         }
         _ => send_signal(pid, libc::SIGCONT),
     }
@@ -30,20 +30,27 @@ pub fn unfreeze_checked(pid: u32, expected_start_time: u64) -> OpResult {
 pub fn freeze_checked(pid: u32, expected_start_time: u64) -> OpResult {
     match read_start_time(pid) {
         Some(st) if st != expected_start_time => {
-            OpResult { pid, success: false, error: Some("PID recycled — aborting freeze".into()) }
+            OpResult::fail(pid, "PID recycled — aborting freeze")
         }
         None => {
-            OpResult { pid, success: false, error: Some("process gone".into()) }
+            OpResult::fail(pid, "process gone")
         }
         _ => send_signal(pid, libc::SIGSTOP),
     }
 }
 
 fn send_signal(pid: u32, signal: i32) -> OpResult {
-    let result = unsafe { libc::kill(pid as i32, signal) };
+    // Ensure the PID converts safely to an i32
+    let target_pid = match i32::try_from(pid) {
+        Ok(p) => p,
+        Err(_) => return OpResult::fail(pid, "Invalid PID: exceeds i32 limits"),
+    };
+
+    let result = unsafe { libc::kill(target_pid, signal) };
+
     if result == 0 {
-        OpResult { pid, success: true, error: None }
+        OpResult::success(pid)
     } else {
-        OpResult { pid, success: false, error: Some(io::Error::last_os_error().to_string()) }
+        OpResult::fail(pid, std::io::Error::last_os_error().to_string())
     }
 }

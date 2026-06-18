@@ -52,7 +52,7 @@ impl PsiTrigger {
 
         // elevated_pct of the 1,000,000 us window (default 5% → 50,000 us)
         let stall_us = (crate::config::get().psi.elevated_pct / 100.0 * 1_000_000.0) as u64;
-        file.write_all(format!("some {stall_us} 1000000\0").as_bytes())?;
+        file.write_all(format!("some {stall_us} 1000000").as_bytes())?;
 
         Ok(PsiTrigger { file, source: path })
     }

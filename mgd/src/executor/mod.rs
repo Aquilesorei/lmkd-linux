@@ -14,6 +14,26 @@ pub struct OpResult {
     pub error: Option<String>,
 }
 
+
+impl OpResult {
+    /// Create a successful operation result.
+    pub fn success(pid: u32) -> Self {
+        Self {
+            pid,
+            success: true,
+            error: None,
+        }
+    }
+
+    /// Create a failed operation result with a dynamic error message.
+    pub fn fail<S: Into<String>>(pid: u32, error: S) -> Self {
+        Self {
+            pid,
+            success: false,
+            error: Some(error.into()),
+        }
+    }
+}
 /// Read process start time from /proc/pid/stat (field 22, clock ticks since boot).
 /// Uses rsplit_once to find the *last* ") " — handles comm names containing ")".
 pub fn read_start_time(pid: u32) -> Option<u64> {

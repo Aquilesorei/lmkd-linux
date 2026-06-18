@@ -114,13 +114,7 @@ pub fn broadcast_pressure(level: &str) {
 
 
 
-/// Takes ownership of a `UnixStream` that has been identified as a plugin connection.
-/// 
-/// This function converts the socket into a bidirectional session:
-/// 1. It spawns a background writer thread that listens for `CoreMessage` broadcasts 
-///    (e.g., global pressure changes, approval responses) and flushes them to the plugin.
-/// 2. It blocks the current thread in a loop, continually parsing incoming `PluginMessage`s 
-///    (e.g., GPU observations, ActionRequests) and routing them to the Core.
+
 pub fn serve_plugin_connection(
     stream: UnixStream,
     first_line: String,
@@ -187,7 +181,7 @@ fn process_plugin_line(line: &str) {
                 PluginAction::KillPid { pid } => {
                     let pid = *pid;
                     std::thread::spawn(move || {
-                        let _ = crate::executor::killer::terminate(pid);
+                        let _ = crate::executor::killer::sigterm(pid);
                     });
                 }
                 _ => {} // Other actions (like RestartProcess) are delegated back to the plugin to execute

@@ -36,13 +36,13 @@ fn main() {
 
     try_elevate_scheduler_priority();
 
-    cleanup_orphaned_snapshots();
+    let frozen = Arc::new(Mutex::new(FrozenRegistry::load()));
+    let checkpointed = Arc::new(Mutex::new(CheckpointRegistry::load()));
+
+    cleanup_orphaned_snapshots(&checkpointed);
     print_startup_banner();
 
     plugin_server::init_plugins();
-
-    let frozen = Arc::new(Mutex::new(FrozenRegistry::load()));
-    let checkpointed = Arc::new(Mutex::new(CheckpointRegistry::load()));
 
     // Passive calibration aggregates survive restarts (suggestions need days
     // of observation). Maintenance flushes periodically; main flushes at exit.
@@ -58,15 +58,14 @@ fn main() {
         libc::signal(libc::SIGHUP,  handle_sighup  as *const () as libc::sighandler_t);
     }
 
-    // Doorbell: evictor rings it when it adds to frozen/checkpointed registries.
-    // Recovery sleeps on it when both registries are empty.
+
     let recovery_wake: Arc<(Mutex<bool>, Condvar)> = Arc::new((Mutex::new(false), Condvar::new()));
 
     // Throttle state snapshot: written by evictor, read by IPC for `mgctl list`.
     let throttle_snapshot: Arc<Mutex<std::collections::HashMap<String, throttle::ThrottledState>>> =
         Arc::new(Mutex::new(std::collections::HashMap::new()));
 
-    // ── Actor threads ─────────────────────────────────────────────────────────
+    //Actotd
     let responder = {
         let f = Arc::clone(&frozen);
         let c = Arc::clone(&checkpointed);
@@ -167,14 +166,26 @@ fn print_startup_banner() {
     println!("Press Ctrl+C to stop\n");
 }
 
-/// Remove snapshot dirs left by a previous crash — the registry isn't persisted.
-fn cleanup_orphaned_snapshots() {
+/// Remove snapshot dirs not tracked in the persisted CheckpointRegistry.
+fn cleanup_orphaned_snapshots(checkpointed: &Arc<Mutex<CheckpointRegistry>>) {
     let dir = mgd_common::util::home_dir().join(".local/share/mgd/snapshots");
     let Ok(entries) = std::fs::read_dir(&dir) else { return };
+
+    let active_dirs: std::collections::HashSet<std::path::PathBuf> = {
+        let reg = checkpointed.lock().unwrap();
+        reg.entries_lightest_first()
+            .into_iter()
+            .map(|(_, _, path, _, _)| path)
+            .collect()
+    };
+
     for entry in entries.flatten() {
         if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-            if std::fs::remove_dir_all(entry.path()).is_ok() {
-                locked_print(&format!("[startup] Removed orphaned snapshot: {:?}", entry.path()));
+            let path = entry.path();
+            if !active_dirs.contains(&path) {
+                if std::fs::remove_dir_all(&path).is_ok() {
+                    locked_print(&format!("[startup] Removed orphaned snapshot: {:?}", path));
+                }
             }
         }
     }

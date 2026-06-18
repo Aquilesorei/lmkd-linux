@@ -24,12 +24,16 @@ impl ThrottleManager {
     pub(crate) fn update(&mut self, plan_procs: &[&Process], active_pid: Option<u32>) {
         let mut cgroup_groups: HashMap<String, Vec<&Process>> = HashMap::new();
         for p in plan_procs {
-            if let Some(path) = get_process_cgroup_path(p.pid) {
+            if let Some(path) = p.cgroup_path.clone() {
                 cgroup_groups.entry(path).or_default().push(p);
             }
         }
 
-        let foreground_cgroup = active_pid.and_then(|pid| get_process_cgroup_path(pid));
+        let foreground_cgroup = active_pid.and_then(|apid| {
+            plan_procs.iter()
+                .find(|p| p.pid == apid)
+                .and_then(|p| p.cgroup_path.clone())
+        });
 
         let active_cgroups: HashSet<&String> = cgroup_groups.keys().collect();
         self.tracker.retain(|p, _| active_cgroups.contains(p));
@@ -40,8 +44,7 @@ impl ThrottleManager {
 
             if Some(cgroup_path) == foreground_cgroup.as_ref() {
                 if current != ThrottledState::None {
-                    let _ = write_cgroup_cpu_weight(cgroup_path, 100);
-                    let _ = write_cgroup_cpu_max(cgroup_path, "max 100000");
+                    restore_cgroup_cpu(cgroup_path);
                     self.states.insert(cgroup_path.clone(), ThrottledState::None);
                     mgd_common::sync_print!(
                         "[throttle] Restored foreground cgroup {} to normal CPU shares",
@@ -64,8 +67,7 @@ impl ThrottleManager {
 
             if min_priority < 60 {
                 if current != ThrottledState::None {
-                    let _ = write_cgroup_cpu_weight(cgroup_path, 100);
-                    let _ = write_cgroup_cpu_max(cgroup_path, "max 100000");
+                    restore_cgroup_cpu(cgroup_path);
                     self.states.insert(cgroup_path.clone(), ThrottledState::None);
                     mgd_common::sync_print!(
                         "[throttle] Restored background cgroup {} to normal CPU shares (priority < 60)",
@@ -91,8 +93,7 @@ impl ThrottleManager {
             if target != current {
                 match target {
                     ThrottledState::None => {
-                        let _ = write_cgroup_cpu_weight(cgroup_path, 100);
-                        let _ = write_cgroup_cpu_max(cgroup_path, "max 100000");
+                        restore_cgroup_cpu(cgroup_path);
                         mgd_common::sync_print!("[throttle] Unthrottled cgroup {}", cgroup_path);
                     }
                     ThrottledState::WeightOnly => {
@@ -123,8 +124,7 @@ impl ThrottleManager {
     /// Restore all throttled cgroups to default CPU shares. Called on daemon shutdown.
     pub(crate) fn restore_all(&self) {
         for path in self.states.keys() {
-            let _ = write_cgroup_cpu_weight(path, 100);
-            let _ = write_cgroup_cpu_max(path, "max 100000");
+            restore_cgroup_cpu(path);
         }
     }
 
@@ -133,23 +133,19 @@ impl ThrottleManager {
     }
 }
 
-pub(crate) fn get_process_cgroup_path(pid: u32) -> Option<String> {
-    let content = std::fs::read_to_string(format!("/proc/{}/cgroup", pid)).ok()?;
-    for line in content.lines() {
-        if let Some(path) = line.strip_prefix("0::") {
-            let path = path.trim();
-            if path != "/" {
-                return Some(path.to_string());
-            }
-        }
-    }
-    None
+pub(crate) fn cgroup_sysfs_path(cgroup_path: &str, attr: &str) -> std::path::PathBuf {
+    std::path::Path::new("/sys/fs/cgroup")
+        .join(cgroup_path.trim_start_matches('/'))
+        .join(attr)
+}
+
+fn restore_cgroup_cpu(path: &str) {
+    let _ = write_cgroup_cpu_weight(path, 100);
+    let _ = write_cgroup_cpu_max(path, "max 100000");
 }
 
 pub(crate) fn write_cgroup_cpu_weight(cgroup_path: &str, weight: u32) -> Result<(), std::io::Error> {
-    let path = std::path::Path::new("/sys/fs/cgroup")
-        .join(cgroup_path.trim_start_matches('/'))
-        .join("cpu.weight");
+    let path = cgroup_sysfs_path(cgroup_path, "cpu.weight");
     if path.exists() {
         std::fs::write(&path, format!("{}", weight))?;
         return Ok(());
@@ -158,9 +154,7 @@ pub(crate) fn write_cgroup_cpu_weight(cgroup_path: &str, weight: u32) -> Result<
 }
 
 pub(crate) fn write_cgroup_cpu_max(cgroup_path: &str, max_limit: &str) -> Result<(), std::io::Error> {
-    let path = std::path::Path::new("/sys/fs/cgroup")
-        .join(cgroup_path.trim_start_matches('/'))
-        .join("cpu.max");
+    let path = cgroup_sysfs_path(cgroup_path, "cpu.max");
     if path.exists() {
         std::fs::write(&path, max_limit)?;
         return Ok(());

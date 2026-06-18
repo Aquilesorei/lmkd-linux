@@ -117,7 +117,7 @@ fn validate_dump(caller_uid: u32, pid: u32, images_dir: &str) -> Result<(), Stri
     for line in cgroup_data.lines() {
         if let Some(path) = line.strip_prefix("0::") {
             let path = path.trim();
-            if path.starts_with("/user.slice/") || path.contains("/user.slice/") {
+            if path.starts_with("/user.slice/") {
                 in_user_slice = true;
                 break;
             }
@@ -190,7 +190,7 @@ fn setup_ambient_capabilities() -> Result<(), String> {
 
     unsafe {
         let mut header = CapHeader {
-            version: 0x20080302, // _LINUX_CAPABILITY_VERSION_3
+            version: 0x20080522, // _LINUX_CAPABILITY_VERSION_3
             pid: 0,
         };
         let mut data = [CapData::default(); 2];
@@ -216,6 +216,7 @@ fn setup_ambient_capabilities() -> Result<(), String> {
         }
 
         // 4. Raise ambient capabilities
+        let mut raised = 0u32;
         for cap in &[CAP_SYS_PTRACE, CAP_NET_ADMIN, CAP_CHECKPOINT_RESTORE] {
             let idx = (cap / 32) as usize;
             let bit = 1 << (cap % 32);
@@ -226,7 +227,13 @@ fn setup_ambient_capabilities() -> Result<(), String> {
                         std::io::Error::last_os_error()
                     ));
                 }
+                raised += 1;
             }
+        }
+        if raised == 0 {
+            return Err(
+                "no required capabilities in Permitted set — run install.sh to apply setcap on mgd-checkpoint".to_string()
+            );
         }
     }
     Ok(())

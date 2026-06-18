@@ -5,7 +5,8 @@ use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
+use mgd_common::util::unix_timestamp_secs;
 use mgd_common::protocol::{CoreMessage, PluginAction, PluginMessage};
 
 const PLUGIN_NAME: &str = "mgd-kde";
@@ -56,7 +57,7 @@ fn main() {
                             mgd_common::sync_print!("[mgd-kde] action denied: {:?}", reason);
                         } else if let PluginAction::RestartProcess { name } = action {
                             if name == "plasmashell" {
-                                let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+                                let now = unix_timestamp_secs();
                                 LAST_PLASMA_RESTART.store(now, Ordering::SeqCst);
                                 let _ = std::process::Command::new("systemctl")
                                     .arg("--user")
@@ -105,29 +106,99 @@ fn get_process_ticks(pid: u32) -> Option<u64> {
     }
 }
 
+fn default_plasma_cooldown_min() -> u64 { 30 }
+fn default_plasma_gpu_threshold_mb() -> u64 { 1024 }
+fn default_discover_cooldown_min() -> u64 { 30 }
+fn default_discover_idle_check_secs() -> u64 { 60 }
+fn default_discover_rss_threshold_mb() -> u64 { 400 }
+
+#[derive(serde::Deserialize)]
+struct PlasmaConfig {
+    #[serde(default = "default_plasma_cooldown_min")]
+    min_restart_interval_min: u64,
+    #[serde(default = "default_plasma_gpu_threshold_mb")]
+    gpu_leak_threshold_mb: u64,
+}
+
+impl Default for PlasmaConfig {
+    fn default() -> Self {
+        PlasmaConfig {
+            min_restart_interval_min: default_plasma_cooldown_min(),
+            gpu_leak_threshold_mb: default_plasma_gpu_threshold_mb(),
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct PlasmaDiscoverConfig {
+    #[serde(default = "default_discover_cooldown_min")]
+    cooldown_min: u64,
+    #[serde(default = "default_discover_idle_check_secs")]
+    idle_check_secs: u64,
+    #[serde(default = "default_discover_rss_threshold_mb")]
+    rss_threshold_mb: u64,
+}
+
+impl Default for PlasmaDiscoverConfig {
+    fn default() -> Self {
+        PlasmaDiscoverConfig {
+            cooldown_min: default_discover_cooldown_min(),
+            idle_check_secs: default_discover_idle_check_secs(),
+            rss_threshold_mb: default_discover_rss_threshold_mb(),
+        }
+    }
+}
+
+#[derive(serde::Deserialize, Default)]
+struct PluginConfig {
+    #[serde(default)]
+    plasma: PlasmaConfig,
+    #[serde(default)]
+    plasma_discover: PlasmaDiscoverConfig,
+}
+
+static PLUGIN_CONFIG: std::sync::OnceLock<PluginConfig> = std::sync::OnceLock::new();
+
+fn load_plugin_config() -> &'static PluginConfig {
+    PLUGIN_CONFIG.get_or_init(|| {
+        let home = std::env::var("HOME").unwrap_or_default();
+        let paths = [
+            std::path::PathBuf::from(&home).join(".config/mgd/priorities.toml"),
+            std::path::PathBuf::from("/etc/mgd/priorities.toml"),
+        ];
+        for path in &paths {
+            if let Ok(content) = std::fs::read_to_string(path) {
+                if let Ok(cfg) = toml::from_str(&content) {
+                    return cfg;
+                }
+            }
+        }
+        PluginConfig::default()
+    })
+}
+
 fn check_plasma_gpu(writer: &mut UnixStream, cache: &Arc<Mutex<u64>>) {
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+    let now = unix_timestamp_secs();
     let last_restart = LAST_PLASMA_RESTART.load(Ordering::SeqCst);
-    let cooldown_min = read_config_val("plasma", "min_restart_interval_min", 30);
-    if now.saturating_sub(last_restart) < cooldown_min * 60 {
+    let cfg = load_plugin_config();
+    if now.saturating_sub(last_restart) < cfg.plasma.min_restart_interval_min * 60 {
         return; // cooldown
     }
 
     let Some(pid) = mgd_common::process::find_pid_by_name("plasmashell") else { return };
-    
+
     // Request latest GPU stats for this PID
     let req = PluginMessage::QueryGpu { pid };
     let _ = writeln!(writer, "{}", serde_json::to_string(&req).unwrap());
-    
+
     // Use the currently cached value
     let gpu_kb = *cache.lock().unwrap();
 
-    let threshold_mb = read_config_val("plasma", "gpu_leak_threshold_mb", 1024);
-    if gpu_kb / 1024 > threshold_mb {
+    if gpu_kb / 1024 > cfg.plasma.gpu_leak_threshold_mb {
         let act = PluginMessage::ActionRequest {
             plugin: PLUGIN_NAME.to_string(),
             action: PluginAction::RestartProcess { name: "plasmashell".to_string() },
-            reason: format!("gpu memory {}MB > {}MB", gpu_kb / 1024, threshold_mb),
+            reason: format!("gpu memory {}MB > {}MB", gpu_kb / 1024, cfg.plasma.gpu_leak_threshold_mb),
         };
         let _ = writeln!(writer, "{}", serde_json::to_string(&act).unwrap());
         // Reset cache so we don't spam requests while waiting for core response
@@ -136,10 +207,11 @@ fn check_plasma_gpu(writer: &mut UnixStream, cache: &Arc<Mutex<u64>>) {
 }
 
 fn check_plasma_discover(writer: &mut UnixStream, tracker: &mut DiscoverTracker) {
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-    
+    let now = unix_timestamp_secs();
+    let cfg = load_plugin_config();
+
     let last_reap = LAST_PD_REAP.load(Ordering::SeqCst);
-    let reap_cooldown_secs = read_config_val("plasma_discover", "cooldown_min", 30) * 60;
+    let reap_cooldown_secs = cfg.plasma_discover.cooldown_min * 60;
     if now.saturating_sub(last_reap) < reap_cooldown_secs {
         return; // cooldown between reap attempts
     }
@@ -163,8 +235,7 @@ fn check_plasma_discover(writer: &mut UnixStream, tracker: &mut DiscoverTracker)
         return; // not idle
     }
 
-    let idle_check_secs = read_config_val("plasma_discover", "idle_check_secs", 60);
-    if now.saturating_sub(tracker.idle_since) >= idle_check_secs {
+    if now.saturating_sub(tracker.idle_since) >= cfg.plasma_discover.idle_check_secs {
         // Idle for at least configured seconds
         let status_path = format!("/proc/{pid}/status");
         let Ok(status) = fs::read_to_string(&status_path) else { return };
@@ -176,12 +247,11 @@ fn check_plasma_discover(writer: &mut UnixStream, tracker: &mut DiscoverTracker)
             }
         }
 
-        let rss_threshold_mb = read_config_val("plasma_discover", "rss_threshold_mb", 400);
-        if rss_kb / 1024 > rss_threshold_mb {
+        if rss_kb / 1024 > cfg.plasma_discover.rss_threshold_mb {
             let req = PluginMessage::ActionRequest {
                 plugin: PLUGIN_NAME.to_string(),
                 action: PluginAction::KillPid { pid },
-                reason: format!("RSS {}MB > {}MB and idle for {}s", rss_kb / 1024, rss_threshold_mb, idle_check_secs),
+                reason: format!("RSS {}MB > {}MB and idle for {}s", rss_kb / 1024, cfg.plasma_discover.rss_threshold_mb, cfg.plasma_discover.idle_check_secs),
             };
             let _ = writeln!(writer, "{}", serde_json::to_string(&req).unwrap());
             LAST_PD_REAP.store(now, Ordering::SeqCst);
@@ -271,35 +341,3 @@ fn watch_active_window(writer: std::os::unix::net::UnixStream) {
     });
 }
 
-fn read_config_val(section: &str, key: &str, default: u64) -> u64 {
-    let home = std::env::var("HOME").unwrap_or_default();
-    let paths = [
-        std::path::PathBuf::from(home).join(".config/mgd/priorities.toml"),
-        std::path::PathBuf::from("/etc/mgd/priorities.toml"),
-    ];
-
-    for path in &paths {
-        if let Ok(content) = std::fs::read_to_string(path) {
-            let mut current_section = "";
-            for line in content.lines() {
-                let line = line.trim();
-                if line.starts_with('[') && line.ends_with(']') {
-                    current_section = &line[1..line.len()-1];
-                    continue;
-                }
-                if current_section == section {
-                    // strip comments
-                    let line = line.split('#').next().unwrap_or("").trim();
-                    if let Some(rest) = line.strip_prefix(key) {
-                        if let Some(val_str) = rest.trim_start().strip_prefix('=') {
-                            if let Ok(val) = val_str.trim().parse::<u64>() {
-                                return val;
-                              }
-                          }
-                      }
-                  }
-              }
-          }
-      }
-      default
-}

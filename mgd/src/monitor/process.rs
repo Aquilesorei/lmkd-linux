@@ -13,26 +13,9 @@ pub struct Process {
     pub rss_kb: u64,
     pub swap_kb: u64,
     pub oom_score: i32,
-}
-
-/// Returns true if a process belongs to our user session and we can signal it.
-/// Combines UID ownership check with cgroup placement (user.slice).
-fn is_user_managed(pid: u32) -> bool {
-    let our_uid = unsafe { libc::geteuid() };
-
-    let proc_dir = format!("/proc/{pid}");
-    let uid_matches = match fs::metadata(&proc_dir) {
-        Ok(meta) => meta.uid() == our_uid,
-        Err(_) => return false,
-    };
-    if !uid_matches {
-        return false;
-    }
-
-    let Ok(cgroup) = fs::read_to_string(format!("/proc/{pid}/cgroup")) else {
-        return false;
-    };
-    cgroup.lines().any(|line| line.contains("/user.slice/") || line.contains("/user@"))
+    /// Unified cgroup v2 path (e.g. `/user.slice/user-1000.slice/…`), cached to
+    /// avoid re-reading `/proc/PID/cgroup` multiple times per evictor cycle.
+    pub cgroup_path: Option<String>,
 }
 
 /// Read all user processes from /proc, excluding ourselves and system processes
@@ -45,12 +28,34 @@ pub fn list_processes() -> Vec<Process> {
     entries
         .filter_map(|e| e.ok())
         .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok().map(|pid| (pid, e.path())))
-        .filter(|(pid, _)| *pid != own_pid && is_user_managed(*pid))
+        .filter(|(pid, _)| *pid != own_pid)
         .filter_map(|(pid, path)| read_process(pid, &path).ok())
         .collect()
 }
 
 fn read_process(pid: u32, path: &Path) -> Result<Process, MgdError> {
+    let our_uid = unsafe { libc::geteuid() };
+    let meta = fs::metadata(path)?;
+    if meta.uid() != our_uid {
+        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "not owned by user").into());
+    }
+
+    let cgroup_content = fs::read_to_string(path.join("cgroup"))?;
+    if !cgroup_content.lines().any(|line| line.contains("/user.slice/") || (line.contains("/user@") && line.contains(".service"))) {
+        return Err(std::io::Error::new(std::io::ErrorKind::Other, "not in user cgroup").into());
+    }
+
+    let mut cgroup_path = None;
+    for line in cgroup_content.lines() {
+        if let Some(p) = line.strip_prefix("0::") {
+            let p = p.trim();
+            if p != "/" {
+                cgroup_path = Some(p.to_string());
+                break;
+            }
+        }
+    }
+
     let status = fs::read_to_string(path.join("status"))?;
 
     let name = parse_status_field(&status, "Name:")
@@ -71,7 +76,7 @@ fn read_process(pid: u32, path: &Path) -> Result<Process, MgdError> {
         .ok()
         .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()));
 
-    Ok(Process { pid, name, exe_basename, rss_kb, swap_kb, oom_score })
+    Ok(Process { pid, name, exe_basename, rss_kb, swap_kb, oom_score, cgroup_path })
 }
 
 
