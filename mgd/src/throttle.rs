@@ -29,11 +29,7 @@ impl ThrottleManager {
             }
         }
 
-        let foreground_cgroup = active_pid.and_then(|apid| {
-            plan_procs.iter()
-                .find(|p| p.pid == apid)
-                .and_then(|p| p.cgroup_path.clone())
-        });
+        let foreground_cgroup = find_foreground_cgroup(plan_procs, active_pid);
 
         let active_cgroups: HashSet<&String> = cgroup_groups.keys().collect();
         self.tracker.retain(|p, _| active_cgroups.contains(p));
@@ -193,11 +189,7 @@ impl MemCapManager {
             return;
         }
 
-        let foreground_cgroup = active_pid.and_then(|apid| {
-            plan_procs.iter()
-                .find(|p| p.pid == apid)
-                .and_then(|p| p.cgroup_path.clone())
-        });
+        let foreground_cgroup = find_foreground_cgroup(plan_procs, active_pid);
 
         let mut cgroup_groups: HashMap<String, (u8, u64)> = HashMap::new();
         for p in plan_procs {
@@ -276,4 +268,12 @@ fn write_memory_max(cgroup_path: &str, bytes: u64) -> Result<(), std::io::Error>
         return Ok(());
     }
     Err(std::io::Error::new(std::io::ErrorKind::NotFound, "memory.max not found"))
+}
+
+fn find_foreground_cgroup(plan_procs: &[&Process], active_pid: Option<u32>) -> Option<String> {
+    active_pid.and_then(|apid| {
+        plan_procs.iter()
+            .find(|p| p.pid == apid)
+            .and_then(|p| p.cgroup_path.clone())
+    })
 }
