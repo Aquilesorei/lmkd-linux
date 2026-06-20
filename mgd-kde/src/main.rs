@@ -1,6 +1,6 @@
 //! mgd-kde — KDE Plasma 6+ plasmashell + plasma-discover watcher plugin.
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, Write};
 use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -25,8 +25,7 @@ fn main() {
     let stream = mgd_common::plugin::connect_and_identify(PLUGIN_NAME, VERSION, vec!["idle_reap"]);
 
     let mut writer = stream.try_clone().expect("clone stream");
-    let mut reader = BufReader::new(stream);
-    
+
     // Load KWin active window tracker script and start the journal watcher
     if load_kwin_script().is_some() {
         mgd_common::sync_print!("[mgd-kde] KWin active window tracker script loaded and running.");
@@ -42,9 +41,8 @@ fn main() {
     let gpu_kb_clone = gpu_kb_cache.clone();
 
     thread::spawn(move || {
-        let mut line = String::new();
-        while reader.read_line(&mut line).is_ok() && !line.is_empty() {
-            if let Ok(msg) = serde_json::from_str::<CoreMessage>(&line) {
+        mgd_common::plugin::drain_lines(stream, |line| {
+            if let Ok(msg) = serde_json::from_str::<CoreMessage>(line) {
                 match msg {
                     CoreMessage::PressureChanged { level } => {
                         *level_clone.lock().unwrap() = level;
@@ -72,8 +70,7 @@ fn main() {
                     }
                 }
             }
-            line.clear();
-        }
+        });
     });
 
     let mut pd_tracker = DiscoverTracker {
@@ -91,18 +88,6 @@ fn main() {
         check_plasma_gpu(&mut writer, &gpu_kb_cache);
 
         thread::sleep(Duration::from_secs(10));
-    }
-}
-
-fn get_process_ticks(pid: u32) -> Option<u64> {
-    let stat = fs::read_to_string(format!("/proc/{}/stat", pid)).ok()?;
-    let parts: Vec<&str> = stat.split_whitespace().collect();
-    if parts.len() > 14 {
-        let utime: u64 = parts[13].parse().unwrap_or(0);
-        let stime: u64 = parts[14].parse().unwrap_or(0);
-        Some(utime + stime)
-    } else {
-        None
     }
 }
 
@@ -223,12 +208,12 @@ fn check_plasma_discover(writer: &mut UnixStream, tracker: &mut DiscoverTracker)
 
     if tracker.pid != pid {
         tracker.pid = pid;
-        tracker.ticks = get_process_ticks(pid).unwrap_or(0);
+        tracker.ticks = mgd_common::process::read_proc_cpu_ticks(pid).unwrap_or(0);
         tracker.idle_since = now;
         return;
     }
 
-    let current_ticks = get_process_ticks(pid).unwrap_or(0);
+    let current_ticks = mgd_common::process::read_proc_cpu_ticks(pid).unwrap_or(0);
     if current_ticks > tracker.ticks {
         tracker.ticks = current_ticks;
         tracker.idle_since = now;

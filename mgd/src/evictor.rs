@@ -661,7 +661,7 @@ fn execute_decision(
         Action::Freeze => ("FREEZE", freeze_process(d, frozen)),
         Action::Terminate => ("TERMINATE", terminate_process(d)),
         Action::Kill => ("KILL", kill_process(d)),
-        Action::Checkpoint => ("CHECKPOINT", execute_checkpoint(d, checkpointed)),
+        Action::Checkpoint => execute_checkpoint(d, checkpointed),
         Action::None => return String::new(),
     };
     log.log(&LogEntry::new(action_name, d.pid, &d.name, d.rss_mb, &s));
@@ -705,17 +705,31 @@ fn kill_process(d: &Decision) -> String {
     }
 }
 
-fn execute_checkpoint(d: &Decision, checkpointed: &Arc<Mutex<CheckpointRegistry>>) -> String {
+fn execute_checkpoint(d: &Decision, checkpointed: &Arc<Mutex<CheckpointRegistry>>) -> (&'static str, String) {
     let r = crate::executor::checkpoint::checkpoint(d.pid, &d.name);
     if r.success {
         let dir = r.snapshot_dir.unwrap();
         checkpointed.lock().unwrap()
             .add(d.pid, &d.name, dir.clone(), d.rss_mb as u64 * 1024);
-        format!("checkpointed → {dir:?}")
+        ("CHECKPOINT", format!("checkpointed → {dir:?}"))
     } else {
-        let kr = crate::executor::killer::sigkill(d.pid);
-        if kr.success { "killed (CRIU failed)".into() }
-        else { format!("kill_fail: {}", kr.error.unwrap_or_default()) }
+        // Dump failed — this binary is not safely checkpointable; record it so
+        // future cycles skip CRIU for it and route directly here.
+        crate::executor::checkpoint::mark_binary_failed(&d.name);
+        // Fall back using the same prio logic as when cp_supported=false:
+        // prio >= 60 → Terminate (async, graceful); prio < 60 → Kill (protected process,
+        // dump likely failed due to complex state, don't wait for SIGTERM).
+        if d.prio >= 60 {
+            terminate_process(d);
+            ("TERMINATE", format!("terminating (CRIU failed: {})", r.error.unwrap_or_default()))
+        } else {
+            let kr = crate::executor::killer::sigkill(d.pid);
+            if kr.success {
+                ("KILL", format!("killed (CRIU failed: {})", r.error.unwrap_or_default()))
+            } else {
+                ("KILL", format!("kill_fail: {}", kr.error.unwrap_or_default()))
+            }
+        }
     }
 }
 

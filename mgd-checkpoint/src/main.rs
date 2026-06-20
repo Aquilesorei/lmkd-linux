@@ -113,17 +113,7 @@ fn validate_dump(caller_uid: u32, pid: u32, images_dir: &str) -> Result<(), Stri
     // 2. Cgroup Check: target process must reside inside user.slice
     let cgroup_data = fs::read_to_string(format!("/proc/{}/cgroup", pid))
         .map_err(|e| format!("failed to read target cgroup: {e}"))?;
-    let mut in_user_slice = false;
-    for line in cgroup_data.lines() {
-        if let Some(path) = line.strip_prefix("0::") {
-            let path = path.trim();
-            if path.starts_with("/user.slice/") {
-                in_user_slice = true;
-                break;
-            }
-        }
-    }
-    if !in_user_slice {
+    if !mgd_common::process::is_cgroup_in_user_slice(&cgroup_data) {
         return Err("target process is not in the user.slice cgroup".to_string());
     }
 

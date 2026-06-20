@@ -128,7 +128,7 @@ pub fn flush_calibration(calibrator: &Arc<Mutex<Calibrator>>, log: &Logger) {
         let _ = fs::create_dir_all(parent);
     }
     if let Err(e) = fs::write(&state_path, &state_toml) {
-        locked_print(&format!("[calibrate] cannot persist state to {}: {e}", state_path.display()));
+        mgd_common::sync_print!("[calibrate] cannot persist state to {}: {e}", state_path.display());
         return;
     }
 
@@ -142,19 +142,17 @@ pub fn flush_calibration(calibrator: &Arc<Mutex<Calibrator>>, log: &Logger) {
     }
     match fs::write(&sug_path, &rendered) {
         Ok(()) => {
-            locked_print(&format!(
+            mgd_common::sync_print!(
                 "[calibrate] [psi] suggestion ready ({:.0}h observed, {} stalls) → {}",
                 s.observed_hours, s.stall_events, sug_path.display()
-            ));
+            );
             log.log(&LogEntry::new(
                 "CALIBRATE", 0, "psi", s.elevated_pct,
                 &format!("suggested elevated_pct={:.1} full_critical_pct={:.1}",
                     s.elevated_pct, s.full_critical_pct),
             ));
         }
-        Err(e) => locked_print(&format!(
-            "[calibrate] cannot write suggestion to {}: {e}", sug_path.display()
-        )),
+        Err(e) => mgd_common::sync_print!("[calibrate] cannot write suggestion to {}: {e}", sug_path.display()),
     }
 }
 
@@ -268,11 +266,11 @@ fn check_proactive_reclaim(pressure: &monitor::psi::MemoryPressure, log: &Logger
         return;
     }
 
-    locked_print(&format!(
+    mgd_common::sync_print!(
         "[reclaim] calm, swap {:.0}% full, zram {}MB compressed ({}MB decompressed), \
          avail {}MB — reclaiming",
         gates.swap_used_pct, gates.zram_used_mb, gates.zram_orig_mb, gates.mem_available_mb
-    ));
+    );
 
     match run_reclaim_helper(helper) {
         Ok(()) => {
@@ -289,7 +287,7 @@ fn check_proactive_reclaim(pressure: &monitor::psi::MemoryPressure, log: &Logger
         }
         Err((code, e)) => {
             // Don't arm the cooldown on failure.
-            locked_print(&format!("[reclaim] helper failed (exit {code:?}): {e}"));
+            mgd_common::sync_print!("[reclaim] helper failed (exit {code:?}): {e}");
             log.log(&LogEntry::new("RECLAIM", 0, "zram", 0.0, &format!("failed: {e}")));
             // Exit 2 = uncapped binary (persistent); other codes are transient.
             if code == Some(2) {

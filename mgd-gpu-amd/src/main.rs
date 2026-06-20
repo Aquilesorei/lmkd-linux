@@ -3,7 +3,7 @@
 //! Uses the same DRM fdinfo accounting as mgd-gpu-intel; the kernel interface
 //! is driver-independent (drm-client-id + drm-resident-* fields).
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 use std::os::unix::fs::MetadataExt;
 use std::thread;
 use std::time::Duration;
@@ -18,17 +18,13 @@ fn main() {
     let mut writer = stream.try_clone().expect("clone stream");
 
     thread::spawn(move || {
-        let mut reader = BufReader::new(stream);
-        let mut line = String::new();
-        while reader.read_line(&mut line).is_ok() && !line.is_empty() {
-            line.clear();
-        }
+        mgd_common::plugin::drain_lines(stream, |_| {});
         std::process::exit(0);
     });
 
     loop {
         if let Ok(entries) = fs::read_dir("/proc") {
-            let own_uid = unsafe { libc::geteuid() };
+            let own_uid = mgd_common::util::current_uid();
             for entry in entries.filter_map(|e| e.ok()) {
                 let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else { continue };
 

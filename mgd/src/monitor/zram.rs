@@ -9,6 +9,8 @@ use std::fs;
 use std::io;
 use std::path::PathBuf;
 
+use mgd_common::zram::is_zram_device_path;
+
 /// Active zram swap devices by basename (e.g. `zram0`), from /proc/swaps.
 pub fn zram_devices() -> Vec<String> {
     let content = fs::read_to_string("/proc/swaps").unwrap_or_default();
@@ -59,14 +61,6 @@ fn parse_zram_devices(swaps: &str) -> Vec<String> {
         .filter_map(|dev| dev.rsplit('/').next())
         .map(|s| s.to_string())
         .collect()
-}
-
-/// `/dev/zram` followed by digits — rejects partitions and lookalike swapfiles.
-fn is_zram_device_path(path: &str) -> bool {
-    match path.strip_prefix("/dev/zram") {
-        Some(rest) => !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()),
-        None => false,
-    }
 }
 
 /// `mem_used_total` — field 2 (0-indexed) of mm_stat:
@@ -121,15 +115,6 @@ mod tests {
         let swaps = "Filename Type Size Used Priority\n\
                      /swap/zram-cache file 2097152 0 -3\n";
         assert!(parse_zram_devices(swaps).is_empty());
-    }
-
-    #[test]
-    fn test_is_zram_device_path() {
-        assert!(is_zram_device_path("/dev/zram0"));
-        assert!(is_zram_device_path("/dev/zram10"));
-        assert!(!is_zram_device_path("/dev/zram"));
-        assert!(!is_zram_device_path("/swap/zram-cache"));
-        assert!(!is_zram_device_path("/dev/nvme0n1p3"));
     }
 
     #[test]

@@ -254,6 +254,34 @@ fn process_running(name: &str) -> bool {
     false
 }
 
+// ── GPU cache status (live query, read-only) ──────────────────────────────────
+
+fn report_gpu_cache(daemon_running: bool, gpu_applicable: bool) {
+    if !gpu_applicable || !daemon_running { return; }
+    match crate::query_socket("gpu-info", 3) {
+        Ok(resp) => {
+            // Parse "gpu_pids=<n> total_kb=<n> newest_obs=<s>"
+            let mut pids: Option<u64> = None;
+            let mut total_kb: Option<u64> = None;
+            let mut newest: Option<String> = None;
+            for part in resp.split_whitespace() {
+                if let Some(v) = part.strip_prefix("gpu_pids=")   { pids     = v.parse().ok(); }
+                if let Some(v) = part.strip_prefix("total_kb=")   { total_kb = v.parse().ok(); }
+                if let Some(v) = part.strip_prefix("newest_obs=") { newest   = Some(v.to_string()); }
+            }
+            let pids     = pids.unwrap_or(0);
+            let total_mb = total_kb.unwrap_or(0) / 1024;
+            let age      = newest.as_deref().unwrap_or("none");
+            if pids == 0 {
+                println!("  {}", warn("GPU cache empty — plugin connected but no observations yet"));
+            } else {
+                println!("  {}", ok(&format!("GPU cache: {pids} PID(s), {total_mb} MB resident, last obs {age}")));
+            }
+        }
+        Err(_) => {} // daemon not reachable — already reported above
+    }
+}
+
 // ── Calibration status ────────────────────────────────────────────────────────
 
 struct CalibrationInfo {
@@ -403,6 +431,7 @@ pub fn run() -> i32 {
 
     let de_lower = desktop.de.to_lowercase();
 
+    let mut gpu_plugin_applicable = false;
     for p in &plugins {
         // Determine if this plugin is applicable to this system
         let applicable = match p.binary {
@@ -415,6 +444,10 @@ pub fn run() -> i32 {
             _                => true,
         };
 
+        if applicable && (p.binary == "mgd-gpu-intel" || p.binary == "mgd-gpu-amd") && p.running {
+            gpu_plugin_applicable = true;
+        }
+
         let line = if !applicable {
             skip(&format!("{:<18} (not applicable on this system)", p.name))
         } else if p.running {
@@ -426,6 +459,7 @@ pub fn run() -> i32 {
         };
         println!("  {line}");
     }
+    report_gpu_cache(daemon_running, gpu_plugin_applicable);
     println!();
 
     // ── Thresholds / calibration ──────────────────────────────────────────────

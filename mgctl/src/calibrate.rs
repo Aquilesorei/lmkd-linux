@@ -76,8 +76,9 @@ fn read_psi() -> Option<PsiSnapshot> {
         let parts: Vec<&str> = line.split_whitespace().collect();
         if parts.len() < 3 { continue }
         let get = |prefix: &str| -> f64 {
-            parts.iter().find_map(|p| p.strip_prefix(prefix))
-                .and_then(|v| v.parse().ok())
+            parts.iter()
+                .find(|p| p.starts_with(prefix))
+                .and_then(|p| mgd_common::psi::parse_kv(p, prefix).ok())
                 .unwrap_or(0.0)
         };
         match parts.get(0).copied() {
@@ -87,28 +88,6 @@ fn read_psi() -> Option<PsiSnapshot> {
         }
     }
     Some(snap)
-}
-
-fn read_available_kb() -> u64 {
-    fs::read_to_string("/proc/meminfo").ok()
-        .and_then(|s| {
-            s.lines()
-                .find(|l| l.starts_with("MemAvailable:"))
-                .and_then(|l| l.split_whitespace().nth(1))
-                .and_then(|v| v.parse().ok())
-        })
-        .unwrap_or(0)
-}
-
-fn read_total_kb() -> u64 {
-    fs::read_to_string("/proc/meminfo").ok()
-        .and_then(|s| {
-            s.lines()
-                .find(|l| l.starts_with("MemTotal:"))
-                .and_then(|l| l.split_whitespace().nth(1))
-                .and_then(|v| v.parse().ok())
-        })
-        .unwrap_or(0)
 }
 
 fn read_swap_in_kb() -> u64 {
@@ -185,12 +164,12 @@ fn toml_path() -> PathBuf {
 // ── Main entry ────────────────────────────────────────────────────────────────
 
 pub fn run(args: &[String]) -> i32 {
-    let dry_run = args.iter().any(|a| a == "--dry-run");
-    let apply   = args.iter().any(|a| a == "--apply");
+    let dry_run        = args.iter().any(|a| a == "--dry-run");
+    let apply          = args.iter().any(|a| a == "--apply");
+    let passive_apply  = args.iter().any(|a| a == "--passive-apply");
 
-    if apply {
-        return do_apply();
-    }
+    if apply         { return do_apply(); }
+    if passive_apply { return do_passive_apply(); }
 
     // ── Pre-flight safety checks ──────────────────────────────────────────────
     if battery_low() {
@@ -237,7 +216,7 @@ pub fn run(args: &[String]) -> i32 {
         print!("  [{:>2}/12] PSI full_avg10={:.2}%  MemAvailable={:.0}MB\r",
             i + 1,
             psi_samples.last().copied().unwrap_or(0.0),
-            read_available_kb() as f64 / 1024.0);
+            mgd_common::meminfo::read_available_kb() as f64 / 1024.0);
         let _ = std::io::stdout().flush();
     }
     println!();
@@ -245,7 +224,7 @@ pub fn run(args: &[String]) -> i32 {
     let baseline_psi_full = psi_samples.iter().copied().sum::<f64>() / psi_samples.len().max(1) as f64;
     let baseline_psi_some = read_psi().map(|p| p.some_avg10).unwrap_or(0.0);
     let baseline_swap_in  = *swap_samples.last().unwrap_or(&0);
-    let total_kb          = read_total_kb();
+    let total_kb          = mgd_common::meminfo::read_total_kb();
 
     println!("  Baseline: PSI full_avg10={:.2}%  some_avg10={:.2}%  RAM={:.0}MB",
         baseline_psi_full, baseline_psi_some, total_kb as f64 / 1024.0);
@@ -410,6 +389,133 @@ pub fn run(args: &[String]) -> i32 {
     0
 }
 
+// ── --passive-apply ───────────────────────────────────────────────────────────
+
+/// Parse first non-commented `key = <number>` value from flat TOML text.
+fn suggestion_value(data: &str, key: &str) -> Option<f64> {
+    data.lines().find_map(|line| {
+        let line = line.trim();
+        if line.starts_with('#') { return None; }
+        let rest = line.strip_prefix(key)?.trim_start();
+        let val = rest.strip_prefix('=')?;
+        val.split('#').next()?.trim().parse().ok()
+    })
+}
+
+/// Update or add a `[psi]` block in priorities.toml content (string-level patch,
+/// preserves all other content and comments).
+fn patch_psi_block(content: &str, elevated_pct: f64, full_critical_pct: f64) -> String {
+    let has_psi = content.lines().any(|l| l.trim() == "[psi]");
+
+    if !has_psi {
+        let sep = if content.is_empty() || content.ends_with('\n') { "" } else { "\n" };
+        return format!(
+            "{content}{sep}\n[psi]\nelevated_pct      = {elevated_pct:.1}\nfull_critical_pct = {full_critical_pct:.1}\n"
+        );
+    }
+
+    let mut result: Vec<String> = Vec::new();
+    let mut in_psi = false;
+    let mut found_elevated = false;
+    let mut found_full = false;
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            if in_psi {
+                if !found_elevated {
+                    result.push(format!("elevated_pct      = {elevated_pct:.1}"));
+                }
+                if !found_full {
+                    result.push(format!("full_critical_pct = {full_critical_pct:.1}"));
+                }
+            }
+            in_psi = trimmed == "[psi]";
+            result.push(line.to_string());
+            continue;
+        }
+
+        if in_psi && !trimmed.starts_with('#') {
+            if trimmed.starts_with("elevated_pct") && trimmed.contains('=') {
+                result.push(format!("elevated_pct      = {elevated_pct:.1}"));
+                found_elevated = true;
+                continue;
+            }
+            if trimmed.starts_with("full_critical_pct") && trimmed.contains('=') {
+                result.push(format!("full_critical_pct = {full_critical_pct:.1}"));
+                found_full = true;
+                continue;
+            }
+        }
+
+        result.push(line.to_string());
+    }
+
+    if in_psi {
+        if !found_elevated {
+            result.push(format!("elevated_pct      = {elevated_pct:.1}"));
+        }
+        if !found_full {
+            result.push(format!("full_critical_pct = {full_critical_pct:.1}"));
+        }
+    }
+
+    result.join("\n") + "\n"
+}
+
+fn do_passive_apply() -> i32 {
+    let sug_path = mgd_common::util::home_dir()
+        .join(".local/share/mgd/calibration_suggestion.toml");
+
+    let sug_data = match fs::read_to_string(&sug_path) {
+        Ok(d) => d,
+        Err(_) => {
+            eprintln!("mgctl calibrate --passive-apply: no suggestion at {}", sug_path.display());
+            eprintln!("Run mgd for ≥24h with ≥10 stall episodes first, then check: mgctl doctor");
+            return 1;
+        }
+    };
+
+    let elevated_pct = match suggestion_value(&sug_data, "elevated_pct") {
+        Some(v) => v,
+        None => {
+            eprintln!("mgctl calibrate --passive-apply: could not parse elevated_pct");
+            return 1;
+        }
+    };
+    let full_critical_pct = match suggestion_value(&sug_data, "full_critical_pct") {
+        Some(v) => v,
+        None => {
+            eprintln!("mgctl calibrate --passive-apply: could not parse full_critical_pct");
+            return 1;
+        }
+    };
+
+    let config_path = mgd_common::util::home_dir().join(".config/mgd/priorities.toml");
+    if let Some(parent) = config_path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let existing = fs::read_to_string(&config_path).unwrap_or_default();
+    let patched = patch_psi_block(&existing, elevated_pct, full_critical_pct);
+
+    if let Err(e) = fs::write(&config_path, &patched) {
+        eprintln!("mgctl calibrate --passive-apply: write failed: {e}");
+        return 1;
+    }
+
+    println!("Applied [psi] suggestion → {}", config_path.display());
+    println!("  elevated_pct      = {elevated_pct:.1}");
+    println!("  full_critical_pct = {full_critical_pct:.1}");
+    println!("  Note: elevated_pct re-arms the kernel trigger only on daemon restart.");
+
+    match crate::query_socket("reload", 5) {
+        Ok(_) => println!("Daemon reloaded."),
+        Err(_) => println!("Daemon not running — changes take effect on next start."),
+    }
+    0
+}
+
 // ── --apply ───────────────────────────────────────────────────────────────────
 
 fn do_apply() -> i32 {
@@ -453,4 +559,79 @@ fn cleanup_interrupted() -> i32 {
 
 extern "C" fn handle_interrupt(_: libc::c_int) {
     INTERRUPTED.store(true, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn suggestion_value_parses_plain() {
+        let data = "elevated_pct = 5.5\nfull_critical_pct = 20.0\n";
+        assert_eq!(suggestion_value(data, "elevated_pct"), Some(5.5));
+        assert_eq!(suggestion_value(data, "full_critical_pct"), Some(20.0));
+    }
+
+    #[test]
+    fn suggestion_value_ignores_commented_lines() {
+        let data = "#elevated_pct = 99.0\nelevated_pct = 5.5\n";
+        assert_eq!(suggestion_value(data, "elevated_pct"), Some(5.5));
+    }
+
+    #[test]
+    fn suggestion_value_strips_inline_comment() {
+        let data = "elevated_pct      = 5.5    # current: 5.0\n";
+        assert_eq!(suggestion_value(data, "elevated_pct"), Some(5.5));
+    }
+
+    #[test]
+    fn suggestion_value_returns_none_when_absent() {
+        assert_eq!(suggestion_value("other = 1.0\n", "elevated_pct"), None);
+    }
+
+    #[test]
+    fn patch_psi_block_appends_when_no_section() {
+        let config = "[priorities]\nsome = 1\n";
+        let result = patch_psi_block(config, 5.5, 20.0);
+        assert!(result.contains("[psi]"), "should have [psi]: {result}");
+        assert!(result.contains("elevated_pct      = 5.5"));
+        assert!(result.contains("full_critical_pct = 20.0"));
+        assert!(result.contains("[priorities]"));
+    }
+
+    #[test]
+    fn patch_psi_block_updates_existing_values() {
+        let config = "[psi]\nelevated_pct = 3.0\nfull_critical_pct = 15.0\n";
+        let result = patch_psi_block(config, 5.5, 20.0);
+        assert!(result.contains("elevated_pct      = 5.5"));
+        assert!(result.contains("full_critical_pct = 20.0"));
+        assert!(!result.contains("= 3.0"));
+        assert!(!result.contains("= 15.0"));
+    }
+
+    #[test]
+    fn patch_psi_block_inserts_missing_keys_into_existing_section() {
+        let config = "[psi]\n";
+        let result = patch_psi_block(config, 5.5, 20.0);
+        assert!(result.contains("elevated_pct      = 5.5"));
+        assert!(result.contains("full_critical_pct = 20.0"));
+    }
+
+    #[test]
+    fn patch_psi_block_empty_config() {
+        let result = patch_psi_block("", 5.5, 20.0);
+        assert!(result.contains("[psi]"));
+        assert!(result.contains("elevated_pct      = 5.5"));
+        assert!(result.contains("full_critical_pct = 20.0"));
+    }
+
+    #[test]
+    fn patch_psi_block_preserves_other_sections() {
+        let config = "[zram]\ncompact_on_elevated = true\n\n[psi]\nelevated_pct = 3.0\n\n[idle_reclaim]\nenabled = false\n";
+        let result = patch_psi_block(config, 6.0, 22.0);
+        assert!(result.contains("[zram]"));
+        assert!(result.contains("[idle_reclaim]"));
+        assert!(result.contains("elevated_pct      = 6.0"));
+        assert!(result.contains("full_critical_pct = 22.0"));
+    }
 }

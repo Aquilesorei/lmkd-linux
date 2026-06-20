@@ -12,4 +12,5 @@ name = "mgd-checkpoint"
 path = "src/main.rs"
 
 [dependencies]
-libc = { workspace = true }
+libc       = { workspace = true }
+mgd-common = { path = "../mgd-common" }

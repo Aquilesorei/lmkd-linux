@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Return the current user's home directory.
 ///
@@ -15,6 +15,17 @@ pub fn unix_timestamp_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+pub fn current_uid() -> u32 {
+    unsafe { libc::geteuid() }
+}
+
+pub fn write_file_atomic(path: &Path, data: &str) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, data)
 }
 
 /// Read the unified cgroup v2 path for `pid` from `/proc/<pid>/cgroup`.

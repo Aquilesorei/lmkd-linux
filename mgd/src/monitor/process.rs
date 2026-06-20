@@ -29,16 +29,6 @@ static CPU_CACHE: LazyLock<Mutex<HashMap<u32, (u64, u64)>>> =
 static CLK_TCK: LazyLock<u64> =
     LazyLock::new(|| unsafe { libc::sysconf(libc::_SC_CLK_TCK).max(1) as u64 });
 
-fn read_cpu_ticks(_pid: u32, path: &Path) -> Option<u64> {
-    let stat = fs::read_to_string(path.join("stat")).ok()?;
-    // After the last ')': state(0) ppid(1) ... utime(11) stime(12)
-    let after_comm = stat.rsplit_once(") ")?.1;
-    let mut it = after_comm.split_whitespace().skip(11);
-    let utime: u64 = it.next()?.parse().ok()?;
-    let stime: u64 = it.next()?.parse().ok()?;
-    Some(utime + stime)
-}
-
 /// Read all user processes from /proc, excluding ourselves and system processes
 pub fn list_processes() -> Vec<Process> {
     let own_pid = std::process::id();
@@ -55,14 +45,14 @@ pub fn list_processes() -> Vec<Process> {
 }
 
 fn read_process(pid: u32, path: &Path) -> Result<Process, MgdError> {
-    let our_uid = unsafe { libc::geteuid() };
+    let our_uid = mgd_common::util::current_uid();
     let meta = fs::metadata(path)?;
     if meta.uid() != our_uid {
         return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "not owned by user").into());
     }
 
     let cgroup_content = fs::read_to_string(path.join("cgroup"))?;
-    if !cgroup_content.lines().any(|line| line.contains("/user.slice/") || (line.contains("/user@") && line.contains(".service"))) {
+    if !mgd_common::process::is_cgroup_in_user_slice(&cgroup_content) {
         return Err(std::io::Error::new(std::io::ErrorKind::Other, "not in user cgroup").into());
     }
 
@@ -97,15 +87,15 @@ fn read_process(pid: u32, path: &Path) -> Result<Process, MgdError> {
         .ok()
         .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()));
 
-    let cpu_pct = compute_cpu_pct(pid, path);
+    let cpu_pct = compute_cpu_pct(pid);
 
     Ok(Process { pid, name, exe_basename, rss_kb, swap_kb, oom_score, cgroup_path, cpu_pct })
 }
 
 
-fn compute_cpu_pct(pid: u32, path: &Path) -> f32 {
+fn compute_cpu_pct(pid: u32) -> f32 {
     let now = mgd_common::util::unix_timestamp_secs();
-    let ticks = match read_cpu_ticks(pid, path) {
+    let ticks = match mgd_common::process::read_proc_cpu_ticks(pid) {
         Some(t) => t,
         None => return 0.0,
     };

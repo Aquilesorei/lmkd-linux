@@ -1,3 +1,5 @@
+use mgd_common::meminfo::parse_kb;
+
 pub struct MemInfo {
     pub available_kb: u64,
     pub total_kb: u64,
@@ -33,10 +35,6 @@ pub fn read_meminfo() -> MemInfo {
         }
     }
     MemInfo { available_kb: available, total_kb: total, swap_free_kb: swap_free, swap_total_kb: swap_total }
-}
-
-fn parse_kb(s: &str) -> u64 {
-    s.split_whitespace().next().and_then(|v| v.parse().ok()).unwrap_or(0)
 }
 
 /// Cumulative swap I/O page counters from /proc/vmstat.

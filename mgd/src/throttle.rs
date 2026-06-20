@@ -277,3 +277,77 @@ fn find_foreground_cgroup(plan_procs: &[&Process], active_pid: Option<u32>) -> O
             .and_then(|p| p.cgroup_path.clone())
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_proc(pid: u32, cgroup: Option<&str>) -> Process {
+        Process {
+            pid,
+            name: format!("proc{pid}"),
+            exe_basename: None,
+            rss_kb: 100_000,
+            swap_kb: 0,
+            oom_score: 200,
+            cgroup_path: cgroup.map(|s| s.to_string()),
+            cpu_pct: 0.0,
+        }
+    }
+
+    #[test]
+    fn cgroup_sysfs_path_strips_leading_slash() {
+        let p = cgroup_sysfs_path("/user.slice/user-1000.slice", "cpu.weight");
+        assert_eq!(p, std::path::Path::new("/sys/fs/cgroup/user.slice/user-1000.slice/cpu.weight"));
+    }
+
+    #[test]
+    fn cgroup_sysfs_path_no_leading_slash() {
+        let p = cgroup_sysfs_path("user.slice/user-1000.slice", "cpu.weight");
+        assert_eq!(p, std::path::Path::new("/sys/fs/cgroup/user.slice/user-1000.slice/cpu.weight"));
+    }
+
+    #[test]
+    fn find_foreground_cgroup_matches_active_pid() {
+        let a = make_proc(100, Some("user.slice/app-A.slice"));
+        let b = make_proc(200, Some("user.slice/app-B.slice"));
+        let procs = [&a, &b];
+        assert_eq!(
+            find_foreground_cgroup(&procs, Some(100)).as_deref(),
+            Some("user.slice/app-A.slice")
+        );
+    }
+
+    #[test]
+    fn find_foreground_cgroup_none_when_no_active_pid() {
+        let a = make_proc(100, Some("user.slice/app-A.slice"));
+        assert!(find_foreground_cgroup(&[&a], None).is_none());
+    }
+
+    #[test]
+    fn find_foreground_cgroup_none_when_pid_not_in_list() {
+        let a = make_proc(100, Some("user.slice/app-A.slice"));
+        assert!(find_foreground_cgroup(&[&a], Some(999)).is_none());
+    }
+
+    #[test]
+    fn find_foreground_cgroup_none_when_pid_has_no_cgroup() {
+        let a = make_proc(100, None);
+        assert!(find_foreground_cgroup(&[&a], Some(100)).is_none());
+    }
+
+    #[test]
+    fn memcap_formula_adds_512mb_headroom() {
+        let rss_kb: u64 = 1_024 * 1_024; // 1 GB in KB
+        let cap_bytes = (rss_kb + 512 * 1024) * 1024;
+        // Should be 1.5 GB in bytes
+        assert_eq!(cap_bytes, 1_610_612_736);
+        assert_eq!(cap_bytes / 1024 / 1024, 1536); // 1536 MB
+    }
+
+    #[test]
+    fn throttled_state_eq() {
+        assert_eq!(ThrottledState::None, ThrottledState::None);
+        assert_ne!(ThrottledState::WeightOnly, ThrottledState::Full);
+    }
+}

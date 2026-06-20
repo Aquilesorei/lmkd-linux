@@ -40,6 +40,7 @@ pub struct Decision {
     pub rss_mb: f64,
     pub swap_mb: f64,
     pub reason: String,
+    pub prio: u8,
 }
 
 
@@ -51,6 +52,7 @@ impl Decision {
         rss_mb: f64,
         swap_mb: f64,
         reason: impl Into<String>,
+        prio: u8,
     ) -> Self {
         Self {
             pid,
@@ -59,6 +61,7 @@ impl Decision {
             rss_mb,
             swap_mb,
             reason: reason.into(),
+            prio,
         }
     }
 }
@@ -145,7 +148,8 @@ pub fn plan(
             0.0
         };
         let checkpoint_override = cfg.checkpoint_override(&proc.name);
-        let action = determine_process_action(level, prio, swap_ratio, checkpoint_override, swap_exhausted);
+        let cp_supported = crate::executor::checkpoint::is_checkpoint_eligible(&proc.name);
+        let action = determine_process_action(level, prio, swap_ratio, checkpoint_override, swap_exhausted, cp_supported);
         if action == Action::None {
             continue;
         }
@@ -177,6 +181,7 @@ pub fn plan(
             proc.rss_kb as f64 / 1024.0,
             proc.swap_kb as f64 / 1024.0,
             reason,
+            prio,
         ));
     }
     decisions
@@ -190,6 +195,7 @@ fn determine_process_action(
     swap_ratio: f64,
     checkpoint_override: Option<bool>,
     swap_exhausted: bool,
+    cp_supported: bool,
 ) -> Action {
     if swap_exhausted && prio >= 80 {
         return Action::Kill;
@@ -217,13 +223,12 @@ fn determine_process_action(
         }
 
         PressureLevel::Critical => {
-            let cp_supported = crate::executor::checkpoint::is_checkpoint_supported();
             if let Some(cp) = checkpoint_override {
                 return if cp && cp_supported { Action::Checkpoint } else {
                     if swap_ratio > 0.5 { Action::Kill } else { Action::Terminate }
                 };
             }
-            if swap_ratio > 0.5 {
+            if swap_ratio > 0.5 && prio >= 60 {
                 // Mostly in swap already — its data is effectively on disk, so
                 // checkpointing buys nothing. Kill.
                 Action::Kill
@@ -361,5 +366,37 @@ mod tests {
         let decisions = plan(&PressureLevel::Elevated, &procs.iter().collect::<Vec<_>>(), 1_000_000, 16_000_000, true);
         assert_eq!(decisions.len(), 1);
         assert_eq!(decisions[0].action, Action::Kill);
+    }
+
+    // Tests for determine_process_action directly — verifies the prio<60 + high-swap fix.
+    // Previously, swap_ratio > 0.5 → Kill with no priority check, so a protected process
+    // (prio<60) would be killed without attempting checkpoint. Now prio >= 60 is required
+    // for the fast-kill path; protected processes fall through to the checkpoint branch.
+
+    #[test]
+    fn critical_protected_high_swap_checkpoints_with_criu() {
+        // prio=45 (protected), swap_ratio=0.7, CRIU available → must Checkpoint, not Kill
+        let action = determine_process_action(
+            &PressureLevel::Critical, 45, 0.7, None, false, true,
+        );
+        assert_eq!(action, Action::Checkpoint);
+    }
+
+    #[test]
+    fn critical_protected_high_swap_kills_without_criu() {
+        // prio=45 (protected), swap_ratio=0.7, no CRIU → Kill via else fallback (prio<60)
+        let action = determine_process_action(
+            &PressureLevel::Critical, 45, 0.7, None, false, false,
+        );
+        assert_eq!(action, Action::Kill);
+    }
+
+    #[test]
+    fn critical_expendable_high_swap_still_kills() {
+        // prio=90 (expendable), swap_ratio=0.7 → Kill (data on disk, no checkpoint needed)
+        let action = determine_process_action(
+            &PressureLevel::Critical, 90, 0.7, None, false, true,
+        );
+        assert_eq!(action, Action::Kill);
     }
 }

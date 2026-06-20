@@ -1,17 +1,36 @@
+use std::collections::HashSet;
 use std::process::Command;
 use std::fs;
 use std::io;
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 static HELPER_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
 static CHECKPOINT_DISABLED: AtomicBool = AtomicBool::new(false);
+static CHECKPOINT_FAILED_BINARIES: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 
-/// Check if checkpointing is supported (mgd-checkpoint helper is present and has not been disabled)
+fn failed_binaries() -> &'static Mutex<HashSet<String>> {
+    CHECKPOINT_FAILED_BINARIES.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Record that a checkpoint dump failed for this binary name so future pressure
+/// cycles skip the CRIU path for it and go straight to the prio-based fallback.
+/// Session-permanent by design: retrying a failed dump under Critical pressure adds
+/// I/O cost to the exact moment the system can least afford it, with no different outcome guaranteed.
+pub fn mark_binary_failed(name: &str) {
+    failed_binaries().lock().unwrap().insert(name.to_string());
+}
+
+/// System-level check: helper present + not globally disabled.
 pub fn is_checkpoint_supported() -> bool {
     let _ = helper_path();
     !CHECKPOINT_DISABLED.load(Ordering::Relaxed)
+}
+
+/// Per-process eligibility: system check AND binary not in the per-name failed set.
+pub fn is_checkpoint_eligible(name: &str) -> bool {
+    is_checkpoint_supported() && !failed_binaries().lock().unwrap().contains(name)
 }
 
 /// Force disable checkpointing (e.g. after a privilege or security error)

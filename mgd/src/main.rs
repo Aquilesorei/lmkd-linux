@@ -109,6 +109,8 @@ fn main() {
     let _ = ipc.join();
     let _ = maintenance.join();
 
+    plugin_server::shutdown_plugins();
+
     // Actors are done — no new freezes: safe to sweep.
     shutdown_unfreeze(&frozen);
 
@@ -189,7 +191,7 @@ fn cleanup_orphaned_snapshots(checkpointed: &Arc<Mutex<CheckpointRegistry>>) {
             let path = entry.path();
             if !active_dirs.contains(&path) {
                 if std::fs::remove_dir_all(&path).is_ok() {
-                    locked_print(&format!("[startup] Removed orphaned snapshot: {:?}", path));
+                    mgd_common::sync_print!("[startup] Removed orphaned snapshot: {:?}", path);
                 }
             }
         }
@@ -210,9 +212,9 @@ fn shutdown_unfreeze(frozen: &Arc<Mutex<FrozenRegistry>>) {
     for (pid, st) in &entries {
         let r = executor::freezer::unfreeze_checked(*pid, *st);
         if r.success {
-            locked_print(&format!("  ✓ Unfroze PID {pid}"));
+            mgd_common::sync_print!("  ✓ Unfroze PID {pid}");
         } else {
-            mgd_common::output::locked_eprint(&format!("  ✗ PID {pid}: {}", r.error.unwrap_or_default()));
+            mgd_common::sync_eprint!("  ✗ PID {pid}: {}", r.error.unwrap_or_default());
         }
     }
     locked_print("[shutdown] Done.");
@@ -244,7 +246,7 @@ fn try_elevate_scheduler_priority() {
                     locked_print("[core] Running with standard priority (CAP_SYS_NICE missing for RT/Nice elevation)");
                 }
             } else {
-                locked_print(&format!("[core] Warning: failed to set scheduler policy: {}", err));
+                mgd_common::sync_print!("[core] Warning: failed to set scheduler policy: {}", err);
             }
         }
     }

@@ -205,6 +205,7 @@ fn dispatch(
                 cmd_info(arg, frozen, checkpointed, throttle_snapshot)
             }
         }
+        "gpu-info" => cmd_gpu_info(),
         _ => err(&format!("unknown command: {cmd}")),
     }
 }
@@ -546,6 +547,12 @@ fn cmd_kill(arg: &str, event_log: &crate::events::EventLog) -> String {
         }
     }
     ok(&results.join("\n"))
+}
+
+fn cmd_gpu_info() -> String {
+    let (pids, total_kb, newest_age) = crate::plugin_server::gpu_cache_snapshot();
+    let age_str = newest_age.map(|a| format!("{a}s ago")).unwrap_or_else(|| "none".to_string());
+    ok(&format!("gpu_pids={pids} total_kb={total_kb} newest_obs={age_str}"))
 }
 
 fn cmd_events(event_log: &crate::events::EventLog) -> String {

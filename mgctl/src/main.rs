@@ -48,8 +48,9 @@ fn usage() {
     eprintln!("  mgctl restart | start | stop");
     eprintln!("  mgctl service                 (systemd unit state)");
     eprintln!("  mgctl logs [-f]");
-    eprintln!("  mgctl calibrate [--dry-run]   (derive per-machine thresholds)");
-    eprintln!("  mgctl calibrate --apply       (apply previously generated calibration)");
+    eprintln!("  mgctl calibrate [--dry-run]   (derive per-machine thresholds via active sweep)");
+    eprintln!("  mgctl calibrate --apply       (apply active-sweep calibration)");
+    eprintln!("  mgctl calibrate --passive-apply  (apply daemon passive [psi] suggestion)");
     eprintln!("  mgctl doctor                  (environment + feature report)");
 }
 

@@ -1,5 +1,24 @@
 use std::fs;
 
+/// Read utime+stime ticks from /proc/<pid>/stat. Returns None on any parse failure.
+pub fn read_proc_cpu_ticks(pid: u32) -> Option<u64> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // After the last ')': state(0) ppid(1) ... utime(11) stime(12)
+    let after_comm = stat.rsplit_once(") ")?.1;
+    let mut it = after_comm.split_whitespace().skip(11);
+    let utime: u64 = it.next()?.parse().ok()?;
+    let stime: u64 = it.next()?.parse().ok()?;
+    Some(utime + stime)
+}
+
+/// Return true if the cgroup file content places the process in the user session.
+/// Checks both "/user.slice/" and "/user@...service" patterns.
+pub fn is_cgroup_in_user_slice(cgroup_content: &str) -> bool {
+    cgroup_content.lines().any(|line| {
+        line.contains("/user.slice/") || (line.contains("/user@") && line.contains(".service"))
+    })
+}
+
 /// Finds the PID of a given process name belonging to the current user.
 pub fn find_pid_by_name(target_name: &str) -> Option<u32> {
     let own_uid = unsafe { libc::geteuid() };
