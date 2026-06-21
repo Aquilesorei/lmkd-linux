@@ -88,8 +88,8 @@ The core daemon (`mgd`) runs four cooperating threads ("actors"), spawned in
 ┌───────────────┐  ┌───────────────┐     ┌─────────────────┐   ┌──────────────────┐
 │ PressureRespon│  │ RecoveryManager│    │  IPC server      │   │ MaintenanceManager│
 │   (evictor.rs)│  │ (recovery.rs)  │    │   (ipc.rs)       │   │ (maintenance.rs)  │
-│  5s poll      │  │  3s poll       │    │  unix socket     │   │  60s poll         │
-│  freeze/kill/ │  │  unfreeze/     │    │  status/list/    │   │  proactive swap   │
+│  5s poll      │  │  3s poll       │    │  unix socket     │   │  60s poll or      │
+│  freeze/kill/ │  │  unfreeze/     │    │  status/list/    │   │  kill-triggered   │
 │  checkpoint + │  │  restore at    │    │  unfreeze/reload │   │  reclaim          │
 │  system pre-  │  │  Normal only   │    │  & plugin comms  │   │                   │
 │  actions      │  │                │    │                  │   │                   │
@@ -101,10 +101,11 @@ The core daemon (`mgd`) runs four cooperating threads ("actors"), spawned in
 
 ### Why these specific threads
 
-- **PressureResponder (evictor, 5 s):** the hot loop. Reads PSI, decides and
-  executes freeze/terminate/kill/checkpoint, and runs the two *quick* system
-  pre-actions (zram compact, page-cache drop). Must stay responsive, so nothing
-  that blocks for long lives here.
+- **PressureResponder (evictor, 5 s):** the hot loop. Reads PSI, updates the
+  continuous pressure controller, runs CPU throttling and idle cgroup reclaim at
+  Normal pressure, executes freeze/terminate/kill/checkpoint at Elevated+, and runs
+  the two *quick* system pre-actions (zram compact, page-cache drop). Must stay
+  responsive, so nothing that blocks for long lives here.
 - **RecoveryManager (3 s):** acts **only at Normal pressure**. Unfreezes
   processes that have been frozen long enough, and restores checkpointed
   processes one at a time — both gated by a learned RAM baseline so the system
@@ -159,8 +160,8 @@ in `engine/decision.rs`.
 | Module | Reads | Provides |
 |--------|-------|----------|
 | `psi.rs` | `/proc/pressure/memory` | `MemoryPressure` (some/full avg10/60/300) → `PressureLevel` |
-| `meminfo.rs` | `/proc/meminfo` | `MemInfo { available, total, swap_free, swap_total }`, `swap_used_pct()` |
-| `process.rs` | `/proc/<pid>/{status,stat,oom_score,exe,cgroup}` | `Process` list, `cpu_jiffies()` for idle detection |
+| `meminfo.rs` | `/proc/meminfo`, `/proc/vmstat` | `MemInfo { available, total, swap_free, swap_total }`, `swap_used_pct()`; `read_vmstat_swap_counters()` → cumulative `pswpin`/`pswpout` page counters for I/O rate |
+| `process.rs` | `/proc/<pid>/{status,stat,oom_score,exe,cgroup}` | `Process` list including `cpu_pct` (delta from `/proc/<pid>/stat`), `cgroup_path` |
 | `zram.rs` | `/proc/swaps`, `/sys/block/zramN/mm_stat` | device list, compressed + decompressed sizes, `compact()` |
 | `gpu.rs` | `/proc/<pid>/fdinfo/*` (DRM) | per-process GPU residency (UMA), plasmashell restart |
 | `cache.rs` | configured dir trees | `posix_fadvise(DONTNEED)` page-cache drop |
@@ -172,11 +173,12 @@ Emergency`), derived `PartialOrd`/`Ord` so callers can gate on
 `level >= Elevated`. Instead of mapping raw PSI directly, the core daemon uses a **damped feedback controller** to determine the active level:
 
 1. **Pressure Score ($P$):** A normalized score ($0.0$ to $1.0$) representing overall memory stress:
-   $$P = w_{\text{PSI}} \cdot S_{\text{PSI}} + w_{\text{swap}} \cdot S_{\text{swap}} + w_{\text{GPU}} \cdot S_{\text{GPU}}$$
-   where the weights are $w_{\text{PSI}} = 0.60$, $w_{\text{swap}} = 0.25$, and $w_{\text{GPU}} = 0.15$. The sub-scores are normalized between $0.0$ and $1.0$:
+   $$P = 0.55 \cdot S_{\text{PSI}} + 0.20 \cdot S_{\text{swap}} + 0.15 \cdot S_{\text{GPU}} + 0.10 \cdot S_{\text{swapIO}}$$
+   The sub-scores are normalized between $0.0$ and $1.0$:
    *   $S_{\text{PSI}} = \text{clamp}\left(\frac{\text{PSI}_{\text{some\_avg10}}}{100.0},\, 0.0,\, 1.0\right)$
-   *   $S_{\text{swap}} = \text{clamp}\left(\frac{\text{Swap}_{\text{used\_pct}}}{100.0},\, 0.0,\, 1.0\right)$ (defaults to $0.0$ if no swap exists)
-   *   $S_{\text{GPU}} = \text{clamp}\left(\frac{\text{GPU}_{\text{UMA\_kb}}}{\text{RAM}_{\text{total\_kb}}},\, 0.0,\, 1.0\right)$ (total GPU residency reported by driver plugins)
+   *   $S_{\text{swap}} = \text{clamp}\left(\frac{\text{Swap}_{\text{used\_pct}}}{100.0},\, 0.0,\, 1.0\right)$ (defaults to $0.0$ if no swap)
+   *   $S_{\text{GPU}} = \text{clamp}\left(\frac{\text{GPU}_{\text{UMA\_kb}}}{\text{RAM}_{\text{total\_kb}}},\, 0.0,\, 1.0\right)$ (total GPU residency reported by driver plugins via `plugin_server::GPU_CACHE`, 30 s TTL)
+   *   $S_{\text{swapIO}} = \text{clamp}\left(\frac{(\Delta\text{pswpin} + \Delta\text{pswpout}) \cdot 4\,\text{KB/page}}{\Delta t \cdot 51200\,\text{KB/s}},\, 0.0,\, 1.0\right)$ — total swap I/O rate from `/proc/vmstat`, normalized at 50 MB/s (full-thrash signal). Catches fast-onset thrashing before the PSI 10 s moving average smooths it out.
 2. **Trend ($T$):** The derivative ($dP/dt$) calculated dynamically across cycles to measure pressure velocity (change per second):
    $$T = \frac{dP}{dt} \approx \frac{P_t - P_{t-1}}{\Delta t}$$
    where $\Delta t$ is the precise time elapsed (in seconds) since the last cycle.
@@ -255,8 +257,9 @@ Every process gets a 0–100 priority (higher = sacrifice sooner), resolved by
 ¹ At Critical, special cases apply in order:
 - **Per-process `checkpoint` override** (config) wins: `true` → Checkpoint;
   `false` → Kill if mostly-swapped else Terminate.
-- Else if **`swap_ratio > 0.5`** (already mostly in swap) → Kill (checkpointing
-  on-disk-already data is pointless).
+- Else if **`swap_ratio > 0.5` AND `prio >= 60`** (expendable + already mostly in swap)
+  → Kill (checkpointing on-disk-already data is pointless). Protected processes
+  (`prio < 60`) with high swap ratio fall through to Checkpoint/Kill below.
 - Else normal tier with real RAM → Checkpoint to preserve state.
 
 ### Actions (`Action` enum)
@@ -312,17 +315,23 @@ Both are **persisted to disk** in `~/.local/share/mgd/state/*.json`. A daemon re
 
 ### CRIU specifics
 
-Dump: `criu dump --tree <pid> --images-dir <dir> --shell-job --leave-stopped
---ext-unix-sk --tcp-established --file-locks`, then SIGKILL on success. Snapshots
-live in `~/.local/share/mgd/snapshots/<pid>_<name>/`. Restore:
+Checkpoint/restore is mediated by the `mgd-checkpoint` wrapper binary (see §9).
+`checkpoint.rs` resolves `mgd-checkpoint` by absolute path (sibling of the `mgd`
+binary, or `~/.local/bin/mgd-checkpoint`), then execs:
+
+Dump: `mgd-checkpoint dump <pid> <images-dir>` → wrapper validates and execs
+`criu dump --tree <pid> --images-dir <dir> --shell-job --leave-stopped --ext-unix-sk
+--tcp-established --file-locks`. SIGKILL on success. Snapshots live in
+`~/.local/share/mgd/snapshots/<pid>_<name>/`.
+
+Restore: `mgd-checkpoint restore <images-dir>` → wrapper execs
 `criu restore --images-dir <dir> --shell-job --restore-detached`.
 
-criu is resolved to an **absolute path** from a fixed candidate list
-(`/usr/sbin`, `/usr/bin`, `/sbin`, `/bin`, `/usr/local/{s}bin`) and never via a
-`PATH` search — because the binary may be capped, and a `PATH`-search invocation
-of a capped binary is a hijack vector. Privilege failures are inferred from
-stderr (no libcap dependency) and annotated with the exact `setcap` command to
-re-run. See §9 and `PRIVILEGE_DESIGN.md` §3.
+If `mgd-checkpoint` is absent or CRIU fails, `checkpoint.rs` falls back to SIGKILL
+and logs once. A **per-binary failure cache** (`mark_binary_failed` / `is_checkpoint_eligible`)
+permanently excludes any binary that has failed a CRIU dump from future checkpoint
+attempts in the same daemon session — subsequent Freeze decisions for that binary
+use a priority-based SIGTERM/SIGKILL fallback instead. See §9 and `PRIVILEGE_DESIGN.md` §3.
 
 ---
 
@@ -353,36 +362,139 @@ Cooldown-gated so a sustained High spell doesn't re-walk every 5 s.
 ### early background process cgroup reclaim (`evictor.rs`, inline pre-action, Elevated)
 
 To proactively free RAM before pressure escalates, `mgd` implements early background cgroup reclaim. When pressure is `Elevated`, it selects up to 3 background processes that:
-- Have a priority $\ge 50$ (expendable/user applications).
+- Have a priority $\in [50, 59]$ — the "normal background" tier only. Processes with
+  priority $\ge 60$ are handled exclusively by `plan()` → `Action::Freeze` +
+  post-freeze reclaim (see below), which reclaims 100% RSS after SIGSTOP with no
+  re-fault risk.
 - Have an RSS $> 20$ MB.
 - Are not the currently active foreground process (reported by plugins).
 
 It reclaims $50\%$ of their RSS by writing the target bytes to their cgroup's `memory.reclaim` node (e.g., `/sys/fs/cgroup/user.slice/.../memory.reclaim`). Since the cgroup file hierarchy under the user's slice is owned by the user, this is fully unprivileged and does not require elevated privileges (`CAP_SYS_ADMIN`). A $30$ s cooldown is enforced between runs.
 
-### proactive swap reclaim (`maintenance.rs`, maintenance thread, Normal only)
+### post-freeze cgroup reclaim (`evictor.rs`, inline post-action, Elevated+)
 
-The headline fix for the MGLRU lazy-swap-in problem. When calm, cycle the zram
-swap device (`swapoff`/`swapon`) to pull all compressed pages back into RAM.
-Blocks, so it runs on the maintenance thread. **Privileged** (`CAP_SYS_ADMIN`) —
-carried by the `mgd-zram-reclaim` helper (see §9), **off by default**. All policy
-gates live in the unprivileged daemon:
+After a successful `Action::Freeze` (SIGSTOP confirmed), the evictor immediately writes
+100% of the process's RSS to `memory.reclaim` for its cgroup (`FREEZE_RECLAIM` log event).
+The process is immobile (SIGSTOP), so there is no risk of re-faulting the pushed pages.
+This is strictly better than pre-freeze reclaim: pages are pushed while the process
+cannot touch them. Applies to all pressure-triggered Freeze decisions (prio ≥ 60);
+does **not** apply to idle-freeze (`IDLE_FREEZE`), which has its own separate path.
 
-- Normal pressure **and** `some_avg60 < 5 %` (calm, not a just-subsided spike)
+### idle background process cgroup reclaim (`evictor.rs`, Normal pressure only)
+
+At Normal pressure, `check_idle_process_reclaim()` identifies background processes that:
+- Are not the active foreground process (reported by plugins via `ActiveWindow`).
+- Have priority ≥ 50 and RSS ≥ `idle_reclaim_rss_min_mb` (default 50 MB).
+- Have been continuously in the background for ≥ `idle_sec` (default 180 s).
+
+It writes `reclaim_pct`% of their RSS (default 20%) to `memory.reclaim` for their cgroup.
+Skipped if swap occupancy exceeds `max_swap_occupancy_pct` (default 60%) — pushing more
+into an already-full swap would be counterproductive. A global cooldown of
+`global_cooldown_sec` (default 30 s) prevents back-to-back sweeps. Fully unprivileged.
+Gated by `[idle_reclaim] enabled` (on by default).
+
+### proactive swap reclaim (`maintenance.rs`, maintenance thread)
+
+The headline fix for the MGLRU lazy-swap-in problem. Cycles the zram swap device
+(`swapoff`/`swapon`) to pull all compressed pages back into RAM, then lets MGLRU
+recompress cold pages naturally via `swapon`. Blocks, so it runs on the maintenance
+thread. **Privileged** (`CAP_SYS_ADMIN`) — carried by the `mgd-zram-reclaim`
+helper (see §9), **off by default**. All policy gates live in the unprivileged daemon.
+
+**Two trigger paths:**
+
+1. **Calm path (normal cadence):** maintenance wakes every 60 s (condvar timeout),
+   checks all gates below, fires if conditions are met.
+
+2. **Kill-triggered path:** when the evictor dispatches ≥1 Kill/Terminate/Checkpoint
+   in a cycle, it signals `reclaim_wake` (condvar) immediately. The maintenance thread
+   wakes early and attempts `check_proactive_reclaim` regardless of the calm gate —
+   the kills just freed RAM + zram slots, creating the headroom the OOM gate needs.
+   The OOM headroom gate still runs (protects against OOM); only the `calm` guard is
+   bypassed for this path.
+
+**Gates (both paths check these):**
 - cooldown elapsed (`reclaim_cooldown_min`, default 10 min)
 - `zram_used ≥ min_zram_used_mb` (default 2048)
 - **OOM headroom gate (critical):** Restricts swap reclaim unless:
   $$\text{MemAvailable} > \text{Footprint}_{\text{decompressed}} \cdot m_{\text{headroom}}$$
   where $m_{\text{headroom}} = 1.5$ (default) and $\text{Footprint}_{\text{decompressed}}$ is the sum of `orig_data_size` (field 0 of `/sys/block/zramN/mm_stat`) across all zram devices. Because zram stores compressed pages that expand 2–3× on decompression, this gate prevents the reclaim operation itself from triggering a system OOM.
 
+**Why this solves the mutual-exclusion problem:** the classic failure mode was
+`avail > footprint × 1.5` being impossible to satisfy under pressure (the exact
+moment reclaim is needed). By killing expendable processes first — which frees their
+zram slots without decompressing — the gate can pass immediately after eviction.
+
 ---
 
-## 8.5 Plugins (`mgd-kde`, `mgd-gpu-intel`, etc.)
+## 8.5 `memory.max` cgroup caps (`throttle.rs` / `evictor.rs`, High+ pressure)
 
-Historically, environment-specific watchers lived inside `mgd`. They are now decoupled into standalone plugin processes that connect to the IPC server using the `mgd-common` library:
-- **`mgd-kde`**: Handles restarting the KDE `plasmashell` on GPU leaks, and reaping `plasma-discover` on CPU idle.
-- **`mgd-gpu-intel`**: Scans `/proc/<pid>/fdinfo/` (DRM) to account for UMA graphics memory as part of process footprint.
+At High+ pressure, `MemCapManager` writes `memory.max` to expendable background cgroups (priority ≥ 60, not foreground) that have been continuously in the background for ≥ 10 s. The cap is set to `current_RSS + 512 MB` — generous enough to avoid intra-cgroup OOM while preventing unbounded further growth. The kernel then reclaims from those cgroups first under further pressure.
 
-Plugins observe the system and request actions from the core daemon (`ActionRequest`), keeping the core portable.
+Caps are **restored to `max` (unlimited)** when:
+- Pressure drops below High (every cycle).
+- The process becomes the active foreground window.
+- The daemon shuts down.
+
+This is fully unprivileged: `memory.max` under `user.slice` is user-writable when systemd delegates the cgroup subtree. Writes that fail (EPERM) are silently skipped — the cgroup simply isn't capped that cycle.
+
+---
+
+## 8.6 CPU throttling / App Nap (`evictor.rs`, per-cycle)
+
+Background processes that have been out of the foreground for ≥ 10 s (debounce) have their
+cgroup CPU weight reduced via `cpu.weight` and `cpu.max`. `ThrottledState` is a two-tier
+enum (Light / Heavy) mapped by priority tier and background duration. Hard rules:
+
+- The active foreground cgroup (from `ACTIVE_FOREGROUND_PID`) is restored to full CPU
+  weight instantly whenever the active window changes.
+- Priority < 60 processes are never throttled (IDEs, DBs — low-priority but interactive).
+- All throttled cgroups are restored on daemon shutdown.
+
+This is unprivileged: `cpu.weight` and `cpu.max` under `user.slice` are user-writable.
+The evictor reads the active foreground PID from `plugin_server::get_active_foreground_pid()`
+(updated by DE plugins via `PluginMessage::ActiveWindow`).
+
+---
+
+## 8.7 Emergency hibernate (`evictor.rs`, opt-in)
+
+Last-resort fallback when pressure stays at Emergency level beyond a configurable threshold. Disabled by default (`hibernate_after_sec = 0`). When enabled, a one-shot `systemctl hibernate` is triggered after N seconds of sustained Emergency. The timer resets when pressure drops below Emergency. Only fires once per daemon run.
+
+Configure in `priorities.toml`:
+```toml
+[emergency]
+hibernate_after_sec = 120   # 0 = disabled
+```
+
+Requires a working hibernate setup (swap space ≥ RAM). If hibernate is unreliable on the platform, leave this at 0 — the existing Emergency kill path is sufficient.
+
+---
+
+## 8.8 Plugins (`mgd-kde`, `mgd-gpu-intel`, etc.)
+
+Historically, environment-specific watchers lived inside `mgd`. They are now decoupled into
+standalone plugin processes. `plugin_server::init_plugins()` (called at daemon startup)
+auto-detects and spawns the right binaries:
+- **DE detection**: reads `$XDG_CURRENT_DESKTOP` → spawns `mgd-kde`, `mgd-gnome`, or `mgd-cosmic`.
+- **GPU detection**: reads `/sys/class/drm/*/device/driver` symlinks → `i915`/`xe` spawns
+  `mgd-gpu-intel`; `amdgpu` spawns `mgd-gpu-amd`.
+
+Active plugins:
+- **`mgd-kde`**: Handles restarting the KDE `plasmashell` on GPU leaks, and reaping
+  `plasma-discover` on CPU idle. Reports active window PID via `ActiveWindow` by loading
+  a KWin JS script (via DBus/busctl) that emits `ACTIVE_WINDOW_PID:<pid>` to the journal,
+  then tailing `journalctl --user -f`. When the active window changes, the evictor immediately
+  unfreezes that process if frozen, and `MemCapManager`/`ThrottleManager` restore it to full
+  CPU and memory limits.
+- **`mgd-gpu-intel`**: Scans `/proc/<pid>/fdinfo/` (DRM, `drm-resident-*` fields) every 5 s
+  to account for UMA graphics memory. Sends `Observation { metric: GpuResidentKb }` per-pid
+  to core; core stores in `plugin_server::GPU_CACHE` (30 s TTL). Auto-spawned for `i915` or
+  `xe` drivers detected in `/sys/class/drm/*/device/driver`.
+
+Plugins observe the system and send `PluginMessage` to core; core routes via
+`plugin_server::serve_plugin_connection()`. Core broadcasts `CoreMessage::PressureChanged`
+each evictor cycle so plugins can adapt their polling rate.
 
 ---
 
@@ -398,7 +510,7 @@ which is honored regardless of who launches the process.
 |-----------|---------|-----------|---------|
 | zram compact | none (tmpfiles sysfs grant on `compact` node) | none | on |
 | swap reclaim | `mgd-zram-reclaim` (3rd binary) | `CAP_SYS_ADMIN` | **off** |
-| CRIU dump/restore | the system `criu` binary, capped | `CAP_CHECKPOINT_RESTORE` + `CAP_SYS_PTRACE` (+`CAP_NET_ADMIN` for live TCP) | on if capped |
+| CRIU dump/restore | `mgd-checkpoint` wrapper → execs capped `criu` | `CAP_CHECKPOINT_RESTORE` + `CAP_SYS_PTRACE` (+`CAP_NET_ADMIN` for live TCP) | on if criu present |
 
 Principles: narrowest capability never root; smallest carrier (prefer a sysfs
 grant over a binary, a fixed-function binary over a flexible one); **policy stays
@@ -421,12 +533,21 @@ Self-contained, libc-only, **no argv, no env, no subprocess**. It:
   refused-unsafe / 4 no-meminfo) so the daemon can tell "uncapped" (disable for
   session) from "transient" (retry).
 
-### Why CRIU has no custom helper
+### `mgd-checkpoint` (CRIU validating wrapper)
 
-`criu` is already its own external binary mgd execs, so the caps go directly on
-it (Option A). A validating wrapper (`mgd-checkpoint`, Option B) is documented as
-the multi-user hardening upgrade but deliberately not built for the single-user
-desktop threat model.
+`criu` is already its own external binary, so caps could go directly on it (Option A).
+Instead, `mgd-checkpoint` (`mgd-checkpoint/src/main.rs`) is a thin validating wrapper
+(Option B) that mgd execs in place of criu directly. It:
+- Accepts only `dump <pid> <images-dir>` or `restore <images-dir>` — no other argv.
+- Validates caller owns the target PID (`/proc/<pid>` uid check), the process lives in
+  `user.slice` (cgroup path check), and the images dir exists under the caller's home.
+- Raises ambient capabilities (`CAP_CHECKPOINT_RESTORE`, `CAP_SYS_PTRACE`,
+  `CAP_NET_ADMIN`) onto the inheritable set so they are inherited by the child `criu`
+  process, then execs criu with `env_clear()`.
+- Exit codes: 0 = ok, 1 = bad args, 2 = security validation failed, 3 = criu failed.
+
+This keeps the caps off the `criu` binary itself and adds a security validation layer
+even in the single-user desktop case.
 
 ---
 
@@ -445,8 +566,13 @@ Each tunable section follows the **config triple** pattern:
 
 Sections: `[defaults]`, `[[apps]]` (priority regexes + per-app `checkpoint`
 override), `[[protect]]` (never-touch regexes), `[category_priorities]`
-(`.desktop` fallback), `[plasma]`, `[plasma_discover]`, `[zram]`, `[reclaim]`,
-`[cache_drop]`.
+(`.desktop` fallback), `[zram]`, `[reclaim]`, `[cache_drop]`, `[psi]` (pressure-tier
+boundaries, validated as a set), `[idle_reclaim]` (idle background cgroup reclaim
+— `enabled`, `idle_sec`, `rss_min_mb`, `reclaim_pct`, `global_cooldown_sec`,
+`max_swap_occupancy_pct`), `[thresholds]` (`target_available_pct` — explicit override
+above the passive calibration file and RAM-scaling defaults), `[emergency]`
+(`hibernate_after_sec` — seconds of sustained Emergency before triggering
+`systemctl hibernate`; 0 = disabled, default).
 
 Reload is triggered by SIGHUP or `mgctl reload`; the responder picks it up at the
 top of its next cycle. `.desktop` files are re-scanned on each load to rebuild the
@@ -462,11 +588,9 @@ at `$XDG_RUNTIME_DIR/mgd.sock` (fallback `/tmp/mgd-<uid>.sock`). Responses are
 `MAX_CONNECTIONS = 8`; a stale socket from a crash is detected and rebound.
 
 `mgctl` is the client and splits cleanly into three categories:
-- **socket commands** (daemon must be alive): `status`, `list`, `unfreeze`,
-  `reload`.
+- **socket commands** (daemon must be alive): `status` (pressure + swap + throttle counts), `list` (frozen/checkpointed processes with RSS), `freeze <pid|name>`, `restore <pid|name>`, `info <pid|name>` (process detail), `ps` (all live processes with priority + CPU%), `events` (recent daemon action history), `kill <pid|name>`, `watch` (live 2-second dashboard), `unfreeze <pid|name>`, `reload`.
 - **lifecycle commands** (wrap `systemctl --user` / `journalctl --user`, work
-  even when the daemon is down — which the socket cannot): `restart`, `start`,
-  `stop`, `service` (systemd unit state), `logs [-f]`.
+  even when the daemon is down): `restart`, `start`, `stop`, `service` (systemd unit state), `logs [-f]`.
 - **standalone utility commands**: `doctor` (environment + feature report) and `calibrate` (derive per-machine PSI thresholds).
 
 `status` is the daemon's live view (pressure, frozen counts); `service` is the
@@ -499,10 +623,14 @@ Everything mgd senses comes from procfs/sysfs — no kernel module, no BPF:
 | `/proc/<pid>/exe` | untruncated basename for `.desktop` lookup |
 | `/proc/<pid>/cgroup` | user-session scoping |
 | `/proc/<pid>/fdinfo/*` | per-process GPU residency (DRM) |
+| `/proc/vmstat` | cumulative `pswpin`/`pswpout` page counters → swap I/O rate for pressure score |
 | `/proc/swaps` | zram device discovery |
 | `/sys/block/zramN/mm_stat` | compressed + decompressed pool size |
 | `/sys/block/zramN/compact` | trigger compaction (privileged write) |
 | `/sys/fs/cgroup/.../memory.reclaim` | trigger proactive cgroup memory reclaim (user write) |
+| `/sys/fs/cgroup/.../memory.max` | cap background cgroup memory growth at High+ pressure (user write) |
+| `/sys/fs/cgroup/.../cpu.weight` | CPU weight throttling for background cgroups (user write) |
+| `/sys/fs/cgroup/.../cpu.max` | CPU quota throttling for expendable background cgroups (user write) |
 
 ---
 

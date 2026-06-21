@@ -50,6 +50,8 @@ struct RawConfig {
     thresholds: Thresholds,
     #[serde(default)]
     psi: Psi,
+    #[serde(default)]
+    emergency: EmergencyConfig,
 }
 
 /// `[psi]` — pressure-tier boundaries (some_avg10 %) and the full_avg10
@@ -197,6 +199,8 @@ struct IdleReclaim {
     global_cooldown_sec: u64,
     #[serde(default = "default_idle_reclaim_max_swap_occupancy_pct")]
     max_swap_occupancy_pct: f64,
+    #[serde(default)]
+    freeze_after_sec: Option<u64>,
 }
 
 impl Default for IdleReclaim {
@@ -208,6 +212,7 @@ impl Default for IdleReclaim {
             reclaim_pct: default_idle_reclaim_reclaim_pct(),
             global_cooldown_sec: default_idle_reclaim_global_cooldown_sec(),
             max_swap_occupancy_pct: default_idle_reclaim_max_swap_occupancy_pct(),
+            freeze_after_sec: None,
         }
     }
 }
@@ -219,6 +224,20 @@ fn default_idle_reclaim_reclaim_pct() -> u64 { 20 }
 fn default_idle_reclaim_global_cooldown_sec() -> u64 { 30 }
 fn default_idle_reclaim_max_swap_occupancy_pct() -> f64 { 60.0 }
 
+/// `[emergency]` — last-resort actions when pressure stays at Emergency level.
+#[derive(Deserialize)]
+struct EmergencyConfig {
+    /// Seconds of sustained Emergency before triggering `systemctl hibernate`.
+    /// 0 (default) = disabled. Requires working hibernate (swap partition ≥ RAM).
+    #[serde(default)]
+    hibernate_after_sec: u64,
+}
+
+impl Default for EmergencyConfig {
+    fn default() -> Self {
+        EmergencyConfig { hibernate_after_sec: 0 }
+    }
+}
 
 #[derive(Deserialize)]
 struct Defaults {
@@ -302,6 +321,8 @@ pub struct CompiledConfig {
     pub idle_reclaim_pct: u64,
     pub idle_reclaim_global_cooldown_sec: u64,
     pub idle_reclaim_max_swap_occupancy_pct: f64,
+    pub idle_reclaim_freeze_after_sec: Option<u64>,
+    pub emergency_hibernate_after_sec: u64,
     /// (regex, priority, checkpoint_override)
     entries: Vec<(Regex, u8, Option<bool>)>,
     /// Patterns that must never be touched
@@ -358,6 +379,7 @@ fn load() -> CompiledConfig {
     match compile(&content) {
         Ok(mut cfg) => {
             cfg.config_path = path;
+            apply_calibration_overlay(&mut cfg);
             cfg
         }
         Err(e) => {
@@ -367,13 +389,63 @@ fn load() -> CompiledConfig {
     }
 }
 
+// ── Calibration auto-apply ────────────────────────────────────────────────────
+
+#[derive(serde::Deserialize, Default)]
+struct CalibrationSuggestion {
+    #[serde(default)]
+    psi: CalibrationPsi,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct CalibrationPsi {
+    elevated_pct: Option<f64>,
+    full_critical_pct: Option<f64>,
+}
+
+/// On every config load (startup + SIGHUP), overlay the two auto-calibrated
+/// PSI thresholds from `calibration_suggestion.toml` if the file exists and
+/// parses cleanly. Upper tiers (high/critical/emergency) are commented-out in
+/// the suggestion file and thus ignored by the TOML parser — manual review
+/// required before applying them.
+fn apply_calibration_overlay(cfg: &mut CompiledConfig) {
+    if cfg!(test) {
+        return;
+    }
+    let path = mgd_common::util::home_dir()
+        .join(".local/share/mgd/calibration_suggestion.toml");
+    let Ok(content) = std::fs::read_to_string(&path) else { return };
+    let Ok(suggestion) = toml::from_str::<CalibrationSuggestion>(&content) else { return };
+    let mut applied = false;
+    if let Some(v) = suggestion.psi.elevated_pct {
+        cfg.psi.elevated_pct = v;
+        applied = true;
+    }
+    if let Some(v) = suggestion.psi.full_critical_pct {
+        cfg.psi.full_critical_pct = v;
+        applied = true;
+    }
+    if applied {
+        eprintln!(
+            "[config] Calibration overlay applied: elevated_pct={:.1} full_critical_pct={:.1}",
+            cfg.psi.elevated_pct, cfg.psi.full_critical_pct,
+        );
+    }
+}
+
 fn try_user_config() -> Option<(String, Option<PathBuf>)> {
+    if cfg!(test) {
+        return None;
+    }
     let path = mgd_common::util::home_dir().join(".config/mgd/priorities.toml");
     let content = std::fs::read_to_string(&path).ok()?;
     Some((content, Some(path)))
 }
 
 fn try_system_config() -> Option<(String, Option<PathBuf>)> {
+    if cfg!(test) {
+        return None;
+    }
     let path = PathBuf::from("/etc/mgd/priorities.toml");
     let content = std::fs::read_to_string(&path).ok()?;
     Some((content, Some(path)))
@@ -401,13 +473,20 @@ fn ram_scaled_target_pct() -> f64 {
 /// Try to load target_available_pct from `mgctl calibrate` output.
 /// Returns None if no calibration file exists or it cannot be parsed.
 fn load_calibrated_target_pct() -> Option<f64> {
+    if cfg!(test) {
+        return None;
+    }
     let path = mgd_common::util::home_dir()
         .join(".config/mgd/calibration.toml");
     let content = std::fs::read_to_string(&path).ok()?;
+    parse_calibrated_target_pct(&content)
+}
+
+fn parse_calibrated_target_pct(content: &str) -> Option<f64> {
     for line in content.lines() {
         if let Some(rest) = line.trim().strip_prefix("target_available_pct") {
             if let Some(val) = rest.split('=').nth(1) {
-                let num: String = val.chars()
+                let num: String = val.trim().chars()
                     .take_while(|c| c.is_ascii_digit() || *c == '.')
                     .collect();
                 if let Ok(pct) = num.trim().parse::<f64>() {
@@ -494,6 +573,8 @@ fn compile(content: &str) -> Result<CompiledConfig, String> {
         idle_reclaim_pct: raw.idle_reclaim.reclaim_pct,
         idle_reclaim_global_cooldown_sec: raw.idle_reclaim.global_cooldown_sec,
         idle_reclaim_max_swap_occupancy_pct: raw.idle_reclaim.max_swap_occupancy_pct,
+        idle_reclaim_freeze_after_sec: raw.idle_reclaim.freeze_after_sec,
+        emergency_hibernate_after_sec: raw.emergency.hibernate_after_sec,
         psi,
         entries,
         protected,
@@ -605,5 +686,21 @@ mod tests {
         // elevated >= high: rejected as a set, not silently reordered.
         let cfg = compile("[psi]\nelevated_pct = 50.0\nhigh_pct = 25.0\n").unwrap();
         assert_eq!(cfg.psi, PsiThresholds::default());
+    }
+
+    #[test]
+    fn test_parse_calibrated_target_pct() {
+        let content = "\
+[thresholds]
+target_available_pct = 35      # swap onset was at 6000MB
+psi_recovery_secs    = 5
+";
+        assert_eq!(parse_calibrated_target_pct(content), Some(35.0));
+
+        let content_no_space = "target_available_pct=22.5";
+        assert_eq!(parse_calibrated_target_pct(content_no_space), Some(22.5));
+
+        let content_invalid = "target_available_pct = invalid";
+        assert_eq!(parse_calibrated_target_pct(content_invalid), None);
     }
 }

@@ -3,7 +3,8 @@ use std::collections::{HashSet, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
+use mgd_common::util::unix_timestamp_secs;
 
 
 use crate::engine::decision::{Action, Decision, plan, get_priority};
@@ -50,7 +51,10 @@ pub fn run(
     checkpointed: Arc<Mutex<CheckpointRegistry>>,
     log: Arc<Logger>,
     recovery_wake: Arc<(Mutex<bool>, Condvar)>,
+    reclaim_wake: Arc<(Mutex<bool>, Condvar)>,
     calibrator: Arc<Mutex<crate::engine::calibrate::Calibrator>>,
+    throttle_snapshot: Arc<Mutex<HashMap<String, crate::throttle::ThrottledState>>>,
+    event_log: crate::events::EventLog,
 ) {
     mgd_common::sync_print!("[responder] PSI source: {}", monitor::psi::pressure_source());
     let psi_trigger = monitor::psi::PsiTrigger::new().ok();
@@ -66,20 +70,22 @@ pub fn run(
     let mut current_state = ControlState::Calm;
     let mut pending_state = ControlState::Calm;
     let mut pending_ticks = 0usize;
-    let mut background_tracker: HashMap<String, std::time::Instant> = HashMap::new();
-    let mut throttled_states: HashMap<String, ThrottledState> = HashMap::new();
+    let mut throttle = crate::throttle::ThrottleManager::new();
+    let mut idle_reclaim_pid_tracker: HashMap<u32, std::time::Instant> = HashMap::new();
+    let mut idle_freeze_pid_tracker: HashMap<u32, std::time::Instant> = HashMap::new();
     let mut last_idle_reclaim_check = std::time::Instant::now();
     let mut last_active_pid = None;
     let mut recently_killed_cgroups: HashMap<String, std::time::Instant> = HashMap::new();
     let mut sustained_critical_swap_start: Option<std::time::Instant> = None;
+    let (mut last_pswpin, mut last_pswpout) = crate::monitor::meminfo::read_vmstat_swap_counters();
+    let mut memcap = crate::throttle::MemCapManager::new();
+    let mut sustained_emergency_start: Option<std::time::Instant> = None;
+    let mut hibernate_triggered = false;
 
     loop {
         if crate::should_shutdown() {
-            // Cleanup CPU throttling on shutdown
-            for path in throttled_states.keys() {
-                let _ = write_cgroup_cpu_weight(path, 100);
-                let _ = write_cgroup_cpu_max(path, "max 100000");
-            }
+            throttle.restore_all();
+            memcap.restore_all();
             return;
         }
 
@@ -93,6 +99,30 @@ pub fn run(
         if last_level == PressureLevel::Normal {
             if let Some(trigger) = &psi_trigger {
                 if !trigger.wait(5000) {
+                    // Timeout: no PSI event, system is calm.
+                    // Still run idle reclaim if the cooldown has elapsed so
+                    // background cgroups get reclaimed proactively during quiet
+                    // periods rather than waiting for the next pressure spike.
+                    {
+                        let config = crate::config::get();
+                        if config.idle_reclaim_enabled {
+                            let now_inst = std::time::Instant::now();
+                            if now_inst.duration_since(last_idle_reclaim_check).as_secs()
+                                >= config.idle_reclaim_global_cooldown_sec
+                            {
+                                last_idle_reclaim_check = now_inst;
+                                let procs = monitor::process::list_processes();
+                                let frozen_set: HashSet<u32> =
+                                    frozen.lock().unwrap().frozen_pids().into_iter().collect();
+                                let plan_procs: Vec<&Process> =
+                                    procs.iter().filter(|p| !frozen_set.contains(&p.pid)).collect();
+                                let active_pid = crate::plugin_server::get_active_foreground_pid();
+                                check_idle_process_reclaim(
+                                    &plan_procs, active_pid, &mut idle_reclaim_pid_tracker, &mut idle_freeze_pid_tracker, &frozen, &log,
+                                );
+                            }
+                        }
+                    }
                     continue; // Timeout, no pressure -> skip the whole cycle
                 }
             } else {
@@ -115,7 +145,20 @@ pub fn run(
 
         let meminfo = crate::monitor::meminfo::read_meminfo();
 
-        // Calculate continuous pressure score: 60% PSI, 25% Swap used, 15% GPU UMA overhead
+        let now = std::time::Instant::now();
+        let dt = now.duration_since(last_time).as_secs_f64();
+
+        // Swap I/O rate: pswpin + pswpout delta over last cycle, pages → KB/s.
+        // Normalized at 50 MB/s (51200 KB/s) total I/O — above that = thrash.
+        let (cur_pswpin, cur_pswpout) = crate::monitor::meminfo::read_vmstat_swap_counters();
+        let swap_io_pages = cur_pswpin.saturating_sub(last_pswpin)
+            .saturating_add(cur_pswpout.saturating_sub(last_pswpout));
+        last_pswpin = cur_pswpin;
+        last_pswpout = cur_pswpout;
+        let swap_io_kbs = if dt > 0.1 { (swap_io_pages * 4) as f64 / dt } else { 0.0 };
+        let swap_io_val = (swap_io_kbs / 51200.0).clamp(0.0, 1.0);
+
+        // Continuous pressure score: 55% PSI + 20% swap used + 15% GPU UMA + 10% swap I/O rate
         let psi_val = (pressure.some_avg10 / 100.0).clamp(0.0, 1.0);
         let swap_val = if meminfo.swap_total_kb > 0 {
             (meminfo.swap_used_pct() / 100.0).clamp(0.0, 1.0)
@@ -128,11 +171,9 @@ pub fn run(
         } else {
             0.0
         };
-        let p_score = 0.60 * psi_val + 0.25 * swap_val + 0.15 * gpu_val;
+        let p_score = 0.55 * psi_val + 0.20 * swap_val + 0.15 * gpu_val + 0.10 * swap_io_val;
 
         // Calculate trend (dP/dt)
-        let now = std::time::Instant::now();
-        let dt = now.duration_since(last_time).as_secs_f64();
         let trend = if dt > 0.1 {
             (p_score - last_score) / dt
         } else {
@@ -200,37 +241,54 @@ pub fn run(
 
         let swap_used_pct = meminfo.swap_used_pct();
         let swap_exhausted = meminfo.swap_total_kb > 0 && swap_used_pct >= 95.0;
-        if swap_exhausted && effective_level < PressureLevel::Critical {
-            effective_level = PressureLevel::Critical;
+
+        let prev_effective = effective_level.clone();
+        let prev_sustained = sustained_critical_swap_start;
+        (effective_level, sustained_critical_swap_start) = apply_swap_overrides(
+            effective_level,
+            swap_used_pct,
+            meminfo.swap_total_kb,
+            sustained_critical_swap_start,
+            now,
+        );
+        if swap_exhausted && effective_level >= PressureLevel::Critical && prev_effective < PressureLevel::Critical {
             mgd_common::sync_print!(
                 "[controller] Swap exhausted ({:.1}% used) — forcing effective pressure to CRITICAL to trigger eviction",
                 swap_used_pct
             );
         }
-
-        // Track sustained critical swap pressure (>= 98% swap used with Critical+ effective pressure)
-        let swap_near_full = meminfo.swap_total_kb > 0 && swap_used_pct >= 98.0;
-        if swap_near_full && effective_level >= PressureLevel::Critical {
-            if sustained_critical_swap_start.is_none() {
-                sustained_critical_swap_start = Some(std::time::Instant::now());
-            }
-        } else {
-            sustained_critical_swap_start = None;
-        }
-
-        // Escalate to Emergency if Critical+ and swap exhausted for 45s
-        if let Some(start) = sustained_critical_swap_start {
-            let elapsed = start.elapsed().as_secs();
-            if elapsed >= 45 && effective_level < PressureLevel::Emergency {
-                effective_level = PressureLevel::Emergency;
+        if effective_level >= PressureLevel::Emergency && prev_effective < PressureLevel::Emergency {
+            if let Some(start) = sustained_critical_swap_start.or(prev_sustained) {
+                let elapsed = now.duration_since(start).as_secs();
                 mgd_common::sync_print!(
                     "[controller] Sustained Critical pressure with exhausted swap (>=98% used for {}s) — escalating to EMERGENCY to evict HIGH-tier candidates",
                     elapsed
+                );
+            } else {
+                mgd_common::sync_print!(
+                    "[controller] Escalating to EMERGENCY (composite pressure score threshold exceeded: score={:.2})",
+                    p_score
                 );
             }
         }
 
         last_level = effective_level.clone();
+
+        // Hibernate last-resort: if Emergency sustained beyond threshold (disabled by default)
+        if effective_level >= PressureLevel::Emergency {
+            let start = sustained_emergency_start.get_or_insert(now);
+            let threshold = crate::config::get().emergency_hibernate_after_sec;
+            if !hibernate_triggered && threshold > 0 && now.duration_since(*start).as_secs() >= threshold {
+                hibernate_triggered = true;
+                mgd_common::sync_print!(
+                    "[responder] CRITICAL: Emergency pressure sustained {}s — triggering systemctl hibernate",
+                    threshold
+                );
+                let _ = std::process::Command::new("systemctl").arg("hibernate").spawn();
+            }
+        } else {
+            sustained_emergency_start = None;
+        }
 
         // Passive calibration (Phase D): feed the raw PSI sample before any
         // action this cycle. Samples taken while interventions are in flight
@@ -260,6 +318,30 @@ pub fn run(
                 last_idle_reclaim_check = now_inst;
             }
 
+            // Unfreeze idle-frozen process when it becomes the active window
+            if active_pid_changed {
+                if let Some(apid) = active_pid {
+                    let reg = frozen.lock().unwrap();
+                    if reg.is_frozen(apid) {
+                        let st = reg.start_time(apid);
+                        let name = reg.name(apid).to_string();
+                        drop(reg);
+                        let r = crate::executor::freezer::unfreeze_checked(apid, st);
+                        if r.success {
+                            frozen.lock().unwrap().remove(apid);
+                            mgd_common::sync_print!(
+                                "[idle-freeze] Unfroze {} (PID {}) on focus", name, apid
+                            );
+                        } else {
+                            mgd_common::sync_print!(
+                                "[idle-freeze] Unfreeze on focus failed for PID {} ({}): {:?}",
+                                apid, name, r.error
+                            );
+                        }
+                    }
+                }
+            }
+
             let procs = monitor::process::list_processes();
             let frozen_set: HashSet<u32> = frozen.lock().unwrap().frozen_pids().into_iter().collect();
             let plan_procs: Vec<&Process> = procs.iter()
@@ -267,14 +349,23 @@ pub fn run(
                 .collect();
 
             // Update CPU throttling (tiered, debounced)
-            update_cpu_throttling(&plan_procs, active_pid, &mut background_tracker, &mut throttled_states);
+            throttle.update(&plan_procs, active_pid);
+            *throttle_snapshot.lock().unwrap() = throttle.snapshot();
+
+            // Cap memory.max on expendable background cgroups at High+ pressure
+            memcap.update(&plan_procs, active_pid, &effective_level);
 
             // Idle cgroup reclaim: only runs at Normal/Calm pressure
             if effective_level == PressureLevel::Normal {
                 if config.idle_reclaim_enabled {
-                    check_idle_process_reclaim(&plan_procs, active_pid, &mut background_tracker, &log);
+                    check_idle_process_reclaim(&plan_procs, active_pid, &mut idle_reclaim_pid_tracker, &mut idle_freeze_pid_tracker, &frozen, &log);
                 }
             }
+        }
+
+        // Restore memory caps when pressure drops below High
+        if effective_level < PressureLevel::High {
+            memcap.restore_all();
         }
 
         if effective_level == PressureLevel::Normal {
@@ -301,8 +392,8 @@ pub fn run(
         let plan_procs: Vec<&Process> = procs.iter()
             .filter(|p| !frozen_set.contains(&p.pid))
             .filter(|p| {
-                if let Some(cgroup_path) = get_process_cgroup_path(p.pid) {
-                    if recently_killed_cgroups.contains_key(&cgroup_path) {
+                if let Some(ref cgroup_path) = p.cgroup_path {
+                    if recently_killed_cgroups.contains_key(cgroup_path) {
                         return false; // Skip recently targeted cgroup
                     }
                 }
@@ -319,15 +410,55 @@ pub fn run(
             mgd_common::sync_print!("✓ No action needed.");
         } else {
             mgd_common::sync_print!("⚡ EXECUTING:");
+            let mut destructive_count = 0u32;
             for d in &decisions {
                 if frozen.lock().unwrap().is_frozen(d.pid) { continue; }
 
-                let result_str = execute_decision(d, &frozen, &checkpointed, &log);
+                let result_str = execute_decision(d, &frozen, &checkpointed, &log, &event_log);
                 mgd_common::sync_print!("  {:<10} {:<8} {:<22} {:>6.1}MB  {}", d.action, d.pid, d.name, d.rss_mb, result_str);
+
+                // Post-freeze reclaim: push full RSS to zram while the process is immobile.
+                // SIGSTOP guarantees no re-faults, so 100% is safe (unlike active-process
+                // early reclaim which caps at 50% to preserve a working set).
+                if d.action == Action::Freeze && result_str == "frozen" {
+                    if let Some(cgroup_path) = plan_procs.iter()
+                        .find(|p| p.pid == d.pid)
+                        .and_then(|p| p.cgroup_path.as_deref())
+                    {
+                        let reclaim_bytes = (d.rss_mb * 1024.0 * 1024.0) as u64;
+                        match reclaim_cgroup(cgroup_path, reclaim_bytes) {
+                            Ok(()) => {
+                                mgd_common::sync_print!(
+                                    "[reclaim] Post-freeze: pushed ~{:.0}MB from PID {} ({}) to zram",
+                                    d.rss_mb, d.pid, d.name
+                                );
+                                log.log(&LogEntry::new(
+                                    "FREEZE_RECLAIM",
+                                    d.pid,
+                                    &d.name,
+                                    d.rss_mb,
+                                    "pushed to zram after pressure freeze",
+                                ));
+                            }
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                            Err(_) => {}
+                        }
+                    }
+                }
+
+                // Terminate is async (SIGTERM→5s→SIGKILL): RAM not freed yet when we
+                // signal maintenance. Only count synchronous kills (Kill, Checkpoint).
+                if matches!(d.action, Action::Kill | Action::Checkpoint) {
+                    destructive_count += 1;
+                }
 
                 // Track recently terminated/killed cgroups
                 if d.action == Action::Kill || d.action == Action::Terminate {
-                    if let Some(cgroup_path) = get_process_cgroup_path(d.pid) {
+                    let cgroup_path = plan_procs.iter()
+                        .find(|p| p.pid == d.pid)
+                        .and_then(|p| p.cgroup_path.clone())
+                        .or_else(|| mgd_common::util::read_process_cgroup_path(d.pid));
+                    if let Some(cgroup_path) = cgroup_path {
                         recently_killed_cgroups.insert(cgroup_path, std::time::Instant::now());
                     }
                 }
@@ -336,10 +467,97 @@ pub fn run(
             let (lock, cvar) = &*recovery_wake;
             *lock.lock().unwrap() = true;
             cvar.notify_one();
+
+            // Kills/checkpoints freed RAM + zram slots — wake maintenance so it
+            // can attempt proactive swap reclaim while headroom still exists.
+            if destructive_count > 0 {
+                let (lock, cvar) = &*reclaim_wake;
+                *lock.lock().unwrap() = true;
+                cvar.notify_one();
+            }
         }
     }
 }
 
+/// Pure: given current effective pressure + swap stats + sustained-start timer,
+/// returns the updated (effective_level, sustained_critical_swap_start).
+/// No I/O, no logging — caller owns those responsibilities.
+pub(crate) fn apply_swap_overrides(
+    mut effective: PressureLevel,
+    swap_used_pct: f64,
+    swap_total_kb: u64,
+    sustained_start: Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> (PressureLevel, Option<std::time::Instant>) {
+    let swap_exhausted = swap_total_kb > 0 && swap_used_pct >= 95.0;
+    if swap_exhausted && effective < PressureLevel::Critical {
+        effective = PressureLevel::Critical;
+    }
+
+    let swap_near_full = swap_total_kb > 0 && swap_used_pct >= 98.0;
+    let new_sustained = if swap_near_full && effective >= PressureLevel::Critical {
+        sustained_start.or(Some(now))
+    } else if effective >= PressureLevel::Emergency {
+        // Already at Emergency (score-driven or prior escalation) — preserve the timer so
+        // a single cycle dip below 98% doesn't restart the 45 s window.
+        sustained_start
+    } else {
+        None
+    };
+
+    if let Some(start) = new_sustained {
+        let elapsed = now.duration_since(start).as_secs();
+        if elapsed >= 45 && effective < PressureLevel::Emergency {
+            effective = PressureLevel::Emergency;
+        }
+    }
+
+    (effective, new_sustained)
+}
+
+pub(crate) struct IdleReclaimConfig {
+    pub max_swap_occupancy_pct: f64,
+    pub idle_sec: u64,
+    pub rss_min_mb: u64,
+    pub reclaim_pct: u64,
+}
+
+/// Pure: returns (pid, reclaim_bytes) pairs for processes eligible for idle cgroup reclaim.
+/// Keyed by PID in background_tracker. No cgroup writes — caller handles I/O.
+pub(crate) fn select_idle_candidates(
+    procs: &[&crate::monitor::process::Process],
+    active_pid: Option<u32>,
+    background_tracker: &std::collections::HashMap<u32, std::time::Instant>,
+    swap_used_pct: f64,
+    cfg: &IdleReclaimConfig,
+) -> Vec<(u32, u64)> {
+    if swap_used_pct > cfg.max_swap_occupancy_pct {
+        return vec![];
+    }
+    let mut candidates = vec![];
+    for p in procs {
+        if Some(p.pid) == active_pid {
+            continue;
+        }
+        let prio = crate::engine::decision::get_priority(&p.name, p.exe_basename.as_deref());
+        if prio < 50 {
+            continue;
+        }
+        if p.rss_kb < cfg.rss_min_mb * 1024 {
+            continue;
+        }
+        let duration = background_tracker
+            .get(&p.pid)
+            .map(|t| t.elapsed().as_secs())
+            .unwrap_or(0);
+        if duration < cfg.idle_sec {
+            continue;
+        }
+        let reclaim_bytes = (p.rss_kb * cfg.reclaim_pct / 100) * 1024;
+        candidates.push((p.pid, reclaim_bytes));
+    }
+    candidates
+}
 
 
 /// Compact zram at Elevated+ to free fragmented pages before touching a process.
@@ -411,7 +629,7 @@ fn check_cache_drop(level: &PressureLevel, log: &Logger) {
         return;
     }
 
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let now = unix_timestamp_secs();
     let last = LAST_CACHE_DROP.load(Ordering::Relaxed);
     if last != 0 && now.saturating_sub(last) < cooldown_secs {
         return;
@@ -482,19 +700,21 @@ fn execute_decision(
     frozen: &Arc<Mutex<FrozenRegistry>>,
     checkpointed: &Arc<Mutex<CheckpointRegistry>>,
     log: &Logger,
+    event_log: &crate::events::EventLog,
 ) -> String {
     let (action_name, s) = match d.action {
-        Action::Freeze => ("FREEZE", execute_freeze(d, frozen)),
-        Action::Terminate => ("TERMINATE", execute_terminate(d)),
-        Action::Kill => ("KILL", execute_kill(d)),
-        Action::Checkpoint => ("CHECKPOINT", execute_checkpoint(d, checkpointed)),
+        Action::Freeze => ("FREEZE", freeze_process(d, frozen)),
+        Action::Terminate => ("TERMINATE", terminate_process(d)),
+        Action::Kill => ("KILL", kill_process(d)),
+        Action::Checkpoint => execute_checkpoint(d, checkpointed),
         Action::None => return String::new(),
     };
     log.log(&LogEntry::new(action_name, d.pid, &d.name, d.rss_mb, &s));
+    crate::events::push(event_log, action_name, d.pid, &d.name, &s);
     s
 }
 
-fn execute_freeze(d: &Decision, frozen: &Arc<Mutex<FrozenRegistry>>) -> String {
+fn freeze_process(d: &Decision, frozen: &Arc<Mutex<FrozenRegistry>>) -> String {
     // Abort if start_time is gone rather than freeze a recycled PID.
     let st = match crate::executor::read_start_time(d.pid) {
         Some(t) => t,
@@ -513,54 +733,67 @@ fn execute_freeze(d: &Decision, frozen: &Arc<Mutex<FrozenRegistry>>) -> String {
     }
 }
 
-fn execute_terminate(d: &Decision) -> String {
+fn terminate_process(d: &Decision) -> String {
     // SIGTERM→wait→SIGKILL blocks up to 5s; run it off-thread so the responder
     // isn't stalled per process at Critical.
     let pid = d.pid;
-    std::thread::spawn(move || { crate::executor::killer::terminate(pid); });
+    std::thread::spawn(move || { crate::executor::killer::sigterm(pid); });
     "terminating (async SIGTERM→SIGKILL)".into()
 }
 
-fn execute_kill(d: &Decision) -> String {
-    let r = crate::executor::killer::kill(d.pid);
-    if r.success { "killed".into() }
-    else { format!("fail: {}", r.error.unwrap_or_default()) }
+fn kill_process(d: &Decision) -> String {
+    let r = crate::executor::killer::sigkill(d.pid);
+
+    match r.error {
+        None => "killed".to_string(),
+        Some(err) => format!("fail: {}", err),
+    }
 }
 
-fn execute_checkpoint(d: &Decision, checkpointed: &Arc<Mutex<CheckpointRegistry>>) -> String {
+fn execute_checkpoint(d: &Decision, checkpointed: &Arc<Mutex<CheckpointRegistry>>) -> (&'static str, String) {
     let r = crate::executor::checkpoint::checkpoint(d.pid, &d.name);
     if r.success {
         let dir = r.snapshot_dir.unwrap();
         checkpointed.lock().unwrap()
             .add(d.pid, &d.name, dir.clone(), d.rss_mb as u64 * 1024);
-        format!("checkpointed → {dir:?}")
+        ("CHECKPOINT", format!("checkpointed → {dir:?}"))
     } else {
-        let kr = crate::executor::killer::kill(d.pid);
-        if kr.success { "killed (CRIU failed)".into() }
-        else { format!("kill_fail: {}", kr.error.unwrap_or_default()) }
+        // Dump failed — this binary is not safely checkpointable; record it so
+        // future cycles skip CRIU for it and route directly here.
+        crate::executor::checkpoint::mark_binary_failed(&d.name);
+        // Fall back using the same prio logic as when cp_supported=false:
+        // prio >= 60 → Terminate (async, graceful); prio < 60 → Kill (protected process,
+        // dump likely failed due to complex state, don't wait for SIGTERM).
+        if d.prio >= 60 {
+            terminate_process(d);
+            ("TERMINATE", format!("terminating (CRIU failed: {})", r.error.unwrap_or_default()))
+        } else {
+            let kr = crate::executor::killer::sigkill(d.pid);
+            if kr.success {
+                ("KILL", format!("killed (CRIU failed: {})", r.error.unwrap_or_default()))
+            } else {
+                ("KILL", format!("kill_fail: {}", kr.error.unwrap_or_default()))
+            }
+        }
     }
 }
 
-fn reclaim_process_cgroup(pid: u32, bytes: u64) -> Result<(), std::io::Error> {
-    let cgroup_file = format!("/proc/{}/cgroup", pid);
-    let content = std::fs::read_to_string(&cgroup_file)?;
-    for line in content.lines() {
-        if let Some(path) = line.strip_prefix("0::") {
-            let path = path.trim();
-            if path == "/" {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    "cannot reclaim root cgroup",
-                ));
-            }
-            let reclaim_path = std::path::Path::new("/sys/fs/cgroup")
-                .join(path.trim_start_matches('/'))
-                .join("memory.reclaim");
-            if reclaim_path.exists() {
-                std::fs::write(&reclaim_path, format!("{}", bytes))?;
-                return Ok(());
-            }
-        }
+fn reclaim_cgroup(cgroup_path: &str, bytes_size: u64) -> Result<(), std::io::Error> {
+
+    if bytes_size == 0 {
+        return Ok(());
+    }
+
+    if cgroup_path == "/" {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "cannot reclaim root cgroup",
+        ));
+    }
+    let reclaim_path = crate::throttle::cgroup_sysfs_path(cgroup_path, "memory.reclaim");
+    if reclaim_path.exists() {
+        std::fs::write(&reclaim_path, format!("{}", bytes_size))?;
+        return Ok(());
     }
     Err(std::io::Error::new(std::io::ErrorKind::NotFound, "cgroup memory.reclaim not found"))
 }
@@ -575,10 +808,7 @@ fn check_early_process_reclaim(
         return;
     }
 
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+    let now = unix_timestamp_secs();
     let last = LAST_EARLY_RECLAIM.load(Ordering::Relaxed);
     if last != 0 && now.saturating_sub(last) < 30 {
         return; // 30s cooldown
@@ -589,12 +819,21 @@ fn check_early_process_reclaim(
     // - Priority >= 50 (expendable/user apps)
     // - RSS > 20MB
     // - Not the active foreground process
+    // prio >= 60 processes are handled by plan() → Action::Freeze + post-freeze reclaim,
+    // which reclaims 100% RSS after SIGSTOP (no re-fault risk). Restricting to prio < 60
+    // here avoids a redundant memory.reclaim write on those same pids.
+    // Known edge: if swap_exhausted causes a Kill (prio>=80) to break the plan() loop
+    // before a prio[60,79] process is reached, that process misses both paths for that
+    // cycle. Accepted — swap_exhausted+Critical is already a crisis; next cycle corrects.
     let mut targets: Vec<&Process> = plan_procs
         .iter()
         .filter(|p| {
             p.rss_kb > 20_000
                 && Some(p.pid) != active_pid
-                && get_priority(&p.name, p.exe_basename.as_deref()) >= 50
+                && {
+                    let prio = get_priority(&p.name, p.exe_basename.as_deref());
+                    prio >= 50 && prio < 60
+                }
         })
         .copied()
         .collect();
@@ -603,12 +842,13 @@ fn check_early_process_reclaim(
     targets.sort_by_key(|p| std::cmp::Reverse(p.rss_kb));
 
     for p in targets.iter().take(3) {
-        let reclaim_bytes = (p.rss_kb / 2) * 1024; // reclaim 50% of RSS
-        match reclaim_process_cgroup(p.pid, reclaim_bytes) {
+        let reclaim_bytes_size = (p.rss_kb / 2) * 1024; // reclaim 50% of RSS
+        let Some(cgroup) = p.cgroup_path.as_deref() else { continue };
+        match reclaim_cgroup(cgroup, reclaim_bytes_size) {
             Ok(()) => {
                 mgd_common::sync_print!(
                     "[reclaim] Proactively pushed ~{}MB of background PID {} ({}) to Zram",
-                    reclaim_bytes / (1024 * 1024),
+                    reclaim_bytes_size / (1024 * 1024),
                     p.pid,
                     p.name
                 );
@@ -616,17 +856,17 @@ fn check_early_process_reclaim(
                     "EARLY_RECLAIM",
                     p.pid,
                     &p.name,
-                    (reclaim_bytes / (1024 * 1024)) as f64,
+                    (reclaim_bytes_size / (1024 * 1024)) as f64,
                     "pushed to zram via cgroup reclaim",
                 ));
             }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                // EAGAIN: nothing reclaimable right now, skip silently.
+            }
             Err(e) => {
-                // Ignore transient errors, log at debug
                 mgd_common::sync_print!(
                     "[reclaim] Early reclaim failed for PID {} ({}): {}",
-                    p.pid,
-                    p.name,
-                    e
+                    p.pid, p.name, e
                 );
             }
         }
@@ -636,275 +876,305 @@ fn check_early_process_reclaim(
 fn check_idle_process_reclaim(
     plan_procs: &[&Process],
     active_pid: Option<u32>,
-    background_tracker: &mut HashMap<String, std::time::Instant>,
+    pid_tracker: &mut HashMap<u32, std::time::Instant>,
+    freeze_pid_tracker: &mut HashMap<u32, std::time::Instant>,
+    frozen: &Arc<Mutex<FrozenRegistry>>,
     log: &Logger,
 ) {
     let config = crate::config::get();
-    
-    // Safety gates: swap/zram occupancy
     let meminfo = crate::monitor::meminfo::read_meminfo();
-    if meminfo.swap_total_kb > 0 {
-        let swap_used_pct = meminfo.swap_used_pct();
-        if swap_used_pct > config.idle_reclaim_max_swap_occupancy_pct {
+
+    let swap_used_pct = if meminfo.swap_total_kb > 0 {
+        let pct = meminfo.swap_used_pct();
+        // Hard gate: less than 1.5 GB swap free is too risky to push more
+        if meminfo.swap_free_kb / 1024 < 1500 {
             return;
         }
-        let swap_free_mb = meminfo.swap_free_kb / 1024;
-        if swap_free_mb < 1500 {
-            return; // Less than 1.5 GB swap free
-        }
-    }
+        pct
+    } else {
+        0.0
+    };
 
-    // 1. Group processes by cgroup path
-    let mut cgroup_groups: HashMap<String, Vec<&Process>> = HashMap::new();
+    // Prune entries for processes no longer alive (shared by both reclaim and freeze trackers)
+    let live_pids: HashSet<u32> = plan_procs.iter().map(|p| p.pid).collect();
+    pid_tracker.retain(|pid, _| live_pids.contains(pid));
+
+    // Delegate candidate selection to the pure helper
+    let idle_cfg = IdleReclaimConfig {
+        max_swap_occupancy_pct: config.idle_reclaim_max_swap_occupancy_pct,
+        idle_sec: config.idle_reclaim_sec,
+        rss_min_mb: config.idle_reclaim_rss_min_mb,
+        reclaim_pct: config.idle_reclaim_pct,
+    };
+    let candidates = select_idle_candidates(plan_procs, active_pid, pid_tracker, swap_used_pct, &idle_cfg);
+
+    // Start the background clock for all eligible processes not yet tracked
     for p in plan_procs {
-        if let Some(cgroup_path) = get_process_cgroup_path(p.pid) {
-            cgroup_groups.entry(cgroup_path).or_default().push(p);
+        if Some(p.pid) != active_pid {
+            pid_tracker.entry(p.pid).or_insert_with(std::time::Instant::now);
         }
     }
 
-    // 2. Identify the active foreground cgroup path (if any)
-    let foreground_cgroup_path = active_pid.and_then(|pid| get_process_cgroup_path(pid));
+    // Execute: write to each candidate's cgroup memory.reclaim (cap at 3)
+    for (i, (pid, bytes_to_reclaim_size)) in candidates.iter().enumerate() {
+        if i >= 3 { break; }
+        if *bytes_to_reclaim_size == 0 { continue; }
 
-    // 3. Prune dead cgroups from background tracker
-    let active_cgroups: HashSet<&String> = cgroup_groups.keys().collect();
-    background_tracker.retain(|path, _| active_cgroups.contains(path));
-
-    let mut reclaimed_count = 0;
-    for (cgroup_path, processes) in &cgroup_groups {
-        if Some(cgroup_path) == foreground_cgroup_path.as_ref() {
-            background_tracker.remove(cgroup_path);
-            continue;
-        }
-
-        // Sum the total RSS of processes in this cgroup
-        let total_rss_kb: u64 = processes.iter().map(|p| p.rss_kb).sum();
-        
-        // Find minimum priority in this cgroup
-        let mut min_priority = 100;
-        let mut debug_name = String::new();
-        for p in processes {
-            let prio = get_priority(&p.name, p.exe_basename.as_deref());
-            if prio < min_priority {
-                min_priority = prio;
-                debug_name = p.name.clone();
-            }
-        }
-
-        if min_priority < 50 || total_rss_kb < config.idle_reclaim_rss_min_mb * 1024 {
-            background_tracker.remove(cgroup_path);
-            continue;
-        }
-
-        // Track duration in background
-        let background_duration = background_tracker
-            .entry(cgroup_path.clone())
-            .or_insert_with(std::time::Instant::now)
-            .elapsed()
-            .as_secs();
-
-        if background_duration >= config.idle_reclaim_sec {
-            // Qualifies for reclaim!
-            let reclaim_bytes = (total_rss_kb * config.idle_reclaim_pct / 100) * 1024;
-            if reclaim_bytes > 0 {
-                // Write to the cgroup's memory.reclaim
-                let reclaim_path = std::path::Path::new("/sys/fs/cgroup")
-                    .join(cgroup_path.trim_start_matches('/'))
-                    .join("memory.reclaim");
-                
-                if reclaim_path.exists() {
-                    match std::fs::write(&reclaim_path, format!("{}", reclaim_bytes)) {
-                        Ok(()) => {
-                            mgd_common::sync_print!(
-                                "[reclaim] Proactively reclaimed ~{}MB from idle background cgroup {} (e.g. {})",
-                                reclaim_bytes / (1024 * 1024),
-                                cgroup_path,
-                                debug_name
-                            );
-                            // Log using the PID of the largest process in the cgroup for compatibility with log tools
-                            let max_proc = processes.iter().max_by_key(|p| p.rss_kb);
-                            if let Some(p) = max_proc {
-                                log.log(&LogEntry::new(
-                                    "EARLY_RECLAIM",
-                                    p.pid,
-                                    &p.name,
-                                    (reclaim_bytes / (1024 * 1024)) as f64,
-                                    "proactively pushed idle cgroup to zram",
-                                ));
-                            }
-
-                            // Reset the timer in tracker to serve as per-process cooldown
-                            background_tracker.insert(cgroup_path.clone(), std::time::Instant::now());
-
-                            reclaimed_count += 1;
-                            if reclaimed_count >= 3 {
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            mgd_common::sync_print!(
-                                "[reclaim] Proactive idle reclaim failed for cgroup {} ({}): {}",
-                                cgroup_path,
-                                debug_name,
-                                e
-                            );
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ThrottledState {
-    None,
-    WeightOnly,
-    Full,
-}
-
-fn get_process_cgroup_path(pid: u32) -> Option<String> {
-    let cgroup_file = format!("/proc/{}/cgroup", pid);
-    let content = std::fs::read_to_string(&cgroup_file).ok()?;
-    for line in content.lines() {
-        if let Some(path) = line.strip_prefix("0::") {
-            let path = path.trim();
-            if path != "/" {
-                return Some(path.to_string());
-            }
-        }
-    }
-    None
-}
-
-fn write_cgroup_cpu_weight(cgroup_path: &str, weight: u32) -> Result<(), std::io::Error> {
-    let path = std::path::Path::new("/sys/fs/cgroup")
-        .join(cgroup_path.trim_start_matches('/'))
-        .join("cpu.weight");
-    if path.exists() {
-        std::fs::write(&path, format!("{}", weight))?;
-        return Ok(());
-    }
-    Err(std::io::Error::new(std::io::ErrorKind::NotFound, "cpu.weight not found"))
-}
-
-fn write_cgroup_cpu_max(cgroup_path: &str, max_limit: &str) -> Result<(), std::io::Error> {
-    let path = std::path::Path::new("/sys/fs/cgroup")
-        .join(cgroup_path.trim_start_matches('/'))
-        .join("cpu.max");
-    if path.exists() {
-        std::fs::write(&path, max_limit)?;
-        return Ok(());
-    }
-    Err(std::io::Error::new(std::io::ErrorKind::NotFound, "cpu.max not found"))
-}
-
-fn update_cpu_throttling(
-    plan_procs: &[&Process],
-    active_pid: Option<u32>,
-    background_tracker: &mut HashMap<String, std::time::Instant>,
-    throttled_states: &mut HashMap<String, ThrottledState>,
-) {
-    // 1. Group processes by cgroup path
-    let mut cgroup_groups: HashMap<String, Vec<&Process>> = HashMap::new();
-    for p in plan_procs {
-        if let Some(cgroup_path) = get_process_cgroup_path(p.pid) {
-            cgroup_groups.entry(cgroup_path).or_default().push(p);
-        }
-    }
-
-    // 2. Identify the active foreground cgroup path (if any)
-    let foreground_cgroup_path = active_pid.and_then(|pid| get_process_cgroup_path(pid));
-
-    // 3. Prune dead cgroups from trackers
-    let active_cgroups: HashSet<&String> = cgroup_groups.keys().collect();
-    background_tracker.retain(|path, _| active_cgroups.contains(path));
-    throttled_states.retain(|path, _| active_cgroups.contains(path));
-
-    // 4. Update cgroup throttling states
-    for (cgroup_path, processes) in &cgroup_groups {
-        let current_throttled = throttled_states.get(cgroup_path).copied().unwrap_or(ThrottledState::None);
-
-        if Some(cgroup_path) == foreground_cgroup_path.as_ref() {
-            // Foreground cgroup must be unthrottled instantly
-            if current_throttled != ThrottledState::None {
-                let _ = write_cgroup_cpu_weight(cgroup_path, 100);
-                let _ = write_cgroup_cpu_max(cgroup_path, "max 100000");
-                throttled_states.insert(cgroup_path.clone(), ThrottledState::None);
-                mgd_common::sync_print!("[throttle] Restored foreground cgroup {} to normal CPU shares", cgroup_path);
-            }
-            background_tracker.remove(cgroup_path);
-            continue;
-        }
-
-        // Background cgroup: find minimum priority of processes inside it
-        let mut min_priority = 100;
-        let mut debug_name = String::new();
-        for p in processes {
-            let prio = get_priority(&p.name, p.exe_basename.as_deref());
-            if prio < min_priority {
-                min_priority = prio;
-                debug_name = p.name.clone();
-            }
-        }
-
-        if min_priority < 60 {
-            // Exclude priorities < 60 (system, high, normal apps like IDEs/browsers) from CPU throttling
-            if current_throttled != ThrottledState::None {
-                let _ = write_cgroup_cpu_weight(cgroup_path, 100);
-                let _ = write_cgroup_cpu_max(cgroup_path, "max 100000");
-                throttled_states.insert(cgroup_path.clone(), ThrottledState::None);
-                mgd_common::sync_print!("[throttle] Restored background cgroup {} to normal CPU shares (priority < 60)", cgroup_path);
-            }
-            background_tracker.remove(cgroup_path);
-            continue;
-        }
-
-        // Track duration in background
-        let background_duration = background_tracker
-            .entry(cgroup_path.clone())
-            .or_insert_with(std::time::Instant::now)
-            .elapsed()
-            .as_secs();
-
-        // Target throttled state
-        let target_throttled = if background_duration >= 10 { // 10s debounce
-            if min_priority >= 80 {
-                ThrottledState::Full
-            } else {
-                ThrottledState::WeightOnly
-            }
-        } else {
-            ThrottledState::None
+        let proc_entry = plan_procs.iter().find(|p| p.pid == *pid).copied();
+        let name = proc_entry.map(|p| p.name.as_str()).unwrap_or("unknown");
+        let cgroup = match proc_entry.and_then(|p| p.cgroup_path.as_deref()) {
+            Some(c) => c,
+            None => continue,
         };
 
-        if target_throttled != current_throttled {
-            match target_throttled {
-                ThrottledState::None => {
-                    let _ = write_cgroup_cpu_weight(cgroup_path, 100);
-                    let _ = write_cgroup_cpu_max(cgroup_path, "max 100000");
-                    mgd_common::sync_print!("[throttle] Unthrottled cgroup {}", cgroup_path);
+        match reclaim_cgroup(cgroup, *bytes_to_reclaim_size) {
+            Ok(()) => {
+                mgd_common::sync_print!(
+                    "[reclaim] Proactively reclaimed ~{}MB from idle background process {} (PID {})",
+                    bytes_to_reclaim_size / (1024 * 1024),
+                    name,
+                    pid
+                );
+                if let Some(p) = proc_entry {
+                    log.log(&LogEntry::new(
+                        "EARLY_RECLAIM",
+                        p.pid,
+                        &p.name,
+                        (*bytes_to_reclaim_size / (1024 * 1024)) as f64,
+                        "proactively pushed idle process to zram",
+                    ));
                 }
-                ThrottledState::WeightOnly => {
-                    if write_cgroup_cpu_weight(cgroup_path, 1).is_ok() {
-                        let _ = write_cgroup_cpu_max(cgroup_path, "max 100000");
-                        mgd_common::sync_print!(
-                            "[throttle] Set weight=1 for background cgroup {} (e.g. {})",
-                            cgroup_path,
-                            debug_name
-                        );
-                    }
-                }
-                ThrottledState::Full => {
-                    if write_cgroup_cpu_weight(cgroup_path, 1).is_ok() && write_cgroup_cpu_max(cgroup_path, "50000 100000").is_ok() {
-                        mgd_common::sync_print!(
-                            "[throttle] Capped CPU & weight=1 for low-priority cgroup {} (e.g. {})",
-                            cgroup_path,
-                            debug_name
-                        );
-                    }
+                // Reset timer → serves as per-process cooldown
+                pid_tracker.insert(*pid, std::time::Instant::now());
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                // EAGAIN: kernel has nothing reclaimable right now — not an error.
+                // Reset timer so we back off for a full idle_sec before retrying.
+                pid_tracker.insert(*pid, std::time::Instant::now());
+            }
+            Err(e) => {
+                mgd_common::sync_print!(
+                    "[reclaim] Proactive idle reclaim failed for PID {} ({}): {}",
+                    pid, name, e
+                );
+            }
+        }
+    }
+
+    // Proactive idle freeze: SIGSTOP processes idle >= freeze_after_sec.
+    // Uses a PID-keyed tracker so duplicate process names don't share timers.
+    freeze_pid_tracker.retain(|pid, _| live_pids.contains(pid));
+
+    if let Some(freeze_secs) = config.idle_reclaim_freeze_after_sec {
+        let mut freeze_count = 0;
+        for p in plan_procs {
+            if freeze_count >= 2 { break; }
+            if Some(p.pid) == active_pid { continue; }
+            if p.rss_kb < config.idle_reclaim_rss_min_mb * 1024 { continue; }
+
+            let elapsed = freeze_pid_tracker
+                .entry(p.pid)
+                .or_insert_with(std::time::Instant::now)
+                .elapsed()
+                .as_secs();
+            if elapsed < freeze_secs { continue; }
+
+            let st = match crate::executor::read_start_time(p.pid) {
+                Some(t) => t,
+                None => continue,
+            };
+            let r = crate::executor::freezer::freeze_checked(p.pid, st);
+            if r.success {
+                if frozen.lock().unwrap().add(p.pid, &p.name) {
+                    mgd_common::sync_print!(
+                        "[idle-freeze] Froze idle background process {} (PID {}, idle {}s)",
+                        p.name, p.pid, elapsed
+                    );
+                    log.log(&LogEntry::new(
+                        "IDLE_FREEZE",
+                        p.pid,
+                        &p.name,
+                        p.rss_kb as f64 / 1024.0,
+                        "proactively froze idle background process",
+                    ));
+                    freeze_pid_tracker.remove(&p.pid);
+                    freeze_count += 1;
+                } else {
+                    crate::executor::freezer::unfreeze(p.pid);
                 }
             }
-            throttled_states.insert(cgroup_path.clone(), target_throttled);
         }
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::monitor::psi::PressureLevel;
+    use crate::monitor::process::Process;
+    use std::collections::HashMap;
+    use std::time::{Duration, Instant};
+
+    fn make_process(pid: u32, name: &str, rss_kb: u64) -> Process {
+        Process {
+            pid,
+            name: name.to_string(),
+            exe_basename: None,
+            rss_kb,
+            swap_kb: 0,
+            oom_score: 0,
+            cgroup_path: None,
+            cpu_pct: 0.0,
+        }
+    }
+
+    fn default_idle_cfg() -> IdleReclaimConfig {
+        IdleReclaimConfig { max_swap_occupancy_pct: 60.0, idle_sec: 180, rss_min_mb: 50, reclaim_pct: 20 }
+    }
+
+    fn make_pid_tracker(pid: u32, secs_ago: u64) -> HashMap<u32, Instant> {
+        let mut m = HashMap::new();
+        m.insert(pid, Instant::now() - Duration::from_secs(secs_ago));
+        m
+    }
+
+    // ── apply_swap_overrides ─────────────────────────────────────────────────
+
+    #[test]
+    fn swap_below_95_no_override() {
+        let now = Instant::now();
+        let (level, sustained) = apply_swap_overrides(PressureLevel::Elevated, 94.9, 10_000_000, None, now);
+        assert_eq!(level, PressureLevel::Elevated);
+        assert!(sustained.is_none());
+    }
+
+    #[test]
+    fn swap_95_forces_critical() {
+        let now = Instant::now();
+        let (level, _) = apply_swap_overrides(PressureLevel::Elevated, 95.0, 10_000_000, None, now);
+        assert_eq!(level, PressureLevel::Critical);
+    }
+
+    #[test]
+    fn swap_95_no_override_when_already_critical() {
+        let now = Instant::now();
+        let (level, _) = apply_swap_overrides(PressureLevel::Critical, 95.0, 10_000_000, None, now);
+        assert_eq!(level, PressureLevel::Critical);
+    }
+
+    #[test]
+    fn swap_no_device_no_override() {
+        let now = Instant::now();
+        let (level, _) = apply_swap_overrides(PressureLevel::Elevated, 99.0, 0, None, now);
+        assert_eq!(level, PressureLevel::Elevated);
+    }
+
+    #[test]
+    fn sustained_critical_swap_escalates_emergency() {
+        let start = Instant::now() - Duration::from_secs(46);
+        let now = Instant::now();
+        let (level, _) = apply_swap_overrides(PressureLevel::Critical, 98.5, 10_000_000, Some(start), now);
+        assert_eq!(level, PressureLevel::Emergency);
+    }
+
+    #[test]
+    fn sustained_critical_swap_not_yet_45s() {
+        let start = Instant::now() - Duration::from_secs(44);
+        let now = Instant::now();
+        let (level, _) = apply_swap_overrides(PressureLevel::Critical, 98.5, 10_000_000, Some(start), now);
+        assert_eq!(level, PressureLevel::Critical);
+    }
+
+    #[test]
+    fn sustained_critical_swap_resets_when_swap_drops() {
+        let start = Instant::now() - Duration::from_secs(50);
+        let now = Instant::now();
+        let (_, sustained) = apply_swap_overrides(PressureLevel::Critical, 97.9, 10_000_000, Some(start), now);
+        assert!(sustained.is_none(), "timer must reset when swap < 98%");
+    }
+
+    #[test]
+    fn swap_98_starts_sustained_timer() {
+        let now = Instant::now();
+        let (_, sustained) = apply_swap_overrides(PressureLevel::Critical, 98.0, 10_000_000, None, now);
+        assert!(sustained.is_some(), "timer must start at >=98% swap + Critical");
+    }
+
+    #[test]
+    fn swap_98_preserves_existing_timer() {
+        let start = Instant::now() - Duration::from_secs(10);
+        let now = Instant::now();
+        let (_, sustained) = apply_swap_overrides(PressureLevel::Critical, 98.0, 10_000_000, Some(start), now);
+        assert!(sustained.unwrap().elapsed().as_secs() >= 10, "existing timer must not be reset");
+    }
+
+    // ── select_idle_candidates ───────────────────────────────────────────────
+
+    #[test]
+    fn idle_reclaim_skips_foreground_pid() {
+        let p = make_process(1234, "firefox", 200_000);
+        let r = select_idle_candidates(&[&p], Some(1234), &make_pid_tracker(1234, 300), 10.0, &default_idle_cfg());
+        assert!(r.is_empty());
+    }
+
+    #[test]
+    fn idle_reclaim_skips_rss_below_minimum() {
+        let p = make_process(5678, "app", 40 * 1024); // 40 MB < 50 MB min
+        let r = select_idle_candidates(&[&p], None, &make_pid_tracker(5678, 300), 10.0, &default_idle_cfg());
+        assert!(r.is_empty());
+    }
+
+    #[test]
+    fn idle_reclaim_skips_swap_saturated() {
+        let p = make_process(5678, "app", 200_000);
+        let r = select_idle_candidates(&[&p], None, &make_pid_tracker(5678, 300), 61.0, &default_idle_cfg());
+        assert!(r.is_empty());
+    }
+
+    #[test]
+    fn idle_reclaim_skips_not_yet_idle() {
+        let p = make_process(5678, "app", 200_000);
+        let r = select_idle_candidates(&[&p], None, &make_pid_tracker(5678, 100), 10.0, &default_idle_cfg());
+        assert!(r.is_empty());
+    }
+
+    #[test]
+    fn idle_reclaim_skips_not_in_tracker() {
+        let p = make_process(5678, "app", 200_000);
+        let r = select_idle_candidates(&[&p], None, &HashMap::<u32, Instant>::new(), 10.0, &default_idle_cfg());
+        assert!(r.is_empty());
+    }
+
+    #[test]
+    fn idle_reclaim_selects_eligible() {
+        let p = make_process(5678, "app", 200_000);
+        let r = select_idle_candidates(&[&p], None, &make_pid_tracker(5678, 300), 10.0, &default_idle_cfg());
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].0, 5678);
+        assert_eq!(r[0].1, 40_000 * 1024); // 20% of 200_000 KB * 1024
+    }
+
+    #[test]
+    fn idle_reclaim_selects_multiple() {
+        let p1 = make_process(100, "app_a", 100_000);
+        let p2 = make_process(200, "app_b", 150_000);
+        let mut tracker = make_pid_tracker(100, 300);
+        tracker.insert(200, Instant::now() - Duration::from_secs(250));
+        let r = select_idle_candidates(&[&p1, &p2], None, &tracker, 10.0, &IdleReclaimConfig { max_swap_occupancy_pct: 60.0, idle_sec: 180, rss_min_mb: 50, reclaim_pct: 10 });
+        assert_eq!(r.len(), 2);
+        let pids: Vec<u32> = r.iter().map(|(pid, _)| *pid).collect();
+        assert!(pids.contains(&100));
+        assert!(pids.contains(&200));
+    }
+
+    // ── ThrottledState ───────────────────────────────────────────────────────
+
+    #[test]
+    fn throttle_state_eq() {
+        use crate::throttle::ThrottledState;
+        assert_eq!(ThrottledState::None, ThrottledState::None);
+        assert_ne!(ThrottledState::None, ThrottledState::WeightOnly);
+        assert_ne!(ThrottledState::WeightOnly, ThrottledState::Full);
     }
 }

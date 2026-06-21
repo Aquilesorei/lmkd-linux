@@ -1,17 +1,16 @@
 [package]
-name        = "mgd-gpu-amd"
+name        = "mgd-checkpoint"
 version     = "0.4.0"
 edition     = "2024"
-description = "AMD APU / UMA GPU residency watcher plugin for mgd (scaffold)"
+description = "Capped CRIU checkpoint/restore helper wrapper binary"
 repository  = "https://github.com/Aquilesorei/lmkd-linux"
 license     = "GPL-2.0"
 authors     = ["Caleb Zongo <your@email.com>"]
 
 [[bin]]
-name = "mgd-gpu-amd"
+name = "mgd-checkpoint"
 path = "src/main.rs"
 
 [dependencies]
-mgd-common = { path = "../mgd-common" }
 libc       = { workspace = true }
-serde_json = { workspace = true }
+mgd-common = { path = "../mgd-common" }

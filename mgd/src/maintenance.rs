@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use mgd_common::logger::{LogEntry, Logger};
 use crate::engine::calibrate::{render_suggestion, Calibrator};
@@ -45,6 +45,7 @@ pub fn run(
     frozen: Arc<Mutex<FrozenRegistry>>,
     checkpointed: Arc<Mutex<CheckpointRegistry>>,
     calibrator: Arc<Mutex<Calibrator>>,
+    reclaim_wake: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
 ) {
     let mut last_calibration_flush = Instant::now();
 
@@ -53,6 +54,8 @@ pub fn run(
             return;
         }
 
+        crate::plugin_server::check_and_restart_plugins();
+
         let pressure = monitor::psi::read_pressure().ok();
         // A PSI read error counts as not-calm.
         let calm = pressure
@@ -60,10 +63,19 @@ pub fn run(
             .map(|p| monitor::psi::pressure_level(p) == PressureLevel::Normal)
             .unwrap_or(false);
 
+        // Check if evictor signalled that kills freed headroom.
+        let kill_triggered = {
+            let (lock, _) = &*reclaim_wake;
+            let mut flag = lock.lock().unwrap();
+            let was_set = *flag;
+            *flag = false;
+            was_set
+        };
+
         let cycle_start = Instant::now();
         if calm {
             if let Some(p) = pressure.as_ref() {
-                check_proactive_reclaim(p, &log);
+                check_proactive_reclaim(p, &log, false);
 
                 // Calibration benign-time sampling: the evictor only reads PSI
                 // when the kernel trigger wakes it, so calm time is invisible
@@ -85,9 +97,26 @@ pub fn run(
             flush_calibration(&calibrator, &log);
         }
 
+        // Evictor signalled: kills freed RAM + zram slots. Attempt proactive reclaim
+        // now regardless of calm — the headroom gate inside check_proactive_reclaim
+        // still protects against OOM; we just skip the calm-only guard here.
+        if kill_triggered && !calm {
+            if let Some(p) = pressure.as_ref() {
+                mgd_common::sync_print!("[maintenance] Kill-triggered reclaim attempt (post-eviction headroom)");
+                check_proactive_reclaim(p, &log, true);
+            }
+        }
+
         // Subtract time already spent (the idle sample) to hold the period at ~POLL_SECS.
         let spent = cycle_start.elapsed().as_secs();
-        interruptible_sleep(POLL_SECS.saturating_sub(spent));
+
+        // Block on condvar instead of fixed sleep so the evictor can wake us early
+        // when kills create headroom. Timeout = POLL_SECS (normal maintenance cadence).
+        let (lock, cvar) = &*reclaim_wake;
+        let _ = cvar.wait_timeout(
+            lock.lock().unwrap(),
+            Duration::from_secs(POLL_SECS.saturating_sub(spent)),
+        );
     }
 }
 
@@ -126,7 +155,7 @@ pub fn flush_calibration(calibrator: &Arc<Mutex<Calibrator>>, log: &Logger) {
         let _ = fs::create_dir_all(parent);
     }
     if let Err(e) = fs::write(&state_path, &state_toml) {
-        locked_print(&format!("[calibrate] cannot persist state to {}: {e}", state_path.display()));
+        mgd_common::sync_print!("[calibrate] cannot persist state to {}: {e}", state_path.display());
         return;
     }
 
@@ -140,19 +169,17 @@ pub fn flush_calibration(calibrator: &Arc<Mutex<Calibrator>>, log: &Logger) {
     }
     match fs::write(&sug_path, &rendered) {
         Ok(()) => {
-            locked_print(&format!(
+            mgd_common::sync_print!(
                 "[calibrate] [psi] suggestion ready ({:.0}h observed, {} stalls) → {}",
                 s.observed_hours, s.stall_events, sug_path.display()
-            ));
+            );
             log.log(&LogEntry::new(
                 "CALIBRATE", 0, "psi", s.elevated_pct,
                 &format!("suggested elevated_pct={:.1} full_critical_pct={:.1}",
                     s.elevated_pct, s.full_critical_pct),
             ));
         }
-        Err(e) => locked_print(&format!(
-            "[calibrate] cannot write suggestion to {}: {e}", sug_path.display()
-        )),
+        Err(e) => mgd_common::sync_print!("[calibrate] cannot write suggestion to {}: {e}", sug_path.display()),
     }
 }
 
@@ -167,10 +194,7 @@ fn interruptible_sleep(secs: u64) {
 }
 
 fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+    mgd_common::util::unix_timestamp_secs()
 }
 
 
@@ -211,11 +235,22 @@ fn reclaim_gates_pass(g: &ReclaimGates) -> Result<(), String> {
     Ok(())
 }
 
+/// Minimum cooldown for the kill-triggered path (2 min). Shorter than the calm
+/// path default (10 min) so post-eviction reclaim is more responsive.
+const KILL_RECLAIM_COOLDOWN_SECS: u64 = 120;
+
 /// Proactive swap reclaim via the capped helper (PRIVILEGED, PRIVILEGE_DESIGN
 /// §2). No-op unless `[reclaim] proactive_swap_reclaim = true`. All gates live
-/// here; the helper is dumb. Requires `some_avg60 < 5%` so a just-subsided spike
-/// doesn't trigger a reclaim.
-fn check_proactive_reclaim(pressure: &monitor::psi::MemoryPressure, log: &Logger) {
+/// here; the helper is dumb.
+///
+/// `skip_calm_gate`: when true (kill-triggered path), bypasses `some_avg60 < 5%`
+/// and uses a shorter cooldown — kills just freed headroom, calm check is
+/// irrelevant.
+fn check_proactive_reclaim(
+    pressure: &monitor::psi::MemoryPressure,
+    log: &Logger,
+    skip_calm_gate: bool,
+) {
     let (enabled, threshold_pct, cooldown_secs, min_used_mb, headroom_mult) = {
         let cfg = crate::config::get();
         if !cfg.proactive_swap_reclaim {
@@ -233,13 +268,18 @@ fn check_proactive_reclaim(pressure: &monitor::psi::MemoryPressure, log: &Logger
         return;
     }
 
-    if pressure.some_avg60 >= 5.0 {
+    if !skip_calm_gate && pressure.some_avg60 >= 5.0 {
         return;
     }
 
+    let effective_cooldown = if skip_calm_gate {
+        cooldown_secs.min(KILL_RECLAIM_COOLDOWN_SECS)
+    } else {
+        cooldown_secs
+    };
     let now = now_secs();
     let last = LAST_RECLAIM.load(Ordering::Relaxed);
-    if last != 0 && now.saturating_sub(last) < cooldown_secs {
+    if last != 0 && now.saturating_sub(last) < effective_cooldown {
         return;
     }
 
@@ -269,11 +309,12 @@ fn check_proactive_reclaim(pressure: &monitor::psi::MemoryPressure, log: &Logger
         return;
     }
 
-    locked_print(&format!(
-        "[reclaim] calm, swap {:.0}% full, zram {}MB compressed ({}MB decompressed), \
+    mgd_common::sync_print!(
+        "[reclaim] {} swap {:.0}% full, zram {}MB compressed ({}MB decompressed), \
          avail {}MB — reclaiming",
+        if skip_calm_gate { "post-eviction:" } else { "calm," },
         gates.swap_used_pct, gates.zram_used_mb, gates.zram_orig_mb, gates.mem_available_mb
-    ));
+    );
 
     match run_reclaim_helper(helper) {
         Ok(()) => {
@@ -290,7 +331,7 @@ fn check_proactive_reclaim(pressure: &monitor::psi::MemoryPressure, log: &Logger
         }
         Err((code, e)) => {
             // Don't arm the cooldown on failure.
-            locked_print(&format!("[reclaim] helper failed (exit {code:?}): {e}"));
+            mgd_common::sync_print!("[reclaim] helper failed (exit {code:?}): {e}");
             log.log(&LogEntry::new("RECLAIM", 0, "zram", 0.0, &format!("failed: {e}")));
             // Exit 2 = uncapped binary (persistent); other codes are transient.
             if code == Some(2) {

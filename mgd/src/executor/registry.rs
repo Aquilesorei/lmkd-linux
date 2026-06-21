@@ -1,10 +1,17 @@
 use serde::{Serialize, Deserialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+
 
 fn state_dir() -> PathBuf {
     mgd_common::util::home_dir().join(".local/share/mgd/state")
+}
+
+fn persist_json<T: serde::Serialize>(filename: &str, data: &T) {
+    let path = state_dir().join(filename);
+    if let Ok(json) = serde_json::to_string(data) {
+        let _ = mgd_common::util::write_file_atomic(&path, &json);
+    }
 }
 
 /// Tracks processes that have been frozen by the daemon
@@ -31,11 +38,7 @@ impl FrozenRegistry {
     }
 
     pub fn save(&self) {
-        let dir = state_dir();
-        let _ = std::fs::create_dir_all(&dir);
-        if let Ok(data) = serde_json::to_string(self) {
-            let _ = std::fs::write(dir.join("frozen.json"), data);
-        }
+        persist_json("frozen.json", self);
     }
 
     /// Record a process as frozen, capturing its start_time for PID-recycle detection.
@@ -44,10 +47,7 @@ impl FrozenRegistry {
         let Some(start_time) = super::read_start_time(pid) else {
             return false;
         };
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        let now = mgd_common::util::unix_timestamp_secs();
         self.frozen.insert(pid, (name.to_string(), now, start_time));
         self.save();
         true
@@ -111,11 +111,7 @@ impl CheckpointRegistry {
     }
 
     pub fn save(&self) {
-        let dir = state_dir();
-        let _ = std::fs::create_dir_all(&dir);
-        if let Ok(data) = serde_json::to_string(self) {
-            let _ = std::fs::write(dir.join("checkpoint.json"), data);
-        }
+        persist_json("checkpoint.json", self);
     }
 
     pub fn add(&mut self, pid: u32, name: &str, snapshot_dir: PathBuf, rss_kb: u64) {

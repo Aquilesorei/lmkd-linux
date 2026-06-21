@@ -1,5 +1,6 @@
 pub mod error;
 pub mod logger;
+pub mod meminfo;
 pub mod output;
 pub mod protocol;
 pub mod socket;
@@ -8,3 +9,4 @@ pub mod plugin;
 pub mod process;
 pub mod psi;
 pub mod gpu;
+pub mod zram;

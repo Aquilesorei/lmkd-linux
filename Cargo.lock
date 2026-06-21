@@ -73,6 +73,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "mgd-checkpoint"
+version = "0.4.0"
+dependencies = [
+ "libc",
+ "mgd-common",
+]
+
+[[package]]
 name = "mgd-common"
 version = "0.4.0"
 dependencies = [
@@ -103,6 +111,7 @@ version = "0.4.0"
 dependencies = [
  "libc",
  "mgd-common",
+ "serde_json",
 ]
 
 [[package]]
@@ -122,6 +131,7 @@ dependencies = [
  "mgd-common",
  "serde",
  "serde_json",
+ "toml",
 ]
 
 [[package]]

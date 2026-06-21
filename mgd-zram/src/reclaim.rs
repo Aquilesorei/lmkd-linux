@@ -5,6 +5,8 @@
 use std::ffi::CString;
 use std::fs;
 
+use mgd_common::zram::is_zram_device_path;
+
 // Linux swap(2) flags — not exported by libc 0.2. From <sys/swap.h>.
 const SWAP_FLAG_PREFER: i32 = 0x8000;
 const SWAP_FLAG_PRIO_MASK: i32 = 0x7fff;
@@ -206,37 +208,22 @@ fn parse_zram_swaps(swaps: &str) -> Vec<ZramSwap> {
         .collect()
 }
 
-/// `/dev/zram` followed by digits. Rejects partitions and lookalike swapfiles.
-fn is_zram_device_path(path: &str) -> bool {
-    match path.strip_prefix("/dev/zram") {
-        Some(rest) => !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()),
-        None => false,
-    }
-}
-
 fn device_basename(path: &str) -> Option<String> {
     path.rsplit('/').next().map(|s| s.to_string())
 }
 
 fn read_mem_available_mb() -> Option<u64> {
     let content = fs::read_to_string("/proc/meminfo").ok()?;
-    parse_mem_available_kb(&content).map(|kb| kb / 1024)
+    let kb = content.lines()
+        .find_map(|l| l.strip_prefix("MemAvailable:"))
+        .map(mgd_common::meminfo::parse_kb)?;
+    Some(kb / 1024)
 }
 
 /// Decompressed footprint (`orig_data_size`, field 0 of mm_stat) of one device, MB.
 fn zram_orig_mb(basename: String) -> Option<u64> {
     let content = fs::read_to_string(format!("/sys/block/{basename}/mm_stat")).ok()?;
     content.split_whitespace().next()?.parse::<u64>().ok().map(|b| b / (1024 * 1024))
-}
-
-fn parse_mem_available_kb(meminfo: &str) -> Option<u64> {
-    meminfo
-        .lines()
-        .find_map(|l| l.strip_prefix("MemAvailable:"))?
-        .split_whitespace()
-        .next()?
-        .parse()
-        .ok()
 }
 
 #[cfg(test)]
@@ -279,21 +266,6 @@ mod tests {
     }
 
     #[test]
-    fn is_zram_device_path_accepts_canonical() {
-        assert!(is_zram_device_path("/dev/zram0"));
-        assert!(is_zram_device_path("/dev/zram12"));
-    }
-
-    #[test]
-    fn is_zram_device_path_rejects_lookalikes() {
-        assert!(!is_zram_device_path("/dev/zram"));        // no number
-        assert!(!is_zram_device_path("/dev/zrama"));       // non-digit suffix
-        assert!(!is_zram_device_path("/swap/zram-cache")); // not under /dev
-        assert!(!is_zram_device_path("/dev/zram0x"));      // trailing non-digit
-        assert!(!is_zram_device_path("/dev/nvme0n1p3"));   // real disk
-    }
-
-    #[test]
     fn device_basename_extracts_name() {
         assert_eq!(device_basename("/dev/zram0").as_deref(), Some("zram0"));
     }
@@ -304,19 +276,6 @@ mod tests {
         assert!(!is_headroom_safe(4000, 4000)); // exactly equal → unsafe (strict)
         assert!(!is_headroom_safe(3000, 4000)); // would OOM
         assert!(is_headroom_safe(1, 0));        // nothing to reclaim
-    }
-
-    #[test]
-    fn parse_mem_available_reads_field() {
-        let meminfo = "MemTotal:       16314800 kB\n\
-                       MemFree:          812044 kB\n\
-                       MemAvailable:    9381234 kB\n";
-        assert_eq!(parse_mem_available_kb(meminfo), Some(9381234));
-    }
-
-    #[test]
-    fn parse_mem_available_missing_is_none() {
-        assert_eq!(parse_mem_available_kb("MemTotal: 100 kB\n"), None);
     }
 
     #[test]

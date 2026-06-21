@@ -5,41 +5,8 @@
 //! (`/proc/<pid>/fdinfo/*`) is readable by the fd owner without privilege,
 //! unlike `intel_gpu_top` (CAP_PERFMON).
 
-use std::sync::{LazyLock, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
-
-const GPU_CACHE_TTL: Duration = Duration::from_secs(30);
-
-/// pid -> (resident KiB, sampled-at). Keyed on pid alone, no recycle guard: the
-/// value feeds sort ranking only, never the deficit, so a recycled pid mis-ranks
-/// one candidate for at most one TTL window.
-static GPU_CACHE: LazyLock<Mutex<std::collections::HashMap<u32, (u64, Instant)>>> =
-    LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
-
-/// [`process_gpu_kb`] memoized per pid for `GPU_CACHE_TTL`. 0 if not a GPU
-/// client. The fdinfo walk costs ~tens of ms; the cache keeps it off the hot
-/// path during a sustained pressure episode.
-pub fn process_gpu_kb_cached(pid: u32) -> u64 {
-    let now = Instant::now();
-    if let Ok(cache) = GPU_CACHE.lock()
-        && let Some(&(kb, at)) = cache.get(&pid)
-        && now.duration_since(at) < GPU_CACHE_TTL
-    {
-        return kb;
-    }
-
-    let kb = mgd_common::gpu::process_gpu_kb(pid).unwrap_or(0);
-
-    if let Ok(mut cache) = GPU_CACHE.lock() {
-        cache.retain(|_, (_, at)| now.duration_since(*at) < GPU_CACHE_TTL);
-        cache.insert(pid, (kb, now));
-    }
-    kb
-}
-
-// process_gpu_kb and parse_mem_kb are now in mgd_common::gpu
-pub use mgd_common::gpu::{process_gpu_kb, parse_mem_kb};
+use std::time::Duration;
 
 /// `kquitapp6 plasmashell` then `kstart plasmashell`, with a 2s settle. Err if
 /// either binary is missing or quit fails — caller skips without arming cooldown.
@@ -89,8 +56,6 @@ fn is_executable(p: &std::path::Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn test_parse_mem_kb_units() {
         assert_eq!(mgd_common::gpu::parse_mem_kb("2247000 KiB"), Some(2_247_000));
@@ -101,12 +66,4 @@ mod tests {
         assert_eq!(mgd_common::gpu::parse_mem_kb("garbage"), None);
     }
 
-    #[test]
-    fn cached_is_consistent_and_hits() {
-        // Test runner pid is not a DRM client: exercises the 0 fast path + hit.
-        let pid = std::process::id();
-        let first = process_gpu_kb_cached(pid);
-        let second = process_gpu_kb_cached(pid);
-        assert_eq!(first, second);
-    }
 }

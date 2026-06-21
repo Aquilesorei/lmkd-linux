@@ -51,7 +51,7 @@ ok "Dependencies OK"
 
 # ── build ─────────────────────────────────────────────────────────────────────
 echo "Building release binaries..."
-cargo build --bin mgd --bin mgctl --bin mgd-zram-reclaim --bin mgd-kde --bin mgd-gpu-intel --bin mgd-gpu-amd --bin mgd-gnome --bin mgd-cosmic --release 2>&1 | tail -3
+cargo build --bin mgd --bin mgctl --bin mgd-zram-reclaim --bin mgd-checkpoint --bin mgd-kde --bin mgd-gpu-intel --bin mgd-gpu-amd --bin mgd-gnome --bin mgd-cosmic --release 2>&1 | tail -3
 ok "Build complete"
 
 # ── stop existing service if running ─────────────────────────────────────────
@@ -62,19 +62,39 @@ fi
 
 # ── install binary ────────────────────────────────────────────────────────────
 mkdir -p "$BIN_DIR"
-cp target/release/mgd   "$BIN_DIR/mgd"
+if [[ "$WITH_PRIVILEGED" == 1 ]]; then
+    DAEMON_DEST="/usr/local/bin/mgd"
+    sudo install -m 0755 target/release/mgd "$DAEMON_DEST"
+    if sudo setcap cap_sys_nice+ep "$DAEMON_DEST"; then
+        ok "Daemon binary installed + capped with CAP_SYS_NICE at $DAEMON_DEST"
+    else
+        warn "Could not setcap CAP_SYS_NICE on daemon binary"
+    fi
+    # Remove local unprivileged binary to avoid path confusion
+    rm -f "$BIN_DIR/mgd"
+else
+    cp target/release/mgd   "$BIN_DIR/mgd"
+    if [[ -f "/usr/local/bin/mgd" ]]; then
+        sudo rm -f "/usr/local/bin/mgd"
+    fi
+fi
 cp target/release/mgctl "$BIN_DIR/mgctl"
+cp target/release/mgd-checkpoint "$BIN_DIR/mgd-checkpoint"
 cp target/release/mgd-kde "$BIN_DIR/mgd-kde"
 cp target/release/mgd-gpu-intel "$BIN_DIR/mgd-gpu-intel"
 cp target/release/mgd-gpu-amd "$BIN_DIR/mgd-gpu-amd"
 cp target/release/mgd-gnome "$BIN_DIR/mgd-gnome"
 cp target/release/mgd-cosmic "$BIN_DIR/mgd-cosmic"
 chmod +x "$BIN_DIR"/mgd*
-ok "Binaries installed to $BIN_DIR/"
+ok "Binaries installed"
 
 # ── install service ───────────────────────────────────────────────────────────
 mkdir -p "$SERVICE_DIR"
 cp config/mgd.service "$SERVICE_DIR/$SERVICE_NAME"
+if [[ "$WITH_PRIVILEGED" == 1 ]]; then
+    sed -i 's|ExecStart=.*|ExecStart=/usr/local/bin/mgd\nCPUWeight=10000|g' "$SERVICE_DIR/$SERVICE_NAME"
+    ok "Service file updated for CPU weight"
+fi
 systemctl --user daemon-reload
 ok "Service file installed to $SERVICE_DIR/$SERVICE_NAME"
 
@@ -120,28 +140,13 @@ if [[ "$WITH_PRIVILEGED" == 1 ]]; then
     ok "swap reclaim helper installed + capped at $HELPER_DEST"
     warn "  reclaim stays OFF until you set [reclaim] proactive_swap_reclaim = true in priorities.toml"
 
-    # CRIU (Option A) — narrow caps instead of root, if criu is present.
-    # Resolve criu from the SAME fixed locations the daemon probes (it never does
-    # a PATH search, since the binary is capped), so we cap exactly the binary mgd
-    # will run. Falls back to `command -v` only as a last resort.
-    criu_bin=""
-    for c in /usr/sbin/criu /usr/bin/criu /sbin/criu /bin/criu \
-             /usr/local/sbin/criu /usr/local/bin/criu; do
-        if [[ -x "$c" ]]; then criu_bin="$c"; break; fi
-    done
-    [[ -z "$criu_bin" ]] && criu_bin="$(command -v criu 2>/dev/null || true)"
-
-    if [[ -n "$criu_bin" ]]; then
-        if sudo setcap cap_checkpoint_restore,cap_sys_ptrace+ep "$criu_bin"; then
-            ok "criu capped (cap_checkpoint_restore,cap_sys_ptrace) at $criu_bin — no root needed"
-            warn "  for live TCP restore (browsers), re-cap with cap_net_admin added:"
-            warn "    sudo setcap cap_checkpoint_restore,cap_sys_ptrace,cap_net_admin+ep $criu_bin"
-            warn "  a criu package UPGRADE resets these caps — re-run install.sh --privileged afterwards"
-        else
-            warn "could not setcap criu (kernel may lack CAP_CHECKPOINT_RESTORE) — CRIU falls back to kill"
-        fi
+    # Fix 3 — checkpoint helper: capped helper (CAP_CHECKPOINT_RESTORE, CAP_SYS_PTRACE, CAP_NET_ADMIN, never SUID root).
+    CHECKPOINT_HELPER_DEST="/usr/local/bin/mgd-checkpoint"
+    sudo install -m 0750 -o root -g mgd target/release/mgd-checkpoint "$CHECKPOINT_HELPER_DEST"
+    if sudo setcap cap_checkpoint_restore,cap_sys_ptrace,cap_net_admin+ep "$CHECKPOINT_HELPER_DEST"; then
+        ok "checkpoint helper installed + capped at $CHECKPOINT_HELPER_DEST"
     else
-        warn "criu not found — checkpoint/restore disabled (mgd will SIGKILL instead)"
+        warn "could not setcap checkpoint helper (kernel may lack CAP_CHECKPOINT_RESTORE)"
     fi
 else
     warn "Privileged features skipped (default). To enable zram compact + swap reclaim:"

@@ -1,9 +1,10 @@
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Mutex, LazyLock};
 use std::sync::mpsc::{channel, Sender};
 use std::collections::HashMap;
 use std::thread;
+use std::time::{Duration, Instant};
 
 use mgd_common::protocol::{CoreMessage, PluginMessage, PluginAction};
 
@@ -12,22 +13,60 @@ use crate::executor::registry::{FrozenRegistry, CheckpointRegistry};
 /// Senders to all active plugin connections
 static PLUGIN_CLIENTS: LazyLock<Mutex<Vec<Sender<CoreMessage>>>> = LazyLock::new(|| Mutex::new(Vec::new()));
 
-/// Cached observations from plugins
-static GPU_CACHE: LazyLock<Mutex<HashMap<u32, u64>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+const GPU_CACHE_TTL: Duration = Duration::from_secs(30);
+
+/// Cached GPU observations from plugins. Keyed by pid; entries expire after
+/// GPU_CACHE_TTL so dead processes don't accumulate stale data.
+static GPU_CACHE: LazyLock<Mutex<HashMap<u32, (u64, Instant)>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Active foreground process PID reported by DE plugins
 static ACTIVE_FOREGROUND_PID: LazyLock<Mutex<Option<u32>>> = LazyLock::new(|| Mutex::new(None));
 
+/// Tracked child processes for crash-restart watchdog. Keyed by plugin name.
+static PLUGIN_CHILDREN: LazyLock<Mutex<HashMap<String, (std::process::Child, Instant)>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
 pub fn get_gpu_kb(pid: u32) -> u64 {
-    *GPU_CACHE.lock().unwrap().get(&pid).unwrap_or(&0)
+    let now = Instant::now();
+    GPU_CACHE.lock().unwrap()
+        .get(&pid)
+        .filter(|(_, at)| now.duration_since(*at) < GPU_CACHE_TTL)
+        .map(|(kb, _)| *kb)
+        .unwrap_or(0)
 }
 
 pub fn set_gpu_kb(pid: u32, kb: u64) {
-    GPU_CACHE.lock().unwrap().insert(pid, kb);
+    let now = Instant::now();
+    let mut cache = GPU_CACHE.lock().unwrap();
+    cache.retain(|_, (_, at)| now.duration_since(*at) < GPU_CACHE_TTL);
+    cache.insert(pid, (kb, now));
 }
 
 pub fn get_total_gpu_kb() -> u64 {
-    GPU_CACHE.lock().unwrap().values().sum()
+    let now = Instant::now();
+    GPU_CACHE.lock().unwrap()
+        .values()
+        .filter(|(_, at)| now.duration_since(*at) < GPU_CACHE_TTL)
+        .map(|(kb, _)| *kb)
+        .sum()
+}
+
+/// Returns (pid_count, total_kb, newest_obs_age_secs) from the live GPU cache.
+/// `newest_obs_age_secs` is None when the cache is empty.
+pub fn gpu_cache_snapshot() -> (usize, u64, Option<u64>) {
+    let now = Instant::now();
+    let cache = GPU_CACHE.lock().unwrap();
+    let live: Vec<_> = cache.values()
+        .filter(|(_, at)| now.duration_since(*at) < GPU_CACHE_TTL)
+        .collect();
+    if live.is_empty() {
+        return (0, 0, None);
+    }
+    let total_kb: u64 = live.iter().map(|(kb, _)| *kb).sum();
+    let newest_age = live.iter()
+        .map(|(_, at)| now.duration_since(*at).as_secs())
+        .min();
+    (live.len(), total_kb, newest_age)
 }
 
 pub fn get_active_foreground_pid() -> Option<u32> {
@@ -100,9 +139,52 @@ fn spawn_plugin_binary(name: &str) {
     }
 
     match std::process::Command::new(&candidate).spawn() {
-        Ok(_) => mgd_common::sync_print!("[core] Autospawned plugin: {}", name),
+        Ok(child) => {
+            mgd_common::sync_print!("[core] Autospawned plugin: {}", name);
+            PLUGIN_CHILDREN.lock().unwrap().insert(name.to_string(), (child, Instant::now()));
+        }
         Err(e) => mgd_common::sync_print!("[core] Failed to spawn {}: {}", name, e),
     }
+}
+
+/// Check all tracked plugins; restart any that have exited.
+/// Called from the maintenance loop (~60s interval).
+pub fn check_and_restart_plugins() {
+    let now = Instant::now();
+    let dead: Vec<String> = {
+        let mut children = PLUGIN_CHILDREN.lock().unwrap();
+        let dead: Vec<String> = children
+            .iter_mut()
+            .filter_map(|(name, (child, spawned_at))| {
+                child.try_wait().ok().flatten().map(|status| {
+                    let uptime = now.duration_since(*spawned_at).as_secs();
+                    mgd_common::sync_print!(
+                        "[core] Plugin {} exited ({}) after {}s — restarting",
+                        name, status, uptime
+                    );
+                    name.clone()
+                })
+            })
+            .collect();
+        for name in &dead {
+            children.remove(name);
+        }
+        dead
+    };
+    for name in dead {
+        spawn_plugin_binary(&name);
+    }
+}
+
+/// SIGTERM all tracked plugin children on daemon shutdown.
+pub fn shutdown_plugins() {
+    let mut children = PLUGIN_CHILDREN.lock().unwrap();
+    for (name, (child, _)) in children.iter_mut() {
+        let pid = child.id() as libc::pid_t;
+        unsafe { libc::kill(pid, libc::SIGTERM); }
+        mgd_common::sync_print!("[core] Sent SIGTERM to plugin {} (pid {})", name, pid);
+    }
+    children.clear();
 }
 
 /// Broadcast a new pressure level to all connected plugins.
@@ -114,17 +196,11 @@ pub fn broadcast_pressure(level: &str) {
 
 
 
-/// Takes ownership of a `UnixStream` that has been identified as a plugin connection.
-/// 
-/// This function converts the socket into a bidirectional session:
-/// 1. It spawns a background writer thread that listens for `CoreMessage` broadcasts 
-///    (e.g., global pressure changes, approval responses) and flushes them to the plugin.
-/// 2. It blocks the current thread in a loop, continually parsing incoming `PluginMessage`s 
-///    (e.g., GPU observations, ActionRequests) and routing them to the Core.
+
 pub fn serve_plugin_connection(
     stream: UnixStream,
     first_line: String,
-    _frozen: Arc<Mutex<FrozenRegistry>>,
+    frozen: Arc<Mutex<FrozenRegistry>>,
     _checkpointed: Arc<Mutex<CheckpointRegistry>>,
 ) {
     // Disable timeout for long-lived connection
@@ -151,18 +227,15 @@ pub fn serve_plugin_connection(
     });
 
     // Process the first line
-    process_plugin_line(&first_line);
+    process_plugin_line(&first_line, &frozen);
 
     // Continue reading
-    let mut reader = BufReader::new(stream);
-    let mut line = String::new();
-    while reader.read_line(&mut line).is_ok() && !line.is_empty() {
-        process_plugin_line(&line);
-        line.clear();
-    }
+    mgd_common::plugin::drain_lines(stream, |line| {
+        process_plugin_line(line, &frozen);
+    });
 }
 
-fn process_plugin_line(line: &str) {
+fn process_plugin_line(line: &str, frozen: &Arc<Mutex<FrozenRegistry>>) {
     let Ok(msg) = serde_json::from_str::<PluginMessage>(line) else { return };
     match msg {
         PluginMessage::Identify { name, version, .. } => {
@@ -177,7 +250,7 @@ fn process_plugin_line(line: &str) {
         }
         PluginMessage::ActionRequest { plugin, action, reason } => {
             mgd_common::sync_print!("[plugin] {} requested action {:?}: {}", plugin, action, reason);
-            
+
             let approved = true;
             let denial_reason = None;
 
@@ -187,19 +260,19 @@ fn process_plugin_line(line: &str) {
                 PluginAction::KillPid { pid } => {
                     let pid = *pid;
                     std::thread::spawn(move || {
-                        let _ = crate::executor::killer::terminate(pid);
+                        let _ = crate::executor::killer::sigterm(pid);
                     });
                 }
                 _ => {} // Other actions (like RestartProcess) are delegated back to the plugin to execute
             }
 
             // Send approval back so the plugin can execute its own specific logic (e.g. restarting a DE service)
-            let response = CoreMessage::ActionResponse { 
-                action, 
-                approved, 
-                reason: denial_reason 
+            let response = CoreMessage::ActionResponse {
+                action,
+                approved,
+                reason: denial_reason
             };
-            
+
             let mut clients = PLUGIN_CLIENTS.lock().unwrap();
             clients.retain(|tx| tx.send(response.clone()).is_ok());
         }
@@ -211,6 +284,26 @@ fn process_plugin_line(line: &str) {
         }
         PluginMessage::ActiveWindow { pid } => {
             set_active_foreground_pid(pid);
+            // If the newly-active process is frozen, unfreeze it immediately
+            // rather than waiting for the next RecoveryManager poll.
+            if let Some(p) = pid {
+                let (is_frozen, start_time) = {
+                    let reg = frozen.lock().unwrap();
+                    (reg.is_frozen(p), reg.start_time(p))
+                };
+                if is_frozen {
+                    let frozen_clone = Arc::clone(frozen);
+                    thread::spawn(move || {
+                        let r = crate::executor::freezer::unfreeze_checked(p, start_time);
+                        if r.success {
+                            frozen_clone.lock().unwrap().remove(p);
+                            mgd_common::sync_print!(
+                                "[recovery] Instant-unfroze foreground PID {} (active window)", p
+                            );
+                        }
+                    });
+                }
+            }
         }
     }
 }

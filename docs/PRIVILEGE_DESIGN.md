@@ -210,38 +210,24 @@ Two ways to grant it:
 | **A. setcap criu directly** | `setcap cap_checkpoint_restore,cap_sys_ptrace+ep $(command -v criu)` | Simplest, no new code. But any local user can then run criu near-privileged (limited to dumping their own-uid processes). Mild risk. |
 | **B. validating wrapper** | `mgd-checkpoint <pid>`, capped, validates the PID, then execs criu | Safer (gates which PID), but new code + must sanitize the exec. |
 
-**Option A is the chosen and implemented path for mgd** (single-user desktop
-threat model), because the dangerous decision — *which* PID gets checkpointed —
-is already made by mgd's gated, unprivileged logic. The capped `criu` only ever
-dumps own-uid processes.
+**Option B (validating wrapper) is the chosen and implemented path** — `mgd-checkpoint` (`mgd-checkpoint/src/main.rs`) is built and ships as part of the workspace. It:
 
-> **Implemented (Option A):** `src/executor/checkpoint.rs` resolves `criu` to an
-> **absolute path** from a fixed root-controlled candidate list
-> (`/usr/sbin`, `/usr/bin`, `/sbin`, `/bin`, `/usr/local/{s}bin`) and never does
-> a `PATH` search — capping a binary then invoking it by bare name would let a
-> `criu` planted earlier in `PATH` run with the caps. The grant is applied by
-> `install.sh --privileged` (and documented for manual use in the README).
-> A criu package upgrade **resets file caps**; mgd detects the resulting
-> privilege failure (stderr inference, no libcap dependency) and logs the exact
-> `setcap` command to re-run. criu absent vs present-but-unprivileged are
-> distinguished at startup and in failure logs.
+- Accepts only `dump <pid> <images-dir>` or `restore <images-dir>` — no other argv.
+- Validates caller owns the target PID (`/proc/<pid>` uid check), the process lives in `user.slice` (cgroup path check), and the images dir exists under the caller's home directory.
+- Raises ambient capabilities (`CAP_CHECKPOINT_RESTORE`, `CAP_SYS_PTRACE`, `CAP_NET_ADMIN` for live TCP restore) onto the inheritable set so they are inherited by the child `criu` process.
+- Execs `criu` with a cleared environment (`env_clear()`).
+- Exit codes: 0 = ok, 1 = bad args, 2 = security validation failed, 3 = criu failed.
 
-**Option B (validating wrapper)** matters only if other local users abusing the
-capped `criu` is a concern (multi-user host). Deferred. If built, the wrapper
-must, before execing criu:
+`src/executor/checkpoint.rs` resolves `mgd-checkpoint` by **absolute path** (sibling of the `mgd` binary or `~/.local/bin/mgd-checkpoint`) — never a PATH search. If `mgd-checkpoint` is absent, it falls back to direct criu invocation (legacy path); if criu itself is missing or unprivileged, falls back to SIGKILL and logs once.
 
-- confirm the PID **exists**,
-- confirm it is **owned by mgd's uid**,
-- confirm it lives in the **`user.slice` cgroup** (the same filter
-  `src/monitor/process.rs` already applies),
-- reject anything else,
-- exec criu with an absolute path and a sanitized environment (no PATH search).
+The caps are placed on `mgd-checkpoint` (not on `criu` itself), so `criu` remains an ordinary binary. Any local user running `criu` directly gets no elevated capabilities.
 
-- Carrier: capped `criu` (A) or `mgd-checkpoint` wrapper (B).
-- Capability: `CAP_CHECKPOINT_RESTORE` + `CAP_SYS_PTRACE`.
-- Input: PID (validated in Tier B).
-- Graceful degrade: already handled — `checkpoint.rs` falls back gracefully when
-  criu is missing or unprivileged.
+> **Option A** (setcap on `criu` directly) is simpler but extends near-privilege to all local users who can run `criu`. Option B adds a security validation layer — the wrapper confirms the PID is user-owned and in `user.slice` before acting. Option B is the implemented and preferred path.
+
+- Carrier: `mgd-checkpoint` wrapper binary.
+- Capability: `CAP_CHECKPOINT_RESTORE` + `CAP_SYS_PTRACE` + `CAP_NET_ADMIN`.
+- Input: PID + images-dir (both validated inside the wrapper).
+- Graceful degrade: `checkpoint.rs` falls back gracefully when `mgd-checkpoint` is missing or fails.
 
 ---
 
@@ -251,7 +237,7 @@ must, before execing criu:
 |------------------|--------------------------------|----------------------------------------------|-------|
 | zram compact     | none (tmpfiles sysfs grant)    | none                                         | none  |
 | swap reclaim     | `mgd-zram-reclaim`             | `CAP_SYS_ADMIN`                              | none  |
-| CRIU dump/restore| capped `criu` *or* `mgd-checkpoint` | `CAP_CHECKPOINT_RESTORE` + `CAP_SYS_PTRACE` | PID (validated) |
+| CRIU dump/restore| `mgd-checkpoint` wrapper       | `CAP_CHECKPOINT_RESTORE` + `CAP_SYS_PTRACE` + `CAP_NET_ADMIN` | PID + images-dir (both validated) |
 
 SIGSTOP/SIGCONT (freezer), SIGTERM/SIGKILL (killer), SIGUSR1 (Firefox GC), and
 fdinfo GPU reads all work on own-uid processes with **no** privilege and are not
@@ -286,11 +272,16 @@ sudo install -m 0750 -o root -g mgd target/release/mgd-zram-reclaim \
 sudo setcap cap_sys_admin+ep /usr/local/bin/mgd-zram-reclaim
 ```
 
-CRIU (Operation 3), Option A:
+CRIU (Operation 3), Option B — `mgd-checkpoint` wrapper (implemented):
 
 ```bash
-sudo setcap cap_checkpoint_restore,cap_sys_ptrace+ep "$(command -v criu)"
+sudo install -m 0750 -o root -g mgd target/release/mgd-checkpoint \
+    /usr/local/bin/mgd-checkpoint
+sudo setcap cap_checkpoint_restore,cap_sys_ptrace,cap_net_admin+ep \
+    /usr/local/bin/mgd-checkpoint
 ```
+
+`install.sh --privileged` does this automatically. Caps on `mgd-checkpoint`, not on `criu` itself.
 
 Each step is independent. Skipping one disables only that feature; mgd logs the
 capability as unavailable at startup and continues.

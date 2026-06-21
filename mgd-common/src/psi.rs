@@ -15,7 +15,7 @@ pub fn cgroup_psi_path() -> String {
 
 /// A PSI file is usable if it can be read and looks like PSI output.
 /// (A cgroup file may exist but return ENOTSUP when PSI is compiled out.)
-pub fn usable_psi_file(path: &str) -> bool {
+pub fn is_usable_psi_file(path: &str) -> bool {
     fs::read_to_string(path)
         .map(|c| c.starts_with("some "))
         .unwrap_or(false)
@@ -25,7 +25,7 @@ pub fn usable_psi_file(path: &str) -> bool {
 /// (cgroup-v1 hosts or kernels without per-cgroup PSI).
 pub fn resolve_pressure_source() -> String {
     let cgroup = cgroup_psi_path();
-    if usable_psi_file(&cgroup) {
+    if is_usable_psi_file(&cgroup) {
         cgroup
     } else {
         GLOBAL_PSI.to_string()
@@ -43,6 +43,20 @@ pub fn trigger_armable(path: &str) -> bool {
         .is_ok()
 }
 
+pub fn parse_kv(s: &str, prefix: &str) -> Result<f64, crate::error::MgdError> {
+    s.strip_prefix(prefix)
+        .ok_or_else(|| crate::error::MgdError::Parse(format!("expected '{prefix}', got '{s}'")))?
+        .parse::<f64>()
+        .map_err(crate::error::MgdError::from)
+}
+
+pub fn parse_kv_u64(s: &str, prefix: &str) -> Result<u64, crate::error::MgdError> {
+    s.strip_prefix(prefix)
+        .ok_or_else(|| crate::error::MgdError::Parse(format!("expected '{prefix}', got '{s}'")))?
+        .parse::<u64>()
+        .map_err(|e| crate::error::MgdError::Parse(e.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -50,18 +64,18 @@ mod tests {
     #[test]
     fn test_usable_psi_file() {
         // Missing file -> unusable.
-        assert!(!usable_psi_file("/nonexistent/memory.pressure"));
+        assert!(!is_usable_psi_file("/nonexistent/memory.pressure"));
 
         // Valid PSI content -> usable.
         let dir = std::env::temp_dir();
         let good = dir.join("mgd_test_psi_good");
         fs::write(&good, "some avg10=0.00 avg60=0.00 avg300=0.00 total=0\n").unwrap();
-        assert!(usable_psi_file(good.to_str().unwrap()));
+        assert!(is_usable_psi_file(good.to_str().unwrap()));
 
         // Garbage content -> unusable.
         let bad = dir.join("mgd_test_psi_bad");
         fs::write(&bad, "not psi output\n").unwrap();
-        assert!(!usable_psi_file(bad.to_str().unwrap()));
+        assert!(!is_usable_psi_file(bad.to_str().unwrap()));
 
         let _ = fs::remove_file(good);
         let _ = fs::remove_file(bad);

@@ -1,4 +1,5 @@
 mod config;
+mod events;
 mod monitor;
 mod engine;
 mod executor;
@@ -7,6 +8,7 @@ mod recovery;
 mod maintenance;
 mod ipc;
 mod plugin_server;
+mod throttle;
 
 use std::sync::{Arc, Condvar, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -33,13 +35,15 @@ fn main() {
         return;
     }
 
-    cleanup_orphaned_snapshots();
-    print_startup_banner();
-
-    plugin_server::init_plugins();
+    try_elevate_scheduler_priority();
 
     let frozen = Arc::new(Mutex::new(FrozenRegistry::load()));
     let checkpointed = Arc::new(Mutex::new(CheckpointRegistry::load()));
+
+    cleanup_orphaned_snapshots(&checkpointed);
+    print_startup_banner();
+
+    plugin_server::init_plugins();
 
     // Passive calibration aggregates survive restarts (suggestions need days
     // of observation). Maintenance flushes periodically; main flushes at exit.
@@ -55,18 +59,27 @@ fn main() {
         libc::signal(libc::SIGHUP,  handle_sighup  as *const () as libc::sighandler_t);
     }
 
-    // Doorbell: evictor rings it when it adds to frozen/checkpointed registries.
-    // Recovery sleeps on it when both registries are empty.
-    let recovery_wake: Arc<(Mutex<bool>, Condvar)> = Arc::new((Mutex::new(false), Condvar::new()));
 
-    // ── Actor threads ─────────────────────────────────────────────────────────
+    let recovery_wake: Arc<(Mutex<bool>, Condvar)> = Arc::new((Mutex::new(false), Condvar::new()));
+    let reclaim_wake: Arc<(Mutex<bool>, Condvar)> = Arc::new((Mutex::new(false), Condvar::new()));
+
+    // Throttle state snapshot: written by evictor, read by IPC for `mgctl list`.
+    let throttle_snapshot: Arc<Mutex<std::collections::HashMap<String, throttle::ThrottledState>>> =
+        Arc::new(Mutex::new(std::collections::HashMap::new()));
+
+    // Ring buffer of recent daemon actions (freeze/kill/checkpoint), readable via `mgctl events`.
+    let event_log = events::new_log();
+
     let responder = {
         let f = Arc::clone(&frozen);
         let c = Arc::clone(&checkpointed);
         let l = Arc::clone(&logger);
         let w = Arc::clone(&recovery_wake);
+        let rw = Arc::clone(&reclaim_wake);
         let cal = Arc::clone(&calibrator);
-        thread::spawn(move || evictor::run(f, c, l, w, cal))
+        let ts = Arc::clone(&throttle_snapshot);
+        let el = Arc::clone(&event_log);
+        thread::spawn(move || evictor::run(f, c, l, w, rw, cal, ts, el))
     };
 
     let recovery = {
@@ -80,7 +93,9 @@ fn main() {
     let ipc = {
         let f = Arc::clone(&frozen);
         let c = Arc::clone(&checkpointed);
-        thread::spawn(move || ipc::run_server(f, c))
+        let ts = Arc::clone(&throttle_snapshot);
+        let el = Arc::clone(&event_log);
+        thread::spawn(move || ipc::run_server(f, c, ts, el))
     };
 
     let maintenance = {
@@ -88,13 +103,16 @@ fn main() {
         let f = Arc::clone(&frozen);
         let c = Arc::clone(&checkpointed);
         let cal = Arc::clone(&calibrator);
-        thread::spawn(move || maintenance::run(l, f, c, cal))
+        let rw = Arc::clone(&reclaim_wake);
+        thread::spawn(move || maintenance::run(l, f, c, cal, rw))
     };
 
     let _ = responder.join();
     let _ = recovery.join();
     let _ = ipc.join();
     let _ = maintenance.join();
+
+    plugin_server::shutdown_plugins();
 
     // Actors are done — no new freezes: safe to sweep.
     shutdown_unfreeze(&frozen);
@@ -148,24 +166,36 @@ fn print_startup_banner() {
     println!("  MaintenanceManager: 60s poll (idle reaps, housekeeping)");
     println!("  IPC socket:         {}", mgd_common::socket::socket_path().display());
 
-    match executor::checkpoint::criu_path() {
+    match executor::checkpoint::helper_path() {
         Some(p) => println!(
-            "  CRIU:               {} (checkpoint enabled; needs cap_checkpoint_restore,cap_sys_ptrace — falls back to kill if unprivileged)",
+            "  Checkpoint Helper:  {} (checkpoint enabled; checks permissions and runs criu)",
             p.display()
         ),
-        None => println!("  CRIU:               not found (checkpoint disabled — will SIGKILL instead)"),
+        None => println!("  Checkpoint Helper:  not found (checkpoint disabled — will SIGKILL instead)"),
     }
     println!("Press Ctrl+C to stop\n");
 }
 
-/// Remove snapshot dirs left by a previous crash — the registry isn't persisted.
-fn cleanup_orphaned_snapshots() {
+/// Remove snapshot dirs not tracked in the persisted CheckpointRegistry.
+fn cleanup_orphaned_snapshots(checkpointed: &Arc<Mutex<CheckpointRegistry>>) {
     let dir = mgd_common::util::home_dir().join(".local/share/mgd/snapshots");
     let Ok(entries) = std::fs::read_dir(&dir) else { return };
+
+    let active_dirs: std::collections::HashSet<std::path::PathBuf> = {
+        let reg = checkpointed.lock().unwrap();
+        reg.entries_lightest_first()
+            .into_iter()
+            .map(|(_, _, path, _, _)| path)
+            .collect()
+    };
+
     for entry in entries.flatten() {
         if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-            if std::fs::remove_dir_all(entry.path()).is_ok() {
-                locked_print(&format!("[startup] Removed orphaned snapshot: {:?}", entry.path()));
+            let path = entry.path();
+            if !active_dirs.contains(&path) {
+                if std::fs::remove_dir_all(&path).is_ok() {
+                    mgd_common::sync_print!("[startup] Removed orphaned snapshot: {:?}", path);
+                }
             }
         }
     }
@@ -185,9 +215,9 @@ fn shutdown_unfreeze(frozen: &Arc<Mutex<FrozenRegistry>>) {
     for (pid, st) in &entries {
         let r = executor::freezer::unfreeze_checked(*pid, *st);
         if r.success {
-            locked_print(&format!("  ✓ Unfroze PID {pid}"));
+            mgd_common::sync_print!("  ✓ Unfroze PID {pid}");
         } else {
-            mgd_common::output::locked_eprint(&format!("  ✗ PID {pid}: {}", r.error.unwrap_or_default()));
+            mgd_common::sync_eprint!("  ✗ PID {pid}: {}", r.error.unwrap_or_default());
         }
     }
     locked_print("[shutdown] Done.");
@@ -201,4 +231,26 @@ extern "C" fn handle_sigterm(_: libc::c_int) {
 /// SIGHUP → reload config on next responder cycle
 extern "C" fn handle_sighup(_: libc::c_int) {
     RELOAD_CONFIG.store(true, Ordering::Relaxed);
+}
+
+fn try_elevate_scheduler_priority() {
+    unsafe {
+        let mut param = libc::sched_param { sched_priority: 20 };
+        // Set policy to SCHED_RR (Real-Time Round Robin) with priority 20
+        if libc::sched_setscheduler(0, libc::SCHED_RR, &mut param) == 0 {
+            locked_print("[core] Successfully set scheduler policy to SCHED_RR (priority 20)");
+        } else {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EPERM) {
+                // If unprivileged and CAP_SYS_NICE is missing, fall back to setting highest normal priority (nice -20)
+                if libc::setpriority(libc::PRIO_PROCESS, 0, -20) == 0 {
+                    locked_print("[core] Set scheduler priority to nice -20 (highest normal priority)");
+                } else {
+                    locked_print("[core] Running with standard priority (CAP_SYS_NICE missing for RT/Nice elevation)");
+                }
+            } else {
+                mgd_common::sync_print!("[core] Warning: failed to set scheduler policy: {}", err);
+            }
+        }
+    }
 }

@@ -3,14 +3,10 @@ use std::os::fd::AsRawFd;
 use std::sync::LazyLock;
 
 use mgd_common::error::MgdError;
+use mgd_common::psi::{parse_kv, parse_kv_u64};
 pub use mgd_common::psi::GLOBAL_PSI;
 
-/// PSI source used by `read_pressure()`, resolved once at first use.
-/// Prefers the systemd user-manager cgroup (`user@<uid>.service`) so levels
-/// reflect only this session's pressure, not system-wide noise. Falls back to
-/// the global /proc file on cgroup-v1 hosts or kernels without per-cgroup PSI.
-/// Resolution logic lives in `mgd_common::psi` so `mgctl doctor` reports the
-/// same source the daemon uses.
+
 static PRESSURE_PATH: LazyLock<String> =
     LazyLock::new(mgd_common::psi::resolve_pressure_source);
 
@@ -22,20 +18,11 @@ pub fn pressure_source() -> &'static str {
 /// Kernel PSI trigger for zero-CPU idle waiting.
 pub struct PsiTrigger {
     file: std::fs::File,
-    /// Which PSI file the trigger is armed on (cgroup or global).
     pub source: &'static str,
 }
 
 impl PsiTrigger {
-    /// Creates a trigger that wakes up the thread when memory pressure hits
-    /// the configured `[psi]` elevated_pct over a 1-second window.
-    /// PSI format: `<some|full> <stall_us> <window_us>`
-    /// Armed once at startup — changing elevated_pct re-arms on daemon
-    /// restart, not on SIGHUP reload.
-    ///
-    /// Tries the per-session cgroup file first; falls back to the global
-    /// /proc file when the cgroup file is root-owned (systemd doesn't chown
-    /// the user@<uid>.service node itself).
+
     pub fn new() -> Result<Self, MgdError> {
         match Self::open(pressure_source()) {
             Err(_) if pressure_source() != GLOBAL_PSI => Self::open(GLOBAL_PSI),
@@ -52,7 +39,7 @@ impl PsiTrigger {
 
         // elevated_pct of the 1,000,000 us window (default 5% → 50,000 us)
         let stall_us = (crate::config::get().psi.elevated_pct / 100.0 * 1_000_000.0) as u64;
-        file.write_all(format!("some {stall_us} 1000000\0").as_bytes())?;
+        file.write_all(format!("some {stall_us} 1000000").as_bytes())?;
 
         Ok(PsiTrigger { file, source: path })
     }
@@ -177,20 +164,6 @@ fn parse_pressure(content: &str) -> Result<MemoryPressure, MgdError> {
         some_avg10, some_avg60, some_avg300, some_total,
         full_avg10, full_avg60, full_avg300, full_total,
     })
-}
-
-fn parse_kv(s: &str, prefix: &str) -> Result<f64, MgdError> {
-    s.strip_prefix(prefix)
-        .ok_or_else(|| MgdError::Parse(format!("expected '{prefix}', got '{s}'")))?
-        .parse::<f64>()
-        .map_err(MgdError::from)
-}
-
-fn parse_kv_u64(s: &str, prefix: &str) -> Result<u64, MgdError> {
-    s.strip_prefix(prefix)
-        .ok_or_else(|| MgdError::Parse(format!("expected '{prefix}', got '{s}'")))?
-        .parse::<u64>()
-        .map_err(|e| MgdError::Parse(e.to_string()))
 }
 
 /// Tier boundaries mapping `some_avg10` to `PressureLevel`, plus the

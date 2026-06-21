@@ -1,11 +1,12 @@
 //! mgd-kde — KDE Plasma 6+ plasmashell + plasma-discover watcher plugin.
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, Write};
 use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
+use mgd_common::util::unix_timestamp_secs;
 use mgd_common::protocol::{CoreMessage, PluginAction, PluginMessage};
 
 const PLUGIN_NAME: &str = "mgd-kde";
@@ -24,8 +25,7 @@ fn main() {
     let stream = mgd_common::plugin::connect_and_identify(PLUGIN_NAME, VERSION, vec!["idle_reap"]);
 
     let mut writer = stream.try_clone().expect("clone stream");
-    let mut reader = BufReader::new(stream);
-    
+
     // Load KWin active window tracker script and start the journal watcher
     if load_kwin_script().is_some() {
         mgd_common::sync_print!("[mgd-kde] KWin active window tracker script loaded and running.");
@@ -41,9 +41,8 @@ fn main() {
     let gpu_kb_clone = gpu_kb_cache.clone();
 
     thread::spawn(move || {
-        let mut line = String::new();
-        while reader.read_line(&mut line).is_ok() && !line.is_empty() {
-            if let Ok(msg) = serde_json::from_str::<CoreMessage>(&line) {
+        mgd_common::plugin::drain_lines(stream, |line| {
+            if let Ok(msg) = serde_json::from_str::<CoreMessage>(line) {
                 match msg {
                     CoreMessage::PressureChanged { level } => {
                         *level_clone.lock().unwrap() = level;
@@ -56,7 +55,7 @@ fn main() {
                             mgd_common::sync_print!("[mgd-kde] action denied: {:?}", reason);
                         } else if let PluginAction::RestartProcess { name } = action {
                             if name == "plasmashell" {
-                                let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+                                let now = unix_timestamp_secs();
                                 LAST_PLASMA_RESTART.store(now, Ordering::SeqCst);
                                 let _ = std::process::Command::new("systemctl")
                                     .arg("--user")
@@ -71,8 +70,7 @@ fn main() {
                     }
                 }
             }
-            line.clear();
-        }
+        });
     });
 
     let mut pd_tracker = DiscoverTracker {
@@ -93,39 +91,99 @@ fn main() {
     }
 }
 
-fn get_process_ticks(pid: u32) -> Option<u64> {
-    let stat = fs::read_to_string(format!("/proc/{}/stat", pid)).ok()?;
-    let parts: Vec<&str> = stat.split_whitespace().collect();
-    if parts.len() > 14 {
-        let utime: u64 = parts[13].parse().unwrap_or(0);
-        let stime: u64 = parts[14].parse().unwrap_or(0);
-        Some(utime + stime)
-    } else {
-        None
+fn default_plasma_cooldown_min() -> u64 { 30 }
+fn default_plasma_gpu_threshold_mb() -> u64 { 1024 }
+fn default_discover_cooldown_min() -> u64 { 30 }
+fn default_discover_idle_check_secs() -> u64 { 60 }
+fn default_discover_rss_threshold_mb() -> u64 { 400 }
+
+#[derive(serde::Deserialize)]
+struct PlasmaConfig {
+    #[serde(default = "default_plasma_cooldown_min")]
+    min_restart_interval_min: u64,
+    #[serde(default = "default_plasma_gpu_threshold_mb")]
+    gpu_leak_threshold_mb: u64,
+}
+
+impl Default for PlasmaConfig {
+    fn default() -> Self {
+        PlasmaConfig {
+            min_restart_interval_min: default_plasma_cooldown_min(),
+            gpu_leak_threshold_mb: default_plasma_gpu_threshold_mb(),
+        }
     }
 }
 
+#[derive(serde::Deserialize)]
+struct PlasmaDiscoverConfig {
+    #[serde(default = "default_discover_cooldown_min")]
+    cooldown_min: u64,
+    #[serde(default = "default_discover_idle_check_secs")]
+    idle_check_secs: u64,
+    #[serde(default = "default_discover_rss_threshold_mb")]
+    rss_threshold_mb: u64,
+}
+
+impl Default for PlasmaDiscoverConfig {
+    fn default() -> Self {
+        PlasmaDiscoverConfig {
+            cooldown_min: default_discover_cooldown_min(),
+            idle_check_secs: default_discover_idle_check_secs(),
+            rss_threshold_mb: default_discover_rss_threshold_mb(),
+        }
+    }
+}
+
+#[derive(serde::Deserialize, Default)]
+struct PluginConfig {
+    #[serde(default)]
+    plasma: PlasmaConfig,
+    #[serde(default)]
+    plasma_discover: PlasmaDiscoverConfig,
+}
+
+static PLUGIN_CONFIG: std::sync::OnceLock<PluginConfig> = std::sync::OnceLock::new();
+
+fn load_plugin_config() -> &'static PluginConfig {
+    PLUGIN_CONFIG.get_or_init(|| {
+        let home = std::env::var("HOME").unwrap_or_default();
+        let paths = [
+            std::path::PathBuf::from(&home).join(".config/mgd/priorities.toml"),
+            std::path::PathBuf::from("/etc/mgd/priorities.toml"),
+        ];
+        for path in &paths {
+            if let Ok(content) = std::fs::read_to_string(path) {
+                if let Ok(cfg) = toml::from_str(&content) {
+                    return cfg;
+                }
+            }
+        }
+        PluginConfig::default()
+    })
+}
+
 fn check_plasma_gpu(writer: &mut UnixStream, cache: &Arc<Mutex<u64>>) {
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+    let now = unix_timestamp_secs();
     let last_restart = LAST_PLASMA_RESTART.load(Ordering::SeqCst);
-    if now.saturating_sub(last_restart) < 600 {
-        return; // 10 minute cooldown
+    let cfg = load_plugin_config();
+    if now.saturating_sub(last_restart) < cfg.plasma.min_restart_interval_min * 60 {
+        return; // cooldown
     }
 
     let Some(pid) = mgd_common::process::find_pid_by_name("plasmashell") else { return };
-    
+
     // Request latest GPU stats for this PID
     let req = PluginMessage::QueryGpu { pid };
     let _ = writeln!(writer, "{}", serde_json::to_string(&req).unwrap());
-    
+
     // Use the currently cached value
     let gpu_kb = *cache.lock().unwrap();
 
-    if gpu_kb / 1024 > 250 {
+    if gpu_kb / 1024 > cfg.plasma.gpu_leak_threshold_mb {
         let act = PluginMessage::ActionRequest {
             plugin: PLUGIN_NAME.to_string(),
             action: PluginAction::RestartProcess { name: "plasmashell".to_string() },
-            reason: format!("gpu memory {}MB > 250MB", gpu_kb / 1024),
+            reason: format!("gpu memory {}MB > {}MB", gpu_kb / 1024, cfg.plasma.gpu_leak_threshold_mb),
         };
         let _ = writeln!(writer, "{}", serde_json::to_string(&act).unwrap());
         // Reset cache so we don't spam requests while waiting for core response
@@ -134,11 +192,13 @@ fn check_plasma_gpu(writer: &mut UnixStream, cache: &Arc<Mutex<u64>>) {
 }
 
 fn check_plasma_discover(writer: &mut UnixStream, tracker: &mut DiscoverTracker) {
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-    
+    let now = unix_timestamp_secs();
+    let cfg = load_plugin_config();
+
     let last_reap = LAST_PD_REAP.load(Ordering::SeqCst);
-    if now.saturating_sub(last_reap) < 60 {
-        return; // 1 minute cooldown between reap attempts
+    let reap_cooldown_secs = cfg.plasma_discover.cooldown_min * 60;
+    if now.saturating_sub(last_reap) < reap_cooldown_secs {
+        return; // cooldown between reap attempts
     }
 
     let Some(pid) = mgd_common::process::find_pid_by_name("plasma-discover") else { 
@@ -148,20 +208,20 @@ fn check_plasma_discover(writer: &mut UnixStream, tracker: &mut DiscoverTracker)
 
     if tracker.pid != pid {
         tracker.pid = pid;
-        tracker.ticks = get_process_ticks(pid).unwrap_or(0);
+        tracker.ticks = mgd_common::process::read_proc_cpu_ticks(pid).unwrap_or(0);
         tracker.idle_since = now;
         return;
     }
 
-    let current_ticks = get_process_ticks(pid).unwrap_or(0);
+    let current_ticks = mgd_common::process::read_proc_cpu_ticks(pid).unwrap_or(0);
     if current_ticks > tracker.ticks {
         tracker.ticks = current_ticks;
         tracker.idle_since = now;
         return; // not idle
     }
 
-    if now.saturating_sub(tracker.idle_since) >= 60 {
-        // Idle for at least 60 seconds
+    if now.saturating_sub(tracker.idle_since) >= cfg.plasma_discover.idle_check_secs {
+        // Idle for at least configured seconds
         let status_path = format!("/proc/{pid}/status");
         let Ok(status) = fs::read_to_string(&status_path) else { return };
         let mut rss_kb = 0;
@@ -172,11 +232,11 @@ fn check_plasma_discover(writer: &mut UnixStream, tracker: &mut DiscoverTracker)
             }
         }
 
-        if rss_kb / 1024 > 150 {
+        if rss_kb / 1024 > cfg.plasma_discover.rss_threshold_mb {
             let req = PluginMessage::ActionRequest {
                 plugin: PLUGIN_NAME.to_string(),
                 action: PluginAction::KillPid { pid },
-                reason: format!("RSS {}MB > 150MB and idle for 60s", rss_kb / 1024),
+                reason: format!("RSS {}MB > {}MB and idle for {}s", rss_kb / 1024, cfg.plasma_discover.rss_threshold_mb, cfg.plasma_discover.idle_check_secs),
             };
             let _ = writeln!(writer, "{}", serde_json::to_string(&req).unwrap());
             LAST_PD_REAP.store(now, Ordering::SeqCst);
@@ -265,3 +325,4 @@ fn watch_active_window(writer: std::os::unix::net::UnixStream) {
         let _ = child.kill();
     });
 }
+
