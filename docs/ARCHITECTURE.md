@@ -88,8 +88,8 @@ The core daemon (`mgd`) runs four cooperating threads ("actors"), spawned in
 ┌───────────────┐  ┌───────────────┐     ┌─────────────────┐   ┌──────────────────┐
 │ PressureRespon│  │ RecoveryManager│    │  IPC server      │   │ MaintenanceManager│
 │   (evictor.rs)│  │ (recovery.rs)  │    │   (ipc.rs)       │   │ (maintenance.rs)  │
-│  5s poll      │  │  3s poll       │    │  unix socket     │   │  60s poll         │
-│  freeze/kill/ │  │  unfreeze/     │    │  status/list/    │   │  proactive swap   │
+│  5s poll      │  │  3s poll       │    │  unix socket     │   │  60s poll or      │
+│  freeze/kill/ │  │  unfreeze/     │    │  status/list/    │   │  kill-triggered   │
 │  checkpoint + │  │  restore at    │    │  unfreeze/reload │   │  reclaim          │
 │  system pre-  │  │  Normal only   │    │  & plugin comms  │   │                   │
 │  actions      │  │                │    │                  │   │                   │
@@ -257,8 +257,9 @@ Every process gets a 0–100 priority (higher = sacrifice sooner), resolved by
 ¹ At Critical, special cases apply in order:
 - **Per-process `checkpoint` override** (config) wins: `true` → Checkpoint;
   `false` → Kill if mostly-swapped else Terminate.
-- Else if **`swap_ratio > 0.5`** (already mostly in swap) → Kill (checkpointing
-  on-disk-already data is pointless).
+- Else if **`swap_ratio > 0.5` AND `prio >= 60`** (expendable + already mostly in swap)
+  → Kill (checkpointing on-disk-already data is pointless). Protected processes
+  (`prio < 60`) with high swap ratio fall through to Checkpoint/Kill below.
 - Else normal tier with real RAM → Checkpoint to preserve state.
 
 ### Actions (`Action` enum)
@@ -326,9 +327,11 @@ Dump: `mgd-checkpoint dump <pid> <images-dir>` → wrapper validates and execs
 Restore: `mgd-checkpoint restore <images-dir>` → wrapper execs
 `criu restore --images-dir <dir> --shell-job --restore-detached`.
 
-If `mgd-checkpoint` is absent, `checkpoint.rs` falls back to direct criu invocation
-(legacy path); if criu itself is missing or exits non-zero, falls back to SIGKILL
-and logs once. See §9 and `PRIVILEGE_DESIGN.md` §3.
+If `mgd-checkpoint` is absent or CRIU fails, `checkpoint.rs` falls back to SIGKILL
+and logs once. A **per-binary failure cache** (`mark_binary_failed` / `is_checkpoint_eligible`)
+permanently excludes any binary that has failed a CRIU dump from future checkpoint
+attempts in the same daemon session — subsequent Freeze decisions for that binary
+use a priority-based SIGTERM/SIGKILL fallback instead. See §9 and `PRIVILEGE_DESIGN.md` §3.
 
 ---
 
@@ -359,11 +362,23 @@ Cooldown-gated so a sustained High spell doesn't re-walk every 5 s.
 ### early background process cgroup reclaim (`evictor.rs`, inline pre-action, Elevated)
 
 To proactively free RAM before pressure escalates, `mgd` implements early background cgroup reclaim. When pressure is `Elevated`, it selects up to 3 background processes that:
-- Have a priority $\ge 50$ (expendable/user applications).
+- Have a priority $\in [50, 59]$ — the "normal background" tier only. Processes with
+  priority $\ge 60$ are handled exclusively by `plan()` → `Action::Freeze` +
+  post-freeze reclaim (see below), which reclaims 100% RSS after SIGSTOP with no
+  re-fault risk.
 - Have an RSS $> 20$ MB.
 - Are not the currently active foreground process (reported by plugins).
 
 It reclaims $50\%$ of their RSS by writing the target bytes to their cgroup's `memory.reclaim` node (e.g., `/sys/fs/cgroup/user.slice/.../memory.reclaim`). Since the cgroup file hierarchy under the user's slice is owned by the user, this is fully unprivileged and does not require elevated privileges (`CAP_SYS_ADMIN`). A $30$ s cooldown is enforced between runs.
+
+### post-freeze cgroup reclaim (`evictor.rs`, inline post-action, Elevated+)
+
+After a successful `Action::Freeze` (SIGSTOP confirmed), the evictor immediately writes
+100% of the process's RSS to `memory.reclaim` for its cgroup (`FREEZE_RECLAIM` log event).
+The process is immobile (SIGSTOP), so there is no risk of re-faulting the pushed pages.
+This is strictly better than pre-freeze reclaim: pages are pushed while the process
+cannot touch them. Applies to all pressure-triggered Freeze decisions (prio ≥ 60);
+does **not** apply to idle-freeze (`IDLE_FREEZE`), which has its own separate path.
 
 ### idle background process cgroup reclaim (`evictor.rs`, Normal pressure only)
 
@@ -378,20 +393,37 @@ into an already-full swap would be counterproductive. A global cooldown of
 `global_cooldown_sec` (default 30 s) prevents back-to-back sweeps. Fully unprivileged.
 Gated by `[idle_reclaim] enabled` (on by default).
 
-### proactive swap reclaim (`maintenance.rs`, maintenance thread, Normal only)
+### proactive swap reclaim (`maintenance.rs`, maintenance thread)
 
-The headline fix for the MGLRU lazy-swap-in problem. When calm, cycle the zram
-swap device (`swapoff`/`swapon`) to pull all compressed pages back into RAM.
-Blocks, so it runs on the maintenance thread. **Privileged** (`CAP_SYS_ADMIN`) —
-carried by the `mgd-zram-reclaim` helper (see §9), **off by default**. All policy
-gates live in the unprivileged daemon:
+The headline fix for the MGLRU lazy-swap-in problem. Cycles the zram swap device
+(`swapoff`/`swapon`) to pull all compressed pages back into RAM, then lets MGLRU
+recompress cold pages naturally via `swapon`. Blocks, so it runs on the maintenance
+thread. **Privileged** (`CAP_SYS_ADMIN`) — carried by the `mgd-zram-reclaim`
+helper (see §9), **off by default**. All policy gates live in the unprivileged daemon.
 
-- Normal pressure **and** `some_avg60 < 5 %` (calm, not a just-subsided spike)
+**Two trigger paths:**
+
+1. **Calm path (normal cadence):** maintenance wakes every 60 s (condvar timeout),
+   checks all gates below, fires if conditions are met.
+
+2. **Kill-triggered path:** when the evictor dispatches ≥1 Kill/Terminate/Checkpoint
+   in a cycle, it signals `reclaim_wake` (condvar) immediately. The maintenance thread
+   wakes early and attempts `check_proactive_reclaim` regardless of the calm gate —
+   the kills just freed RAM + zram slots, creating the headroom the OOM gate needs.
+   The OOM headroom gate still runs (protects against OOM); only the `calm` guard is
+   bypassed for this path.
+
+**Gates (both paths check these):**
 - cooldown elapsed (`reclaim_cooldown_min`, default 10 min)
 - `zram_used ≥ min_zram_used_mb` (default 2048)
 - **OOM headroom gate (critical):** Restricts swap reclaim unless:
   $$\text{MemAvailable} > \text{Footprint}_{\text{decompressed}} \cdot m_{\text{headroom}}$$
   where $m_{\text{headroom}} = 1.5$ (default) and $\text{Footprint}_{\text{decompressed}}$ is the sum of `orig_data_size` (field 0 of `/sys/block/zramN/mm_stat`) across all zram devices. Because zram stores compressed pages that expand 2–3× on decompression, this gate prevents the reclaim operation itself from triggering a system OOM.
+
+**Why this solves the mutual-exclusion problem:** the classic failure mode was
+`avail > footprint × 1.5` being impossible to satisfy under pressure (the exact
+moment reclaim is needed). By killing expendable processes first — which frees their
+zram slots without decompressing — the gate can pass immediately after eviction.
 
 ---
 

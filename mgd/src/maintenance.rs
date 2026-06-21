@@ -45,6 +45,7 @@ pub fn run(
     frozen: Arc<Mutex<FrozenRegistry>>,
     checkpointed: Arc<Mutex<CheckpointRegistry>>,
     calibrator: Arc<Mutex<Calibrator>>,
+    reclaim_wake: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
 ) {
     let mut last_calibration_flush = Instant::now();
 
@@ -62,10 +63,19 @@ pub fn run(
             .map(|p| monitor::psi::pressure_level(p) == PressureLevel::Normal)
             .unwrap_or(false);
 
+        // Check if evictor signalled that kills freed headroom.
+        let kill_triggered = {
+            let (lock, _) = &*reclaim_wake;
+            let mut flag = lock.lock().unwrap();
+            let was_set = *flag;
+            *flag = false;
+            was_set
+        };
+
         let cycle_start = Instant::now();
         if calm {
             if let Some(p) = pressure.as_ref() {
-                check_proactive_reclaim(p, &log);
+                check_proactive_reclaim(p, &log, false);
 
                 // Calibration benign-time sampling: the evictor only reads PSI
                 // when the kernel trigger wakes it, so calm time is invisible
@@ -87,9 +97,26 @@ pub fn run(
             flush_calibration(&calibrator, &log);
         }
 
+        // Evictor signalled: kills freed RAM + zram slots. Attempt proactive reclaim
+        // now regardless of calm — the headroom gate inside check_proactive_reclaim
+        // still protects against OOM; we just skip the calm-only guard here.
+        if kill_triggered && !calm {
+            if let Some(p) = pressure.as_ref() {
+                mgd_common::sync_print!("[maintenance] Kill-triggered reclaim attempt (post-eviction headroom)");
+                check_proactive_reclaim(p, &log, true);
+            }
+        }
+
         // Subtract time already spent (the idle sample) to hold the period at ~POLL_SECS.
         let spent = cycle_start.elapsed().as_secs();
-        interruptible_sleep(POLL_SECS.saturating_sub(spent));
+
+        // Block on condvar instead of fixed sleep so the evictor can wake us early
+        // when kills create headroom. Timeout = POLL_SECS (normal maintenance cadence).
+        let (lock, cvar) = &*reclaim_wake;
+        let _ = cvar.wait_timeout(
+            lock.lock().unwrap(),
+            Duration::from_secs(POLL_SECS.saturating_sub(spent)),
+        );
     }
 }
 
@@ -208,11 +235,22 @@ fn reclaim_gates_pass(g: &ReclaimGates) -> Result<(), String> {
     Ok(())
 }
 
+/// Minimum cooldown for the kill-triggered path (2 min). Shorter than the calm
+/// path default (10 min) so post-eviction reclaim is more responsive.
+const KILL_RECLAIM_COOLDOWN_SECS: u64 = 120;
+
 /// Proactive swap reclaim via the capped helper (PRIVILEGED, PRIVILEGE_DESIGN
 /// §2). No-op unless `[reclaim] proactive_swap_reclaim = true`. All gates live
-/// here; the helper is dumb. Requires `some_avg60 < 5%` so a just-subsided spike
-/// doesn't trigger a reclaim.
-fn check_proactive_reclaim(pressure: &monitor::psi::MemoryPressure, log: &Logger) {
+/// here; the helper is dumb.
+///
+/// `skip_calm_gate`: when true (kill-triggered path), bypasses `some_avg60 < 5%`
+/// and uses a shorter cooldown — kills just freed headroom, calm check is
+/// irrelevant.
+fn check_proactive_reclaim(
+    pressure: &monitor::psi::MemoryPressure,
+    log: &Logger,
+    skip_calm_gate: bool,
+) {
     let (enabled, threshold_pct, cooldown_secs, min_used_mb, headroom_mult) = {
         let cfg = crate::config::get();
         if !cfg.proactive_swap_reclaim {
@@ -230,13 +268,18 @@ fn check_proactive_reclaim(pressure: &monitor::psi::MemoryPressure, log: &Logger
         return;
     }
 
-    if pressure.some_avg60 >= 5.0 {
+    if !skip_calm_gate && pressure.some_avg60 >= 5.0 {
         return;
     }
 
+    let effective_cooldown = if skip_calm_gate {
+        cooldown_secs.min(KILL_RECLAIM_COOLDOWN_SECS)
+    } else {
+        cooldown_secs
+    };
     let now = now_secs();
     let last = LAST_RECLAIM.load(Ordering::Relaxed);
-    if last != 0 && now.saturating_sub(last) < cooldown_secs {
+    if last != 0 && now.saturating_sub(last) < effective_cooldown {
         return;
     }
 
@@ -267,8 +310,9 @@ fn check_proactive_reclaim(pressure: &monitor::psi::MemoryPressure, log: &Logger
     }
 
     mgd_common::sync_print!(
-        "[reclaim] calm, swap {:.0}% full, zram {}MB compressed ({}MB decompressed), \
+        "[reclaim] {} swap {:.0}% full, zram {}MB compressed ({}MB decompressed), \
          avail {}MB — reclaiming",
+        if skip_calm_gate { "post-eviction:" } else { "calm," },
         gates.swap_used_pct, gates.zram_used_mb, gates.zram_orig_mb, gates.mem_available_mb
     );
 

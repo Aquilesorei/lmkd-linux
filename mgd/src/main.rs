@@ -61,6 +61,7 @@ fn main() {
 
 
     let recovery_wake: Arc<(Mutex<bool>, Condvar)> = Arc::new((Mutex::new(false), Condvar::new()));
+    let reclaim_wake: Arc<(Mutex<bool>, Condvar)> = Arc::new((Mutex::new(false), Condvar::new()));
 
     // Throttle state snapshot: written by evictor, read by IPC for `mgctl list`.
     let throttle_snapshot: Arc<Mutex<std::collections::HashMap<String, throttle::ThrottledState>>> =
@@ -74,10 +75,11 @@ fn main() {
         let c = Arc::clone(&checkpointed);
         let l = Arc::clone(&logger);
         let w = Arc::clone(&recovery_wake);
+        let rw = Arc::clone(&reclaim_wake);
         let cal = Arc::clone(&calibrator);
         let ts = Arc::clone(&throttle_snapshot);
         let el = Arc::clone(&event_log);
-        thread::spawn(move || evictor::run(f, c, l, w, cal, ts, el))
+        thread::spawn(move || evictor::run(f, c, l, w, rw, cal, ts, el))
     };
 
     let recovery = {
@@ -101,7 +103,8 @@ fn main() {
         let f = Arc::clone(&frozen);
         let c = Arc::clone(&checkpointed);
         let cal = Arc::clone(&calibrator);
-        thread::spawn(move || maintenance::run(l, f, c, cal))
+        let rw = Arc::clone(&reclaim_wake);
+        thread::spawn(move || maintenance::run(l, f, c, cal, rw))
     };
 
     let _ = responder.join();

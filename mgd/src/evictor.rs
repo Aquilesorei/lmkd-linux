@@ -51,6 +51,7 @@ pub fn run(
     checkpointed: Arc<Mutex<CheckpointRegistry>>,
     log: Arc<Logger>,
     recovery_wake: Arc<(Mutex<bool>, Condvar)>,
+    reclaim_wake: Arc<(Mutex<bool>, Condvar)>,
     calibrator: Arc<Mutex<crate::engine::calibrate::Calibrator>>,
     throttle_snapshot: Arc<Mutex<HashMap<String, crate::throttle::ThrottledState>>>,
     event_log: crate::events::EventLog,
@@ -409,11 +410,47 @@ pub fn run(
             mgd_common::sync_print!("✓ No action needed.");
         } else {
             mgd_common::sync_print!("⚡ EXECUTING:");
+            let mut destructive_count = 0u32;
             for d in &decisions {
                 if frozen.lock().unwrap().is_frozen(d.pid) { continue; }
 
                 let result_str = execute_decision(d, &frozen, &checkpointed, &log, &event_log);
                 mgd_common::sync_print!("  {:<10} {:<8} {:<22} {:>6.1}MB  {}", d.action, d.pid, d.name, d.rss_mb, result_str);
+
+                // Post-freeze reclaim: push full RSS to zram while the process is immobile.
+                // SIGSTOP guarantees no re-faults, so 100% is safe (unlike active-process
+                // early reclaim which caps at 50% to preserve a working set).
+                if d.action == Action::Freeze && result_str == "frozen" {
+                    if let Some(cgroup_path) = plan_procs.iter()
+                        .find(|p| p.pid == d.pid)
+                        .and_then(|p| p.cgroup_path.as_deref())
+                    {
+                        let reclaim_bytes = (d.rss_mb * 1024.0 * 1024.0) as u64;
+                        match reclaim_cgroup(cgroup_path, reclaim_bytes) {
+                            Ok(()) => {
+                                mgd_common::sync_print!(
+                                    "[reclaim] Post-freeze: pushed ~{:.0}MB from PID {} ({}) to zram",
+                                    d.rss_mb, d.pid, d.name
+                                );
+                                log.log(&LogEntry::new(
+                                    "FREEZE_RECLAIM",
+                                    d.pid,
+                                    &d.name,
+                                    d.rss_mb,
+                                    "pushed to zram after pressure freeze",
+                                ));
+                            }
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                            Err(_) => {}
+                        }
+                    }
+                }
+
+                // Terminate is async (SIGTERM→5s→SIGKILL): RAM not freed yet when we
+                // signal maintenance. Only count synchronous kills (Kill, Checkpoint).
+                if matches!(d.action, Action::Kill | Action::Checkpoint) {
+                    destructive_count += 1;
+                }
 
                 // Track recently terminated/killed cgroups
                 if d.action == Action::Kill || d.action == Action::Terminate {
@@ -430,6 +467,14 @@ pub fn run(
             let (lock, cvar) = &*recovery_wake;
             *lock.lock().unwrap() = true;
             cvar.notify_one();
+
+            // Kills/checkpoints freed RAM + zram slots — wake maintenance so it
+            // can attempt proactive swap reclaim while headroom still exists.
+            if destructive_count > 0 {
+                let (lock, cvar) = &*reclaim_wake;
+                *lock.lock().unwrap() = true;
+                cvar.notify_one();
+            }
         }
     }
 }
@@ -774,12 +819,21 @@ fn check_early_process_reclaim(
     // - Priority >= 50 (expendable/user apps)
     // - RSS > 20MB
     // - Not the active foreground process
+    // prio >= 60 processes are handled by plan() → Action::Freeze + post-freeze reclaim,
+    // which reclaims 100% RSS after SIGSTOP (no re-fault risk). Restricting to prio < 60
+    // here avoids a redundant memory.reclaim write on those same pids.
+    // Known edge: if swap_exhausted causes a Kill (prio>=80) to break the plan() loop
+    // before a prio[60,79] process is reached, that process misses both paths for that
+    // cycle. Accepted — swap_exhausted+Critical is already a crisis; next cycle corrects.
     let mut targets: Vec<&Process> = plan_procs
         .iter()
         .filter(|p| {
             p.rss_kb > 20_000
                 && Some(p.pid) != active_pid
-                && get_priority(&p.name, p.exe_basename.as_deref()) >= 50
+                && {
+                    let prio = get_priority(&p.name, p.exe_basename.as_deref());
+                    prio >= 50 && prio < 60
+                }
         })
         .copied()
         .collect();

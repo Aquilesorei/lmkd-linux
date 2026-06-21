@@ -379,12 +379,57 @@ fn load() -> CompiledConfig {
     match compile(&content) {
         Ok(mut cfg) => {
             cfg.config_path = path;
+            apply_calibration_overlay(&mut cfg);
             cfg
         }
         Err(e) => {
             eprintln!("mgd: config error ({e}), falling back to built-in defaults");
             compile(BUILTIN_CONFIG).expect("built-in config must be valid")
         }
+    }
+}
+
+// ── Calibration auto-apply ────────────────────────────────────────────────────
+
+#[derive(serde::Deserialize, Default)]
+struct CalibrationSuggestion {
+    #[serde(default)]
+    psi: CalibrationPsi,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct CalibrationPsi {
+    elevated_pct: Option<f64>,
+    full_critical_pct: Option<f64>,
+}
+
+/// On every config load (startup + SIGHUP), overlay the two auto-calibrated
+/// PSI thresholds from `calibration_suggestion.toml` if the file exists and
+/// parses cleanly. Upper tiers (high/critical/emergency) are commented-out in
+/// the suggestion file and thus ignored by the TOML parser — manual review
+/// required before applying them.
+fn apply_calibration_overlay(cfg: &mut CompiledConfig) {
+    if cfg!(test) {
+        return;
+    }
+    let path = mgd_common::util::home_dir()
+        .join(".local/share/mgd/calibration_suggestion.toml");
+    let Ok(content) = std::fs::read_to_string(&path) else { return };
+    let Ok(suggestion) = toml::from_str::<CalibrationSuggestion>(&content) else { return };
+    let mut applied = false;
+    if let Some(v) = suggestion.psi.elevated_pct {
+        cfg.psi.elevated_pct = v;
+        applied = true;
+    }
+    if let Some(v) = suggestion.psi.full_critical_pct {
+        cfg.psi.full_critical_pct = v;
+        applied = true;
+    }
+    if applied {
+        eprintln!(
+            "[config] Calibration overlay applied: elevated_pct={:.1} full_critical_pct={:.1}",
+            cfg.psi.elevated_pct, cfg.psi.full_critical_pct,
+        );
     }
 }
 
