@@ -12,7 +12,7 @@ The Linux kernel swaps processes out on memory spikes but never actively reclaim
 
 Instead of reacting to raw instantaneous metrics, `lmkd-linux` operates as a **damped feedback controller** to determine the system's memory pressure:
 
-1. **Continuous Pressure Score ($P$):** Combines weighted system signals: **60% PSI memory stall**, **25% swap saturation**, and **15% UMA GPU memory residency** (crucial for Intel Iris Xe and other integrated GPUs where graphics memory competing for system RAM is otherwise invisible to tools like `free`).
+1. **Continuous Pressure Score ($P$):** Combines weighted system signals: **55% PSI memory stall**, **20% swap saturation**, **15% UMA GPU memory residency** (crucial for Intel Iris Xe and other integrated GPUs where graphics memory competing for system RAM is otherwise invisible to tools like `free`), and **10% swap I/O rate** (catches fast-onset thrashing before the 10s PSI average smooths it).
 2. **Pressure Trend ($T = dP/dt$):** Measures the velocity of pressure changes to accelerate reactions to sudden spikes while ignoring brief transient blips.
 3. **Damped State Machine:** Coordinates escalation and recovery. Upward transitions require pressure to persist for at least 2 cycles (ticks) unless a rapid critical spike occurs. Downward transitions require sustained calm (1–2 minutes) to prevent system oscillation.
 
@@ -50,11 +50,13 @@ System stayed responsive throughout. No UI freeze, no compositor stutter, no reb
 
 | Range | Tier | Examples |
 |-------|------|---------|
-| 0–19 | CRITICAL | kwin_wayland, pipewire, plasmashell |
-| 20–39 | HIGH | RustRover, WebStorm |
-| 40–59 | NORMAL | Firefox, Claude CLI |
-| 60–79 | LOW | plasma-discover, baloo |
-| 80–100 | EXPENDABLE | msedge, browser tabs, AI inference |
+| 0–19 | System/critical | kwin_wayland, pipewire, plasmashell |
+| 20–49 | Protected | RustRover, WebStorm, Firefox, Claude CLI |
+| 50–59 | Normal background | generic user apps |
+| 60–79 | Expendable background | plasma-discover, baloo, trackers |
+| 80–100 | Expendable heavy | msedge, browser tabs, AI inference |
+
+**Foreground adjustment:** the active window (reported by the DE plugin) gets its effective priority reduced by 25 before `plan()`, shielding it from eviction at its current pressure level.
 
 ## Installation
 
@@ -196,7 +198,7 @@ checkpoint = true
 name       = "quick-tool"
 pattern    = "^quick-tool$"
 priority   = 60
-chegckpoint = false
+checkpoint = false
 
 # Hard protect — mgd will never touch this process regardless of pressure
 [[protect]]
@@ -230,7 +232,7 @@ falls back to SIGKILL when checkpoint fails. See the opt-in setup below.
 - [x] Priority-based decision engine
 - [x] Freeze/unfreeze cycle (SIGSTOP/SIGCONT)
 - [x] Kill pipeline (SIGTERM → SIGKILL)
-- [x] CRIU checkpoint with kill fallback
+- [x] CRIU checkpoint with kill fallback (`mgd-checkpoint` validating wrapper — no caps on the daemon itself)
 - [x] Frozen process registry
 - [x] Session logging
 - [x] Systemd user service
@@ -245,7 +247,7 @@ falls back to SIGKILL when checkpoint fails. See the opt-in setup below.
 - [x] Registry persistence across daemon restart
 - [x] fdinfo GPU sweep cost reduction (pluginized decoupled architecture)
 - [x] `mgctl doctor` + `mgctl calibrate` portability UX
-- [x] PSI epoll (kernel-native triggers, replace 5s poll when calm)
+- [x] PSI kernel trigger via `mgd-psi-trigger` capped subprocess (`cap_perfmon+ep`) with epoll fallback and auto-respawn
 - [ ] Benchmark harness vs earlyoom / nohang / systemd-oomd
 - [ ] COSMIC DE / Pop!_OS 24 plugin (`mgd-cosmic`)
 
