@@ -57,11 +57,23 @@ pub fn run(
     event_log: crate::events::EventLog,
 ) {
     mgd_common::sync_print!("[responder] PSI source: {}", monitor::psi::pressure_source());
-    let psi_trigger = monitor::psi::PsiTrigger::new().ok();
-    if let Some(t) = &psi_trigger {
+
+    // Try subprocess trigger first (mgd-psi-trigger with cap_perfmon+ep).
+    // Falls back to direct PsiTrigger (works without cap on older kernels),
+    // then 5s polling.
+    let mut psi_elevated_pct = crate::config::get().psi.elevated_pct;
+    let mut psi_subprocess = monitor::psi::PsiSubprocess::new(psi_elevated_pct);
+    let mut psi_trigger = if psi_subprocess.is_none() {
+        monitor::psi::PsiTrigger::new().ok()
+    } else {
+        None
+    };
+    if psi_subprocess.is_some() {
+        mgd_common::sync_print!("[responder] PSI kernel trigger armed via mgd-psi-trigger (zero-CPU idle).");
+    } else if let Some(t) = &psi_trigger {
         mgd_common::sync_print!("[responder] PSI epoll trigger registered on {} (zero-CPU idle).", t.source);
     } else {
-        mgd_common::sync_print!("[responder] PSI epoll failed — falling back to 5s polling.");
+        mgd_common::sync_print!("[responder] PSI kernel trigger unavailable (mgd-psi-trigger not found or cap_perfmon absent; cgroup file not writable) — 5s polling.");
     }
 
     let mut last_level = PressureLevel::Normal;
@@ -86,47 +98,80 @@ pub fn run(
         if crate::should_shutdown() {
             throttle.restore_all();
             memcap.restore_all();
+            // Wake maintenance so it exits immediately instead of blocking up to 60s.
+            let (lock, cvar) = &*reclaim_wake;
+            if let Ok(_g) = lock.lock() { cvar.notify_all(); }
             return;
         }
 
         if crate::should_reload() {
             crate::config::reload();
+            // Respawn PSI subprocess if elevated_pct changed (new threshold needs
+            // a fresh fd — the kernel trigger can't be re-armed on an existing fd).
+            let new_pct = crate::config::get().psi.elevated_pct;
+            if (new_pct - psi_elevated_pct).abs() > 0.001 {
+                psi_elevated_pct = new_pct;
+                psi_subprocess = monitor::psi::PsiSubprocess::new(psi_elevated_pct);
+                if psi_subprocess.is_some() {
+                    mgd_common::sync_print!("[responder] PSI trigger respawned at elevated_pct={:.1}%.", psi_elevated_pct);
+                }
+            }
         }
 
         // Zero-CPU idle: if pressure was Normal last cycle, block on the kernel
         // PSI trigger instead of doing expensive /proc/pid walks.
         // Timeout 5s just to re-check shutdown flags and maintain the loop pulse.
         if last_level == PressureLevel::Normal {
-            if let Some(trigger) = &psi_trigger {
-                if !trigger.wait(5000) {
-                    // Timeout: no PSI event, system is calm.
-                    // Still run idle reclaim if the cooldown has elapsed so
-                    // background cgroups get reclaimed proactively during quiet
-                    // periods rather than waiting for the next pressure spike.
-                    {
-                        let config = crate::config::get();
-                        if config.idle_reclaim_enabled {
-                            let now_inst = std::time::Instant::now();
-                            if now_inst.duration_since(last_idle_reclaim_check).as_secs()
-                                >= config.idle_reclaim_global_cooldown_sec
-                            {
-                                last_idle_reclaim_check = now_inst;
-                                let procs = monitor::process::list_processes();
-                                let frozen_set: HashSet<u32> =
-                                    frozen.lock().unwrap().frozen_pids().into_iter().collect();
-                                let plan_procs: Vec<&Process> =
-                                    procs.iter().filter(|p| !frozen_set.contains(&p.pid)).collect();
-                                let active_pid = crate::plugin_server::get_active_foreground_pid();
-                                check_idle_process_reclaim(
-                                    &plan_procs, active_pid, &mut idle_reclaim_pid_tracker, &mut idle_freeze_pid_tracker, &frozen, &log,
-                                );
-                            }
+            // Helper closure: run idle reclaim on PSI timeout and skip the cycle.
+            // Extracted so the subprocess and direct-trigger paths share it.
+            macro_rules! on_psi_timeout {
+                () => {{
+                    let config = crate::config::get();
+                    if config.idle_reclaim_enabled {
+                        let now_inst = std::time::Instant::now();
+                        if now_inst.duration_since(last_idle_reclaim_check).as_secs()
+                            >= config.idle_reclaim_global_cooldown_sec
+                        {
+                            last_idle_reclaim_check = now_inst;
+                            let procs = monitor::process::list_processes();
+                            let frozen_set: HashSet<u32> =
+                                frozen.lock().unwrap().frozen_pids().into_iter().collect();
+                            let plan_procs: Vec<&Process> =
+                                procs.iter().filter(|p| !frozen_set.contains(&p.pid)).collect();
+                            let active_pid = crate::plugin_server::get_active_foreground_pid();
+                            check_idle_process_reclaim(
+                                &plan_procs, active_pid,
+                                &mut idle_reclaim_pid_tracker, &mut idle_freeze_pid_tracker,
+                                &frozen, &log,
+                            );
                         }
                     }
-                    continue; // Timeout, no pressure -> skip the whole cycle
+                    continue; // no pressure event → skip full cycle
+                }};
+            }
+
+            let helper_died = if let Some(sub) = &psi_subprocess {
+                match sub.wait(5000) {
+                    monitor::psi::WaitResult::Event => false,
+                    monitor::psi::WaitResult::Timeout => { on_psi_timeout!(); }
+                    monitor::psi::WaitResult::HelperDied => true,
                 }
+            } else if let Some(trigger) = &psi_trigger {
+                if !trigger.wait(5000) { on_psi_timeout!(); }
+                false
             } else {
                 thread::sleep(Duration::from_secs(5));
+                false
+            };
+            if helper_died {
+                mgd_common::sync_print!("[psi] mgd-psi-trigger exited — attempting respawn");
+                psi_subprocess = monitor::psi::PsiSubprocess::new(psi_elevated_pct);
+                if psi_subprocess.is_none() && psi_trigger.is_none() {
+                    psi_trigger = monitor::psi::PsiTrigger::new().ok();
+                    if let Some(t) = &psi_trigger {
+                        mgd_common::sync_print!("[psi] subprocess respawn failed — fell back to epoll trigger on {}", t.source);
+                    }
+                }
             }
         } else {
             // When Elevated or higher, poll actively so we can monitor recovery
@@ -240,6 +285,9 @@ pub fn run(
         let mut effective_level = current_state.to_pressure_level();
 
         let swap_used_pct = meminfo.swap_used_pct();
+        // swap_exhausted (≥95%) is forwarded to plan() as a per-process Kill escalator for
+        // prio ≥80 (expendable tier). Distinct from apply_swap_overrides() which raises the
+        // *pressure level* — both run every cycle.
         let swap_exhausted = meminfo.swap_total_kb > 0 && swap_used_pct >= 95.0;
 
         let prev_effective = effective_level.clone();
@@ -427,7 +475,7 @@ pub fn run(
                     {
                         let reclaim_bytes = (d.rss_mb * 1024.0 * 1024.0) as u64;
                         match reclaim_cgroup(cgroup_path, reclaim_bytes) {
-                            Ok(()) => {
+                            Ok(true) => {
                                 mgd_common::sync_print!(
                                     "[reclaim] Post-freeze: pushed ~{:.0}MB from PID {} ({}) to zram",
                                     d.rss_mb, d.pid, d.name
@@ -440,6 +488,7 @@ pub fn run(
                                     "pushed to zram after pressure freeze",
                                 ));
                             }
+                            Ok(false) => {}
                             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                             Err(_) => {}
                         }
@@ -778,22 +827,36 @@ fn execute_checkpoint(d: &Decision, checkpointed: &Arc<Mutex<CheckpointRegistry>
     }
 }
 
-fn reclaim_cgroup(cgroup_path: &str, bytes_size: u64) -> Result<(), std::io::Error> {
+fn is_cgroup_leaf(cgroup_path: &str) -> bool {
+    let sysfs_dir = crate::throttle::cgroup_sysfs_path(cgroup_path, "");
+    std::fs::read_dir(&sysfs_dir)
+        .map(|entries| {
+            !entries
+                .filter_map(|e| e.ok())
+                .any(|e| e.file_type().map(|ft| ft.is_dir()).unwrap_or(false))
+        })
+        .unwrap_or(true) // fail open: can't read → assume leaf, attempt reclaim
+}
+
+fn reclaim_cgroup(cgroup_path: &str, bytes_size: u64) -> Result<bool, std::io::Error> {
 
     if bytes_size == 0 {
-        return Ok(());
+        return Ok(false);
     }
 
-    if cgroup_path == "/" {
+    if cgroup_path == "/" || cgroup_path.is_empty() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             "cannot reclaim root cgroup",
         ));
     }
+    if !is_cgroup_leaf(cgroup_path) {
+        return Ok(false); // non-leaf: skip silently, caller must not log or reset timers
+    }
     let reclaim_path = crate::throttle::cgroup_sysfs_path(cgroup_path, "memory.reclaim");
     if reclaim_path.exists() {
         std::fs::write(&reclaim_path, format!("{}", bytes_size))?;
-        return Ok(());
+        return Ok(true);
     }
     Err(std::io::Error::new(std::io::ErrorKind::NotFound, "cgroup memory.reclaim not found"))
 }
@@ -845,7 +908,7 @@ fn check_early_process_reclaim(
         let reclaim_bytes_size = (p.rss_kb / 2) * 1024; // reclaim 50% of RSS
         let Some(cgroup) = p.cgroup_path.as_deref() else { continue };
         match reclaim_cgroup(cgroup, reclaim_bytes_size) {
-            Ok(()) => {
+            Ok(true) => {
                 mgd_common::sync_print!(
                     "[reclaim] Proactively pushed ~{}MB of background PID {} ({}) to Zram",
                     reclaim_bytes_size / (1024 * 1024),
@@ -860,6 +923,7 @@ fn check_early_process_reclaim(
                     "pushed to zram via cgroup reclaim",
                 ));
             }
+            Ok(false) => {}
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 // EAGAIN: nothing reclaimable right now, skip silently.
             }
@@ -928,7 +992,7 @@ fn check_idle_process_reclaim(
         };
 
         match reclaim_cgroup(cgroup, *bytes_to_reclaim_size) {
-            Ok(()) => {
+            Ok(true) => {
                 mgd_common::sync_print!(
                     "[reclaim] Proactively reclaimed ~{}MB from idle background process {} (PID {})",
                     bytes_to_reclaim_size / (1024 * 1024),
@@ -947,6 +1011,7 @@ fn check_idle_process_reclaim(
                 // Reset timer → serves as per-process cooldown
                 pid_tracker.insert(*pid, std::time::Instant::now());
             }
+            Ok(false) => {}
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 // EAGAIN: kernel has nothing reclaimable right now — not an error.
                 // Reset timer so we back off for a full idle_sec before retrying.

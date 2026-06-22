@@ -5,7 +5,7 @@ edition     = "2024"
 description = "zram compact + proactive swap-reclaim plugin for mgd"
 repository  = "https://github.com/Aquilesorei/lmkd-linux"
 license     = "GPL-2.0"
-authors     = ["Caleb Zongo <your@email.com>"]
+authors     = ["Caleb Zongo <achillezongo07@gmail.com>"]
 
 # mgd-zram-reclaim: privileged CAP_SYS_ADMIN helper. Built unprivileged;
 # gains cap via `setcap` at install time (opt-in). Self-contained — no deps

@@ -5,33 +5,19 @@ pub mod checkpoint;
 
 use std::fs;
 
-/// Unified result for signal-based operations (freeze, unfreeze, kill, terminate).
 #[derive(Debug)]
-#[allow(dead_code)]
 pub struct OpResult {
-    pub pid: u32,
     pub success: bool,
     pub error: Option<String>,
 }
 
-
 impl OpResult {
-    /// Create a successful operation result.
-    pub fn success(pid: u32) -> Self {
-        Self {
-            pid,
-            success: true,
-            error: None,
-        }
+    pub fn success() -> Self {
+        Self { success: true, error: None }
     }
 
-    /// Create a failed operation result with a dynamic error message.
-    pub fn fail<S: Into<String>>(pid: u32, error: S) -> Self {
-        Self {
-            pid,
-            success: false,
-            error: Some(error.into()),
-        }
+    pub fn fail<S: Into<String>>(error: S) -> Self {
+        Self { success: false, error: Some(error.into()) }
     }
 }
 /// Read process start time from /proc/pid/stat (field 22, clock ticks since boot).

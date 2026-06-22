@@ -5,7 +5,7 @@ edition     = "2024"
 description = "KDE Plasma 6+ plasmashell and plasma-discover watcher plugin for mgd"
 repository  = "https://github.com/Aquilesorei/lmkd-linux"
 license     = "GPL-2.0"
-authors     = ["Caleb Zongo <your@email.com>"]
+authors     = ["Caleb Zongo <achillezongo07@gmail.com>"]
 
 [[bin]]
 name = "mgd-kde"

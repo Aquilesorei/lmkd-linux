@@ -90,3 +90,18 @@ pub fn parse_mem_kb(s: &str) -> Option<u64> {
         _ => None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::parse_mem_kb;
+
+    #[test]
+    fn test_parse_mem_kb_units() {
+        assert_eq!(parse_mem_kb("2247000 KiB"), Some(2_247_000));
+        assert_eq!(parse_mem_kb("4 MiB"), Some(4096));
+        assert_eq!(parse_mem_kb("1 GiB"), Some(1024 * 1024));
+        assert_eq!(parse_mem_kb("2048 B"), Some(2));
+        assert_eq!(parse_mem_kb("4096"), Some(4)); // bare = bytes
+        assert_eq!(parse_mem_kb("garbage"), None);
+    }
+}
