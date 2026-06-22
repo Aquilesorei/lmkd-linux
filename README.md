@@ -213,6 +213,14 @@ mgctl reload
 kill -HUP $(pgrep mgd)
 ```
 
+## Documentation
+
+| Doc | What it covers |
+|-----|---------------|
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | End-to-end design spec — all threads, modules, data flows, and design rationale |
+| [docs/DECISION_TREE.md](docs/DECISION_TREE.md) | Mermaid flowcharts — evictor loop, per-process plan(), reclaim, recovery, maintenance |
+| [docs/PRIVILEGE_DESIGN.md](docs/PRIVILEGE_DESIGN.md) | Privilege split rationale — why caps live on helper binaries, not the daemon |
+
 ## Security model
 
 mgd runs as a user service and manages only processes owned by your user
