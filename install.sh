@@ -51,7 +51,7 @@ ok "Dependencies OK"
 
 # ── build ─────────────────────────────────────────────────────────────────────
 echo "Building release binaries..."
-cargo build --bin mgd --bin mgctl --bin mgd-zram-reclaim --bin mgd-checkpoint --bin mgd-kde --bin mgd-gpu-intel --bin mgd-gpu-amd --bin mgd-gnome --bin mgd-cosmic --release 2>&1 | tail -3
+cargo build --bin mgd --bin mgctl --bin mgd-zram-reclaim --bin mgd-checkpoint --bin mgd-psi-trigger --bin mgd-kde --bin mgd-gpu-intel --bin mgd-gpu-amd --release 2>&1 | tail -3
 ok "Build complete"
 
 # ── stop existing service if running ─────────────────────────────────────────
@@ -80,11 +80,10 @@ else
 fi
 cp target/release/mgctl "$BIN_DIR/mgctl"
 cp target/release/mgd-checkpoint "$BIN_DIR/mgd-checkpoint"
+cp target/release/mgd-psi-trigger "$BIN_DIR/mgd-psi-trigger"
 cp target/release/mgd-kde "$BIN_DIR/mgd-kde"
 cp target/release/mgd-gpu-intel "$BIN_DIR/mgd-gpu-intel"
 cp target/release/mgd-gpu-amd "$BIN_DIR/mgd-gpu-amd"
-cp target/release/mgd-gnome "$BIN_DIR/mgd-gnome"
-cp target/release/mgd-cosmic "$BIN_DIR/mgd-cosmic"
 chmod +x "$BIN_DIR"/mgd*
 ok "Binaries installed"
 
@@ -147,6 +146,17 @@ if [[ "$WITH_PRIVILEGED" == 1 ]]; then
         ok "checkpoint helper installed + capped at $CHECKPOINT_HELPER_DEST"
     else
         warn "could not setcap checkpoint helper (kernel may lack CAP_CHECKPOINT_RESTORE)"
+    fi
+
+    # Fix 4 — PSI trigger helper: cap_perfmon+ep (Linux 6.0+ requires it for
+    # /proc/pressure/* writes). The daemon spawns this, polls its stdout for
+    # pressure events, and stays fully unprivileged itself.
+    PSI_TRIGGER_DEST="/usr/local/bin/mgd-psi-trigger"
+    sudo install -m 0755 target/release/mgd-psi-trigger "$PSI_TRIGGER_DEST"
+    if sudo setcap cap_perfmon+ep "$PSI_TRIGGER_DEST"; then
+        ok "PSI trigger helper installed + capped at $PSI_TRIGGER_DEST"
+    else
+        warn "could not setcap PSI trigger helper — daemon falls back to 5s polling"
     fi
 else
     warn "Privileged features skipped (default). To enable zram compact + swap reclaim:"

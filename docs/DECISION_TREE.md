@@ -103,7 +103,8 @@ flowchart LR
     D -->|no| END
     D -->|yes| E[reclaim_cgroup\n100% RSS → zram\nno re-fault risk]
     E --> F{result?}
-    F -->|Ok| G[log FREEZE_RECLAIM]
+    F -->|Ok true — wrote memory.reclaim| G[log FREEZE_RECLAIM]
+    F -->|Ok false — non-leaf or zero bytes\nsilent skip| END
     F -->|EAGAIN — nothing reclaimable| END
     F -->|other error| END
     G --> END

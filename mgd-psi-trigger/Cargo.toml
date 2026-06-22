@@ -1,16 +1,15 @@
 [package]
-name        = "mgd-checkpoint"
+name        = "mgd-psi-trigger"
 version     = "0.4.0"
 edition     = "2024"
-description = "Capped CRIU checkpoint/restore helper wrapper binary"
+description = "Capped PSI kernel trigger helper — arms /proc/pressure/memory and proxies events"
 repository  = "https://github.com/Aquilesorei/lmkd-linux"
 license     = "GPL-2.0"
 authors     = ["Caleb Zongo <achillezongo07@gmail.com>"]
 
 [[bin]]
-name = "mgd-checkpoint"
+name = "mgd-psi-trigger"
 path = "src/main.rs"
 
 [dependencies]
-libc       = { workspace = true }
-mgd-common = { path = "../mgd-common" }
+libc = { workspace = true }

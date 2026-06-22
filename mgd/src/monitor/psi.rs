@@ -60,6 +60,106 @@ impl PsiTrigger {
     }
 }
 
+// ── Subprocess-based PSI trigger (requires cap_perfmon on mgd-psi-trigger) ────
+
+/// Spawns `mgd-psi-trigger <stall_us>` as a capped subprocess.
+///
+/// The helper opens `/proc/pressure/memory`, arms the trigger (needs
+/// `cap_perfmon+ep`), and writes a single byte to stdout for each event.
+/// The daemon polls the pipe with `POLLIN` — no privileged fd in the daemon.
+/// On drop, the subprocess is killed and the kernel fd is released.
+pub struct PsiSubprocess {
+    child: std::process::Child,
+    stdout_fd: i32,
+    #[allow(dead_code)]
+    stdout_owned: std::process::ChildStdout, // kept alive to prevent fd close
+}
+
+pub enum WaitResult {
+    Event,
+    Timeout,
+    HelperDied,
+}
+
+fn psi_helper_candidates() -> Vec<std::path::PathBuf> {
+    let mut v = vec![
+        std::path::PathBuf::from("/usr/local/bin/mgd-psi-trigger"),
+        std::path::PathBuf::from("/usr/bin/mgd-psi-trigger"),
+    ];
+    // Default install path (./install.sh without --privileged copies here)
+    v.insert(0, mgd_common::util::home_dir().join(".local/bin/mgd-psi-trigger"));
+    v
+}
+
+impl PsiSubprocess {
+    pub fn new(elevated_pct: f64) -> Option<Self> {
+        let stall_us = (elevated_pct / 100.0 * 1_000_000.0) as u64;
+
+        let helper = psi_helper_candidates()
+            .into_iter()
+            .find(|p| p.exists())?;
+
+        let mut child = std::process::Command::new(&helper)
+            .arg(stall_us.to_string())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .ok()?;
+
+        let stdout = child.stdout.take()?;
+
+        // 50ms: enough for a cold exec; longer delays mean cap_perfmon is absent.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        if let Ok(Some(status)) = child.try_wait() {
+            let _ = child.wait();
+            mgd_common::sync_print!(
+                "[psi] mgd-psi-trigger exited immediately (status {:?}) — cap_perfmon absent or arm failed",
+                status.code()
+            );
+            return None;
+        }
+
+        use std::os::unix::io::AsRawFd;
+        let stdout_fd = stdout.as_raw_fd();
+
+        Some(PsiSubprocess { child, stdout_fd, stdout_owned: stdout })
+    }
+
+    /// Block until the helper signals a pressure event, or `timeout_ms` elapses.
+    pub fn wait(&self, timeout_ms: i32) -> WaitResult {
+        let mut pfd = libc::pollfd {
+            fd: self.stdout_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        unsafe {
+            let r = libc::poll(&mut pfd, 1, timeout_ms);
+            if r > 0 {
+                if (pfd.revents & libc::POLLIN) != 0 {
+                    let mut buf = [0u8; 1];
+                    let n = libc::read(
+                        self.stdout_fd,
+                        buf.as_mut_ptr() as *mut libc::c_void,
+                        1,
+                    );
+                    if n > 0 { WaitResult::Event } else { WaitResult::HelperDied }
+                } else {
+                    WaitResult::HelperDied // POLLHUP / POLLERR
+                }
+            } else {
+                WaitResult::Timeout // timeout or EINTR
+            }
+        }
+    }
+}
+
+impl Drop for PsiSubprocess {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 
 #[derive(Debug)]
 #[allow(dead_code)]

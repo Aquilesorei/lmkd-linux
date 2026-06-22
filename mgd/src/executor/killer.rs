@@ -4,38 +4,36 @@ use std::thread;
 
 use super::{read_start_time, OpResult};
 
-/// Send SIGTERM — graceful shutdown request.
-/// Gives the process 5 seconds to clean up before SIGKILL.
+/// SIGTERM → 5s wait → SIGKILL.
 pub fn sigterm(pid: u32) -> OpResult {
     let original_start = read_start_time(pid);
 
     let result = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
     if result != 0 {
-        return OpResult::fail(pid,format!("SIGTERM failed: {}", io::Error::last_os_error()));
+        return OpResult::fail(format!("SIGTERM failed: {}", io::Error::last_os_error()));
     }
 
     for _ in 0..10 {
         thread::sleep(Duration::from_millis(500));
         if !process_exists(pid) {
-            return OpResult::success(pid);
+            return OpResult::success();
         }
     }
 
-    // PID reused by a different process — original is gone
+    // PID reused by different process — original is gone
     if original_start.is_some() && read_start_time(pid) != original_start {
-        return OpResult::success(pid);
+        return OpResult::success();
     }
 
     sigkill(pid)
 }
 
-/// Send SIGKILL — immediate forced termination.
 pub fn sigkill(pid: u32) -> OpResult {
     let result = unsafe { libc::kill(pid as i32, libc::SIGKILL) };
     if result == 0 {
-        OpResult::success(pid)
+        OpResult::success()
     } else {
-        OpResult::fail(pid, format!("SIGKILL failed: {}", io::Error::last_os_error()))
+        OpResult::fail(format!("SIGKILL failed: {}", io::Error::last_os_error()))
     }
 }
 

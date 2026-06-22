@@ -9,7 +9,6 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread;
 use std::time::{Duration, Instant};
 
 use mgd_common::logger::{LogEntry, Logger};
@@ -24,9 +23,6 @@ const POLL_SECS: u64 = 60;
 /// Persist calibration aggregates at most this often (plus shutdown flush).
 const CALIBRATION_FLUSH_SECS: u64 = 600;
 
-/// Reclaim-helper locations, probed in order. Absolute, root-writable only — no
-/// PATH search, no attacker-controllable input (PRIVILEGE_DESIGN §3). Covers
-/// manual/install.sh (/usr/local/bin) and distro packaging (/usr/bin).
 const RECLAIM_HELPER_CANDIDATES: &[&str] = &[
     "/usr/local/bin/mgd-zram-reclaim",
     "/usr/bin/mgd-zram-reclaim",
@@ -77,10 +73,7 @@ pub fn run(
             if let Some(p) = pressure.as_ref() {
                 check_proactive_reclaim(p, &log, false);
 
-                // Calibration benign-time sampling: the evictor only reads PSI
-                // when the kernel trigger wakes it, so calm time is invisible
-                // to it — this 60s sample is what builds the noise-floor
-                // histogram. Under pressure the evictor samples at 5s instead.
+                
                 let intervention = frozen.lock().unwrap().count() > 0
                     || checkpointed.lock().unwrap().count() > 0;
                 calibrator.lock().unwrap().observe(
@@ -97,9 +90,6 @@ pub fn run(
             flush_calibration(&calibrator, &log);
         }
 
-        // Evictor signalled: kills freed RAM + zram slots. Attempt proactive reclaim
-        // now regardless of calm — the headroom gate inside check_proactive_reclaim
-        // still protects against OOM; we just skip the calm-only guard here.
         if kill_triggered && !calm {
             if let Some(p) = pressure.as_ref() {
                 mgd_common::sync_print!("[maintenance] Kill-triggered reclaim attempt (post-eviction headroom)");
@@ -180,16 +170,6 @@ pub fn flush_calibration(calibrator: &Arc<Mutex<Calibrator>>, log: &Logger) {
             ));
         }
         Err(e) => mgd_common::sync_print!("[calibrate] cannot write suggestion to {}: {e}", sug_path.display()),
-    }
-}
-
-/// Sleep in 1s slices so shutdown is observed mid-interval.
-fn interruptible_sleep(secs: u64) {
-    for _ in 0..secs {
-        if crate::should_shutdown() {
-            return;
-        }
-        thread::sleep(Duration::from_secs(1));
     }
 }
 
