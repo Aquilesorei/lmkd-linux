@@ -52,6 +52,7 @@ fn usage() {
     eprintln!("  mgctl calibrate --apply       (apply active-sweep calibration)");
     eprintln!("  mgctl calibrate --passive-apply  (apply daemon passive [psi] suggestion)");
     eprintln!("  mgctl doctor                  (environment + feature report)");
+    eprintln!("  mgctl spike-status            (spike mode: tracked heavy processes + frozen victims)");
 }
 
 fn main() {
@@ -76,11 +77,12 @@ fn main() {
     }
 
     let request = match cmd {
-        "status"   => "status".to_string(),
-        "list"     => "list".to_string(),
-        "ps"       => "ps".to_string(),
-        "events"   => "events".to_string(),
-        "reload"   => "reload".to_string(),
+        "status"        => "status".to_string(),
+        "list"          => "list".to_string(),
+        "ps"            => "ps".to_string(),
+        "events"        => "events".to_string(),
+        "reload"        => "reload".to_string(),
+        "spike-status"  => "spike-status".to_string(),
         "unfreeze" | "freeze" | "restore" | "info" | "kill" => {
             if args.len() < 3 {
                 eprintln!("Usage: mgctl {cmd} <pid|name>");

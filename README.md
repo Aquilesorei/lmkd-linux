@@ -6,6 +6,19 @@ The Linux kernel swaps processes out on memory spikes but never actively reclaim
 
 `lmkd-linux` monitors PSI (Pressure Stall Information) and manages the reclaim cycle the kernel skips — freezing, checkpointing, or killing processes in priority order before stall time reaches the point of no return, then restoring them when pressure clears.
 
+**Core features:**
+
+- **Reactive eviction** — PSI-triggered freeze (SIGSTOP), checkpoint (CRIU), or kill in priority order; unfreezes when pressure clears
+- **Spike mode** — detects oscillating build tools (cargo, cmake, docker) and proactively frees RAM *before* the next allocation peak hits, without killing anything
+- **CPU throttling (App Nap)** — writes `cpu.weight` + `cpu.max` quotas to background cgroups at elevated pressure; restores on pressure drop or foreground change
+- **Memory caps** — `memory.max` on expendable background cgroups at High+ pressure; kernel reclaims from them first
+- **Idle cgroup reclaim** — pushes idle background process pages to zram at Normal pressure, recovering RAM without freezing
+- **Composite pressure score** — 55% PSI + 20% swap saturation + 15% GPU UMA residency + 10% swap I/O rate; catches fast-onset thrashing before PSI averages react
+- **Priority-aware** — configurable tiers; foreground window (via DE plugin) gets -25 priority adjustment, shielding it from eviction
+- **CRIU integration** — checkpoint before kill when possible; restore on recovery
+- **Proactive zram compaction** — compacts fragmented zram pools at Elevated+ pressure
+- **Emergency hibernate** — sustained Emergency pressure triggers `systemctl hibernate` as a last resort (off by default)
+
 **Note:** `mgd` does not replace the Linux kernel OOM killer or `systemd-oomd`. It operates purely as a userspace prioritization layer that preemptively freezes or deprioritizes processes under pressure, while all kernel-level memory management remains fully active as the final safety mechanism.
 
 ## How it works
@@ -57,6 +70,33 @@ System stayed responsive throughout. No UI freeze, no compositor stutter, no reb
 | 80–100 | Expendable heavy | msedge, browser tabs, AI inference |
 
 **Foreground adjustment:** the active window (reported by the DE plugin) gets its effective priority reduced by 25 before `plan()`, shielding it from eviction at its current pressure level.
+
+## Requirements
+
+**Kernel:** 5.19+ for full feature support · 4.20+ minimum (core eviction only)
+
+| Kernel | What works |
+|--------|-----------|
+| 4.20+ | PSI monitoring, reactive freeze/kill, priority tiers |
+| 5.2+  | + per-cgroup PSI (more precise pressure, falls back to global) |
+| 5.8+  | + `CAP_PERFMON` for zero-privilege PSI trigger subprocess |
+| **5.19+** | **+ `memory.reclaim` idle cgroup reclaim — full feature set** |
+
+**Distro minimum versions** (ships kernel ≥ 5.19):
+
+| Distro | Minimum version |
+|--------|----------------|
+| Fedora | 37+ |
+| Ubuntu | 22.10+ (kernel 5.19) — *22.04 LTS ships 5.15, idle reclaim degrades gracefully* |
+| Pop!\_OS | 22.04 LTS (ships 5.19 via OEM kernel) |
+| Linux Mint | 21.2+ (Ubuntu 22.04 base — see Ubuntu note) |
+| Arch Linux | Rolling — always supported |
+| openSUSE Tumbleweed | Rolling — always supported |
+| Debian | 12 Bookworm+ (kernel 6.1) |
+
+**Architecture:** x86\_64. ARM64 untested but no x86-specific code.
+
+**Other requirements:** cgroup v2 unified hierarchy must be the active cgroup mode (default on all distros listed above).
 
 ## Installation
 

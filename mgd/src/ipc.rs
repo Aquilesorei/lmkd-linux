@@ -68,6 +68,7 @@ pub fn run_server(
     checkpointed: Arc<Mutex<CheckpointRegistry>>,
     throttle_snapshot: ThrottleSnapshot,
     event_log: crate::events::EventLog,
+    spike_snapshot: Arc<Mutex<crate::spike_mode::SpikeSnapshot>>,
 ) {
     let path = mgd_common::socket::socket_path();
 
@@ -92,11 +93,12 @@ pub fn run_server(
                 let c = Arc::clone(&checkpointed);
                 let t = Arc::clone(&throttle_snapshot);
                 let e = Arc::clone(&event_log);
+                let s = Arc::clone(&spike_snapshot);
                 let a = Arc::clone(&active_conns);
                 a.fetch_add(1, Ordering::Relaxed);
                 thread::spawn(move || {
                     let _guard = ConnGuard(a); // decrements on drop, even on panic
-                    route_ipc_connection(stream, f, c, t, e);
+                    route_ipc_connection(stream, f, c, t, e, s);
                 });
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -126,6 +128,7 @@ fn route_ipc_connection(
     checkpointed: Arc<Mutex<CheckpointRegistry>>,
     throttle_snapshot: ThrottleSnapshot,
     event_log: crate::events::EventLog,
+    spike_snapshot: Arc<Mutex<crate::spike_mode::SpikeSnapshot>>,
 ) {
     stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
 
@@ -149,7 +152,7 @@ fn route_ipc_connection(
         return;
     }
 
-    let response = dispatch(line.trim(), &frozen, &checkpointed, &throttle_snapshot, &event_log);
+    let response = dispatch(line.trim(), &frozen, &checkpointed, &throttle_snapshot, &event_log, &spike_snapshot);
     let _ = writeln!(stream, "{response}");
 }
 
@@ -159,6 +162,7 @@ fn dispatch(
     checkpointed: &Arc<Mutex<CheckpointRegistry>>,
     throttle_snapshot: &ThrottleSnapshot,
     event_log: &crate::events::EventLog,
+    spike_snapshot: &Arc<Mutex<crate::spike_mode::SpikeSnapshot>>,
 ) -> String {
     let parts: Vec<&str> = raw.splitn(2, ' ').collect();
     let cmd = parts[0];
@@ -205,7 +209,8 @@ fn dispatch(
                 cmd_info(arg, frozen, checkpointed, throttle_snapshot)
             }
         }
-        "gpu-info" => cmd_gpu_info(),
+        "gpu-info"      => cmd_gpu_info(),
+        "spike-status"  => cmd_spike_status(spike_snapshot),
         _ => err(&format!("unknown command: {cmd}")),
     }
 }
@@ -553,6 +558,29 @@ fn cmd_gpu_info() -> String {
     let (pids, total_kb, newest_age) = crate::plugin_server::gpu_cache_snapshot();
     let age_str = newest_age.map(|a| format!("{a}s ago")).unwrap_or_else(|| "none".to_string());
     ok(&format!("gpu_pids={pids} total_kb={total_kb} newest_obs={age_str}"))
+}
+
+fn cmd_spike_status(spike_snapshot: &Arc<Mutex<crate::spike_mode::SpikeSnapshot>>) -> String {
+    use crate::spike_mode::SpikePhase;
+    let snap = spike_snapshot.lock().unwrap();
+    if snap.active.is_empty() {
+        return ok("idle (no spike candidates active)");
+    }
+    let mut lines: Vec<String> = vec!["spike candidates:".to_string()];
+    for (pid, name, phase, rss_max_kb, samples, cpu_throttled) in &snap.active {
+        let phase_str = if *phase == SpikePhase::Tracking { "tracking" } else { "observing" };
+        lines.push(format!(
+            "  pid={:<7} name={:<22} phase={:<10} rss_max={:.0}MB samples={} cpu_throttled={}",
+            pid, name, phase_str, *rss_max_kb as f64 / 1024.0, samples, cpu_throttled
+        ));
+    }
+    if !snap.victims.is_empty() {
+        lines.push("frozen victims:".to_string());
+        for (pid, name, for_spike) in &snap.victims {
+            lines.push(format!("  pid={:<7} name={:<22} frozen_for_spike={}", pid, name, for_spike));
+        }
+    }
+    ok(&lines.join("\n"))
 }
 
 fn cmd_events(event_log: &crate::events::EventLog) -> String {

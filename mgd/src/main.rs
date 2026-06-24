@@ -9,6 +9,7 @@ mod maintenance;
 mod ipc;
 mod plugin_server;
 mod throttle;
+mod spike_mode;
 
 use std::sync::{Arc, Condvar, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -39,6 +40,7 @@ fn main() {
 
     let frozen = Arc::new(Mutex::new(FrozenRegistry::load()));
     let checkpointed = Arc::new(Mutex::new(CheckpointRegistry::load()));
+    spike_mode::SpikeTracker::load_and_unfreeze_victims();
 
     cleanup_orphaned_snapshots(&checkpointed);
     print_startup_banner();
@@ -70,6 +72,10 @@ fn main() {
     // Ring buffer of recent daemon actions (freeze/kill/checkpoint), readable via `mgctl events`.
     let event_log = events::new_log();
 
+    // Spike mode snapshot: written by evictor each cycle, read by IPC for `mgctl spike-status`.
+    let spike_snapshot: Arc<Mutex<spike_mode::SpikeSnapshot>> =
+        Arc::new(Mutex::new(spike_mode::SpikeSnapshot { active: vec![], victims: vec![] }));
+
     let responder = {
         let f = Arc::clone(&frozen);
         let c = Arc::clone(&checkpointed);
@@ -79,7 +85,8 @@ fn main() {
         let cal = Arc::clone(&calibrator);
         let ts = Arc::clone(&throttle_snapshot);
         let el = Arc::clone(&event_log);
-        thread::spawn(move || evictor::run(f, c, l, w, rw, cal, ts, el))
+        let ss = Arc::clone(&spike_snapshot);
+        thread::spawn(move || evictor::run(f, c, l, w, rw, cal, ts, el, ss))
     };
 
     let recovery = {
@@ -95,7 +102,8 @@ fn main() {
         let c = Arc::clone(&checkpointed);
         let ts = Arc::clone(&throttle_snapshot);
         let el = Arc::clone(&event_log);
-        thread::spawn(move || ipc::run_server(f, c, ts, el))
+        let ss = Arc::clone(&spike_snapshot);
+        thread::spawn(move || ipc::run_server(f, c, ts, el, ss))
     };
 
     let maintenance = {

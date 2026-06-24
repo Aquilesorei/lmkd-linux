@@ -140,7 +140,7 @@ fn restore_cgroup_cpu(path: &str) {
     let _ = write_cgroup_cpu_max(path, "max 100000");
 }
 
-pub(crate) fn write_cgroup_cpu_weight(cgroup_path: &str, weight: u32) -> Result<(), std::io::Error> {
+pub fn write_cgroup_cpu_weight(cgroup_path: &str, weight: u32) -> Result<(), std::io::Error> {
     let path = cgroup_sysfs_path(cgroup_path, "cpu.weight");
     if path.exists() {
         std::fs::write(&path, format!("{}", weight))?;
@@ -292,6 +292,7 @@ mod tests {
             oom_score: 200,
             cgroup_path: cgroup.map(|s| s.to_string()),
             cpu_pct: 0.0,
+            majflt: 0,
         }
     }
 

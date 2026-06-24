@@ -52,6 +52,8 @@ struct RawConfig {
     psi: Psi,
     #[serde(default)]
     emergency: EmergencyConfig,
+    #[serde(default)]
+    spike_mode: SpikeMode,
 }
 
 /// `[psi]` — pressure-tier boundaries (some_avg10 %) and the full_avg10
@@ -240,6 +242,70 @@ impl Default for EmergencyConfig {
 }
 
 #[derive(Deserialize)]
+struct SpikeMode {
+    #[serde(default = "default_spike_enabled")]
+    enabled: bool,
+    #[serde(default)]
+    include: Vec<String>,
+    #[serde(default)]
+    exclude: Vec<String>,
+    #[serde(default)]
+    victim_exclude: Vec<String>,
+    #[serde(default = "default_spike_window_sec")]
+    window_sec: u64,
+    #[serde(default = "default_spike_headroom_factor")]
+    headroom_factor: f64,
+    #[serde(default = "default_spike_min_rss_kb")]
+    min_rss_kb: u64,
+    #[serde(default = "default_spike_growth_threshold_kb")]
+    growth_threshold_kb: u64,
+    #[serde(default = "default_spike_majflt_threshold")]
+    majflt_threshold: u64,
+    #[serde(default = "default_spike_oscillation_drop_factor")]
+    oscillation_drop_factor: f64,
+    #[serde(default = "default_spike_cpu_threshold_pct")]
+    cpu_threshold_pct: f32,
+    #[serde(default = "default_spike_throttled_cpu_weight")]
+    throttled_cpu_weight: u32,
+    #[serde(default = "default_spike_min_samples")]
+    min_samples: usize,
+    #[serde(default)]
+    max_victim_freeze_sec: u64,
+}
+
+impl Default for SpikeMode {
+    fn default() -> Self {
+        SpikeMode {
+            enabled: default_spike_enabled(),
+            include: vec![],
+            exclude: vec![],
+            victim_exclude: vec![],
+            window_sec: default_spike_window_sec(),
+            headroom_factor: default_spike_headroom_factor(),
+            min_rss_kb: default_spike_min_rss_kb(),
+            growth_threshold_kb: default_spike_growth_threshold_kb(),
+            majflt_threshold: default_spike_majflt_threshold(),
+            oscillation_drop_factor: default_spike_oscillation_drop_factor(),
+            cpu_threshold_pct: default_spike_cpu_threshold_pct(),
+            throttled_cpu_weight: default_spike_throttled_cpu_weight(),
+            min_samples: default_spike_min_samples(),
+            max_victim_freeze_sec: 0,
+        }
+    }
+}
+
+fn default_spike_enabled() -> bool { false }
+fn default_spike_window_sec() -> u64 { 120 }
+fn default_spike_headroom_factor() -> f64 { 1.25 }
+fn default_spike_min_rss_kb() -> u64 { 524_288 }
+fn default_spike_growth_threshold_kb() -> u64 { 102_400 }
+fn default_spike_majflt_threshold() -> u64 { 500 }
+fn default_spike_oscillation_drop_factor() -> f64 { 0.90 }
+fn default_spike_cpu_threshold_pct() -> f32 { 80.0 }
+fn default_spike_throttled_cpu_weight() -> u32 { 20 }
+fn default_spike_min_samples() -> usize { 6 }
+
+#[derive(Deserialize)]
 struct Defaults {
     #[serde(default = "default_fifty")]
     priority: u8,
@@ -323,6 +389,20 @@ pub struct CompiledConfig {
     pub idle_reclaim_max_swap_occupancy_pct: f64,
     pub idle_reclaim_freeze_after_sec: Option<u64>,
     pub emergency_hibernate_after_sec: u64,
+    pub spike_mode_enabled: bool,
+    pub spike_include: Vec<Regex>,
+    pub spike_exclude: Vec<Regex>,
+    pub spike_victim_exclude: Vec<Regex>,
+    pub spike_window_sec: u64,
+    pub spike_headroom_factor: f64,
+    pub spike_min_rss_kb: u64,
+    pub spike_growth_threshold_kb: u64,
+    pub spike_majflt_threshold: u64,
+    pub spike_oscillation_drop_factor: f64,
+    pub spike_cpu_threshold_pct: f32,
+    pub spike_throttled_cpu_weight: u32,
+    pub spike_min_samples: usize,
+    pub spike_max_victim_freeze_sec: u64,
     /// (regex, priority, checkpoint_override)
     entries: Vec<(Regex, u8, Option<bool>)>,
     /// Patterns that must never be touched
@@ -575,6 +655,32 @@ fn compile(content: &str) -> Result<CompiledConfig, String> {
         idle_reclaim_max_swap_occupancy_pct: raw.idle_reclaim.max_swap_occupancy_pct,
         idle_reclaim_freeze_after_sec: raw.idle_reclaim.freeze_after_sec,
         emergency_hibernate_after_sec: raw.emergency.hibernate_after_sec,
+        spike_mode_enabled: raw.spike_mode.enabled,
+        spike_include: raw.spike_mode.include.iter()
+            .filter_map(|p| Regex::new(p).map_err(|e| {
+                mgd_common::output::locked_eprint(&format!("[config] invalid spike include pattern '{}': {e}", p));
+            }).ok())
+            .collect(),
+        spike_exclude: raw.spike_mode.exclude.iter()
+            .filter_map(|p| Regex::new(p).map_err(|e| {
+                mgd_common::output::locked_eprint(&format!("[config] invalid spike exclude pattern '{}': {e}", p));
+            }).ok())
+            .collect(),
+        spike_victim_exclude: raw.spike_mode.victim_exclude.iter()
+            .filter_map(|p| Regex::new(p).map_err(|e| {
+                mgd_common::output::locked_eprint(&format!("[config] invalid spike victim_exclude pattern '{}': {e}", p));
+            }).ok())
+            .collect(),
+        spike_window_sec: raw.spike_mode.window_sec,
+        spike_headroom_factor: raw.spike_mode.headroom_factor,
+        spike_min_rss_kb: raw.spike_mode.min_rss_kb,
+        spike_growth_threshold_kb: raw.spike_mode.growth_threshold_kb,
+        spike_majflt_threshold: raw.spike_mode.majflt_threshold,
+        spike_oscillation_drop_factor: raw.spike_mode.oscillation_drop_factor,
+        spike_cpu_threshold_pct: raw.spike_mode.cpu_threshold_pct,
+        spike_throttled_cpu_weight: raw.spike_mode.throttled_cpu_weight,
+        spike_min_samples: raw.spike_mode.min_samples,
+        spike_max_victim_freeze_sec: raw.spike_mode.max_victim_freeze_sec,
         psi,
         entries,
         protected,

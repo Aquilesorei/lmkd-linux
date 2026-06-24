@@ -251,7 +251,7 @@ mod tests {
     use super::*;
 
     fn proc(name: &str, rss_kb: u64, swap_kb: u64) -> Process {
-        Process { pid: 1000, name: name.to_string(), exe_basename: None, rss_kb, swap_kb, oom_score: 0, cgroup_path: None, cpu_pct: 0.0 }
+        Process { pid: 1000, name: name.to_string(), exe_basename: None, rss_kb, swap_kb, oom_score: 0, cgroup_path: None, cpu_pct: 0.0, majflt: 0 }
     }
 
     #[test]
