@@ -408,8 +408,9 @@ pub fn run(
                 .filter(|p| !frozen_set.contains(&p.pid))
                 .collect();
 
-            // Update CPU throttling (tiered, debounced)
-            throttle.update(&plan_procs, active_pid);
+            // Update CPU throttling (tiered, debounced) — only at Elevated+ pressure
+            let throttle_exclude = crate::config::get().throttle_exclude.clone();
+            throttle.update(&plan_procs, active_pid, effective_level >= PressureLevel::Elevated, &throttle_exclude);
             *throttle_snapshot.lock().unwrap() = throttle.snapshot();
 
             // Cap memory.max on expendable background cgroups at High+ pressure
@@ -479,6 +480,19 @@ pub fn run(
                         v.name, v.pid, max_secs
                     );
                     log.log(&LogEntry::new("SPIKE_UNFREEZE_TIMEOUT", v.pid, &v.name, 0.0, "max_victim_freeze_sec"));
+                }
+            }
+
+            // Release victims whose initiator spike already exited but were deferred
+            // (frozen_for_spike_pid no longer in the active spike set).
+            for v in spike_tracker.drain_orphaned_victims() {
+                let r = crate::executor::freezer::unfreeze_checked(v.pid, v.start_time);
+                if r.success {
+                    mgd_common::sync_print!(
+                        "[spike] Released orphaned victim {} (PID {}): spike PID {} already gone",
+                        v.name, v.pid, v.frozen_for_spike_pid
+                    );
+                    log.log(&LogEntry::new("SPIKE_UNFREEZE_ORPHAN", v.pid, &v.name, 0.0, "initiator exited"));
                 }
             }
 

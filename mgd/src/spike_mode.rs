@@ -97,19 +97,26 @@ fn state_dir() -> PathBuf {
 
 /// All state is owned by the evictor thread. No Arc/Mutex needed.
 pub struct SpikeTracker {
-    spikes:      HashMap<u32, SpikeState>,
-    victims:     HashMap<u32, SpikeVictim>,
-    prev_rss:    HashMap<u32, u64>,   // for growth-signal on new candidates
-    prev_majflt: HashMap<u32, u64>,   // for majflt-signal on new candidates
+    spikes:           HashMap<u32, SpikeState>,
+    victims:          HashMap<u32, SpikeVictim>,
+    prev_rss:         HashMap<u32, u64>,   // for growth-signal on new candidates
+    prev_majflt:      HashMap<u32, u64>,   // for majflt-signal on new candidates
+    // scratch buffers — cleared and reused every cycle
+    scratch_live:     HashSet<u32>,
+    scratch_rss_d:    HashMap<u32, u64>,
+    scratch_majflt_d: HashMap<u32, u64>,
 }
 
 impl SpikeTracker {
     pub fn new() -> Self {
         SpikeTracker {
-            spikes:      HashMap::new(),
-            victims:     HashMap::new(),
-            prev_rss:    HashMap::new(),
-            prev_majflt: HashMap::new(),
+            spikes:           HashMap::new(),
+            victims:          HashMap::new(),
+            prev_rss:         HashMap::new(),
+            prev_majflt:      HashMap::new(),
+            scratch_live:     HashSet::new(),
+            scratch_rss_d:    HashMap::new(),
+            scratch_majflt_d: HashMap::new(),
         }
     }
 
@@ -145,18 +152,23 @@ impl SpikeTracker {
     ) -> Vec<SpikeDecision> {
         let now = Instant::now();
         let window = Duration::from_secs(p.window_sec);
-        let live_pids: HashSet<u32> = procs.iter().map(|pr| pr.pid).collect();
+
+        self.scratch_live.clear();
+        self.scratch_live.extend(procs.iter().map(|pr| pr.pid));
 
         // ── Step 0: Compute per-PID deltas BEFORE updating caches ────────────
         // Deltas are used in steps 1 and 2; caches must not be updated yet.
-        let rss_deltas: HashMap<u32, u64> = procs.iter().map(|pr| {
+        self.scratch_rss_d.clear();
+        for pr in procs {
             let prev = self.prev_rss.get(&pr.pid).copied().unwrap_or(pr.rss_kb);
-            (pr.pid, pr.rss_kb.saturating_sub(prev))
-        }).collect();
-        let majflt_deltas: HashMap<u32, u64> = procs.iter().map(|pr| {
+            self.scratch_rss_d.insert(pr.pid, pr.rss_kb.saturating_sub(prev));
+        }
+
+        self.scratch_majflt_d.clear();
+        for pr in procs {
             let prev = self.prev_majflt.get(&pr.pid).copied().unwrap_or(pr.majflt);
-            (pr.pid, pr.majflt.saturating_sub(prev))
-        }).collect();
+            self.scratch_majflt_d.insert(pr.pid, pr.majflt.saturating_sub(prev));
+        }
 
         // ── Step 1: Register new candidates ──────────────────────────────────
         for proc in procs {
@@ -167,8 +179,8 @@ impl SpikeTracker {
                 continue;
             }
             let force_included = p.include.iter().any(|re| re.is_match(&proc.name));
-            let growth_signal = rss_deltas.get(&proc.pid).copied().unwrap_or(0) > p.growth_threshold_kb;
-            let majflt_signal = majflt_deltas.get(&proc.pid).copied().unwrap_or(0) > p.majflt_threshold;
+            let growth_signal = self.scratch_rss_d.get(&proc.pid).copied().unwrap_or(0) > p.growth_threshold_kb;
+            let majflt_signal = self.scratch_majflt_d.get(&proc.pid).copied().unwrap_or(0) > p.majflt_threshold;
             let is_behavioral = proc.rss_kb >= p.min_rss_kb && (growth_signal || majflt_signal);
 
             if force_included || is_behavioral {
@@ -265,8 +277,8 @@ impl SpikeTracker {
             self.prev_rss.insert(proc.pid, proc.rss_kb);
             self.prev_majflt.insert(proc.pid, proc.majflt);
         }
-        self.prev_rss.retain(|pid, _| live_pids.contains(pid));
-        self.prev_majflt.retain(|pid, _| live_pids.contains(pid));
+        self.prev_rss.retain(|pid, _| self.scratch_live.contains(pid));
+        self.prev_majflt.retain(|pid, _| self.scratch_live.contains(pid));
 
         // ── Step 4: Collect decisions — RAM first, CPU after ─────────────────
 
@@ -314,19 +326,46 @@ impl SpikeTracker {
     }
 
     /// Called when a spike PID exits. Returns victims to unfreeze.
-    /// Defers unfreeze until ALL tracked spikes exit — avoids releasing
-    /// headroom mid-session when cargo + rustc are both tracked.
+    ///
+    /// Releases victims whose `frozen_for_spike_pid` is no longer an active
+    /// spike — this correctly handles both the single-spike case and the case
+    /// where two unrelated processes (e.g. CLion + blender) are tracked
+    /// simultaneously: CLion's victims are freed when CLion exits even if
+    /// blender is still running.
+    ///
+    /// For co-session spikes (cargo + rustc): victims are assigned
+    /// frozen_for_spike_pid = whichever spike pid was first in the set.
+    /// Rustc typically exits before cargo, so cargo holds the victims until
+    /// the build is fully done. If cargo exits first the victims are freed
+    /// early; the evictor's reactive path re-freezes them if rustc still
+    /// needs headroom — acceptable minor churn.
     pub fn on_spike_exit(&mut self, spike_pid: u32) -> Vec<SpikeVictim> {
         self.spikes.remove(&spike_pid);
         self.prev_rss.remove(&spike_pid);
         self.prev_majflt.remove(&spike_pid);
+
         if self.spikes.is_empty() {
+            // Last spike — release everything.
             let victims: Vec<SpikeVictim> = self.victims.drain().map(|(_, v)| v).collect();
-            self.persist_victims(); // write empty list — clears persisted state
-            victims
-        } else {
-            vec![]
+            self.persist_victims();
+            return victims;
         }
+
+        // Other spikes still active: release only victims tied to the dead spike
+        // (frozen_for_spike_pid not in the remaining active set).
+        let active: HashSet<u32> = self.spikes.keys().copied().collect();
+        let to_release: Vec<u32> = self.victims.values()
+            .filter(|v| !active.contains(&v.frozen_for_spike_pid))
+            .map(|v| v.pid)
+            .collect();
+        if to_release.is_empty() {
+            return vec![];
+        }
+        let victims: Vec<SpikeVictim> = to_release.iter()
+            .filter_map(|pid| self.victims.remove(pid))
+            .collect();
+        self.persist_victims();
+        victims
     }
 
     pub fn spike_pids(&self) -> HashSet<u32> {
@@ -376,6 +415,23 @@ impl SpikeTracker {
                 mgd_common::sync_print!("[spike] Recovered victim {} (PID {}) after daemon restart", name, pid);
             }
         }
+    }
+
+    /// Release victims whose initiator spike has already exited (orphaned victims).
+    /// Called every cycle so orphans don't wait for the next spike exit event.
+    pub fn drain_orphaned_victims(&mut self) -> Vec<SpikeVictim> {
+        if self.victims.is_empty() || self.spikes.is_empty() { return vec![]; }
+        let active: HashSet<u32> = self.spikes.keys().copied().collect();
+        let to_release: Vec<u32> = self.victims.values()
+            .filter(|v| !active.contains(&v.frozen_for_spike_pid))
+            .map(|v| v.pid)
+            .collect();
+        if to_release.is_empty() { return vec![]; }
+        let victims: Vec<SpikeVictim> = to_release.iter()
+            .filter_map(|pid| self.victims.remove(pid))
+            .collect();
+        self.persist_victims();
+        victims
     }
 
     /// Release victims frozen beyond `max_secs`. Returns drained victims for caller to unfreeze.
@@ -559,21 +615,29 @@ mod tests {
         assert!(!d.iter().any(|x| matches!(x, SpikeDecision::ThrottleSpike { .. })));
     }
 
-    // T8 ─ on_spike_exit defers while other spikes active
+    // T8 ─ on_spike_exit releases per-initiator, not all-or-nothing
+    // Victim 10 is frozen_for spike 1 (cargo); victim 20 is frozen_for spike 2 (rustc).
+    // When cargo exits, its victim is freed immediately even though rustc still runs.
+    // When rustc exits (last spike), its victim is freed via the drain-all path.
     #[test]
-    fn t8_exit_defers_until_last_spike() {
+    fn t8_per_initiator_release() {
         let mut t = SpikeTracker::new();
         t.spikes.insert(1, make_state_tracking(1, "cargo", 1_000_000));
         t.spikes.insert(2, make_state_tracking(2, "rustc", 500_000));
-        t.victims.insert(10, make_victim(10, "firefox", 1));
+        t.victims.insert(10, make_victim(10, "firefox", 1)); // frozen_for cargo
+        t.victims.insert(20, make_victim(20, "spotify", 2)); // frozen_for rustc
 
+        // cargo exits: only its victim (firefox) is released; rustc's (spotify) stays
         let v = t.on_spike_exit(1);
-        assert!(v.is_empty(), "must defer while spike 2 still alive");
-        assert!(t.victims.contains_key(&10));
+        assert_eq!(v.len(), 1, "cargo's victim released immediately");
+        assert_eq!(v[0].pid, 10);
+        assert!(!t.victims.contains_key(&10));
+        assert!(t.victims.contains_key(&20), "spotify held for rustc");
 
+        // rustc exits (last spike): drain-all releases spotify
         let v = t.on_spike_exit(2);
         assert_eq!(v.len(), 1);
-        assert_eq!(v[0].pid, 10);
+        assert_eq!(v[0].pid, 20);
         assert!(t.victims.is_empty());
     }
 

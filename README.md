@@ -59,6 +59,42 @@ Real memory pressure event on a 16GB system:
 
 System stayed responsive throughout. No UI freeze, no compositor stutter, no reboot. Daemon RSS: ~6 MB.
 
+## Benchmark
+
+Two workloads — same three mgd configurations each.
+
+![mgd benchmark](docs/benchmark.svg)
+
+### Lapce cold build — clean-room (low pressure)
+
+368 crates, wgpu, wasmtime, openssl · system at 12 GB free · minimal competing load.
+This is the **worst case for mgd**: nothing competing for RAM means nothing to manage — only daemon monitoring overhead is visible.
+
+| Scenario | Build time | Min RAM | PSI stall (some) | PSI stall (full) |
+|---|---|---|---|---|
+| No mgd | 123 s | 8287 MB | 185 ms | 179 ms |
+| mgd reactive | 138 s | 8200 MB | 63 ms | 60 ms |
+| **mgd + spike mode** | **139 s** | **8255 MB** | **78 ms** | **76 ms** |
+
+**+12% build overhead** (procfs scan every 5 s across all compiler workers) · **−66% PSI stall** even with nothing to manage.
+
+### Docker compose build — real-world pressure
+
+Next.js + Prisma + pnpm · system at 7.5 GB free · Firefox + KDE + IDE running.
+This is the **scenario mgd was built for**: this workload used to freeze the laptop before mgd.
+
+| Scenario | Build time | Min RAM | PSI stall (some) | PSI stall (full) |
+|---|---|---|---|---|
+| No mgd | 74 s | 5144 MB | 551 ms | 514 ms |
+| mgd reactive | 69 s | 5455 MB | 196 ms | 175 ms |
+| **mgd + spike mode** | **59 s** | **5206 MB** | **165 ms** | **158 ms** |
+
+**mgd + spike mode is 20% faster** than no mgd · **−70% PSI stall** · build completes without freezing the system.
+
+Under real pressure, mgd's background CPU throttling and proactive headroom management free up CPU and RAM the build would otherwise compete for. The daemon overhead visible in the clean-room benchmark disappears — it is paid back by the work mgd is doing.
+
+> Hardware: i7-13700H · 16 GB UMA · Fedora 44 · kernel 7.0 · zram 12 GB zstd · debug profile
+
 ## Priority tiers
 
 | Range | Tier | Examples |

@@ -545,3 +545,8 @@ cpu_threshold_pct      = 80.0
 throttled_cpu_weight   = 20
 min_samples            = 6         # 30s observation before acting
 max_victim_freeze_sec  = 0         # 0 = no limit on victim freeze duration
+
+[throttle]
+# Processes matching these patterns are never CPU-throttled, even at Elevated+ pressure.
+# Protects build workers from cpu.weight=1 suppression during compilation.
+exclude = ["^(rustc|cc|cc1|ld|lld|cargo|make|cmake|ninja|gcc|g\\+\\+|clang|clang\\+\\+|javac|kotlinc)$"]

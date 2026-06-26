@@ -54,6 +54,14 @@ struct RawConfig {
     emergency: EmergencyConfig,
     #[serde(default)]
     spike_mode: SpikeMode,
+    #[serde(default)]
+    throttle: ThrottleConfig,
+}
+
+#[derive(Deserialize, Default)]
+struct ThrottleConfig {
+    #[serde(default)]
+    exclude: Vec<String>,
 }
 
 /// `[psi]` — pressure-tier boundaries (some_avg10 %) and the full_avg10
@@ -403,6 +411,7 @@ pub struct CompiledConfig {
     pub spike_throttled_cpu_weight: u32,
     pub spike_min_samples: usize,
     pub spike_max_victim_freeze_sec: u64,
+    pub throttle_exclude: Vec<Regex>,
     /// (regex, priority, checkpoint_override)
     entries: Vec<(Regex, u8, Option<bool>)>,
     /// Patterns that must never be touched
@@ -681,6 +690,11 @@ fn compile(content: &str) -> Result<CompiledConfig, String> {
         spike_throttled_cpu_weight: raw.spike_mode.throttled_cpu_weight,
         spike_min_samples: raw.spike_mode.min_samples,
         spike_max_victim_freeze_sec: raw.spike_mode.max_victim_freeze_sec,
+        throttle_exclude: raw.throttle.exclude.iter()
+            .filter_map(|p| Regex::new(p).map_err(|e| {
+                mgd_common::output::locked_eprint(&format!("[config] invalid throttle exclude pattern '{}': {e}", p));
+            }).ok())
+            .collect(),
         psi,
         entries,
         protected,
