@@ -55,6 +55,7 @@ pub fn run(
     calibrator: Arc<Mutex<crate::engine::calibrate::Calibrator>>,
     throttle_snapshot: Arc<Mutex<HashMap<String, crate::throttle::ThrottledState>>>,
     event_log: crate::events::EventLog,
+    spike_snapshot: Arc<Mutex<crate::spike_mode::SpikeSnapshot>>,
 ) {
     mgd_common::sync_print!("[responder] PSI source: {}", monitor::psi::pressure_source());
 
@@ -93,11 +94,18 @@ pub fn run(
     let mut memcap = crate::throttle::MemCapManager::new();
     let mut sustained_emergency_start: Option<std::time::Instant> = None;
     let mut hibernate_triggered = false;
+    let mut spike_tracker = crate::spike_mode::SpikeTracker::new();
 
     loop {
         if crate::should_shutdown() {
             throttle.restore_all();
             memcap.restore_all();
+            for cg in spike_tracker.throttled_cgroup_paths() {
+                let _ = crate::throttle::write_cgroup_cpu_weight(&cg, 100);
+            }
+            for v in spike_tracker.all_victims() {
+                let _ = crate::executor::freezer::unfreeze_checked(v.pid, v.start_time);
+            }
             // Wake maintenance so it exits immediately instead of blocking up to 60s.
             let (lock, cvar) = &*reclaim_wake;
             if let Ok(_g) = lock.lock() { cvar.notify_all(); }
@@ -135,7 +143,9 @@ pub fn run(
                             last_idle_reclaim_check = now_inst;
                             let procs = monitor::process::list_processes();
                             let frozen_set: HashSet<u32> =
-                                frozen.lock().unwrap().frozen_pids().into_iter().collect();
+                                frozen.lock().unwrap().frozen_pids().into_iter()
+                                    .chain(spike_tracker.victim_pids())
+                                    .collect();
                             let plan_procs: Vec<&Process> =
                                 procs.iter().filter(|p| !frozen_set.contains(&p.pid)).collect();
                             let active_pid = crate::plugin_server::get_active_foreground_pid();
@@ -391,13 +401,16 @@ pub fn run(
             }
 
             let procs = monitor::process::list_processes();
-            let frozen_set: HashSet<u32> = frozen.lock().unwrap().frozen_pids().into_iter().collect();
+            let frozen_set: HashSet<u32> = frozen.lock().unwrap().frozen_pids().into_iter()
+                .chain(spike_tracker.victim_pids())
+                .collect();
             let plan_procs: Vec<&Process> = procs.iter()
                 .filter(|p| !frozen_set.contains(&p.pid))
                 .collect();
 
-            // Update CPU throttling (tiered, debounced)
-            throttle.update(&plan_procs, active_pid);
+            // Update CPU throttling (tiered, debounced) — only at Elevated+ pressure
+            let throttle_exclude = crate::config::get().throttle_exclude.clone();
+            throttle.update(&plan_procs, active_pid, effective_level >= PressureLevel::Elevated, &throttle_exclude);
             *throttle_snapshot.lock().unwrap() = throttle.snapshot();
 
             // Cap memory.max on expendable background cgroups at High+ pressure
@@ -414,6 +427,139 @@ pub fn run(
         // Restore memory caps when pressure drops below High
         if effective_level < PressureLevel::High {
             memcap.restore_all();
+        }
+
+        // ── Spike mode: runs every cycle, even at Normal PSI ─────────────────
+        // Spike exit detection and proactive headroom management are independent
+        // of reactive eviction — they must not be gated by the Normal continue.
+        {
+            let spike_procs = monitor::process::list_processes();
+            let live_pids: HashSet<u32> = spike_procs.iter().map(|p| p.pid).collect();
+
+            // Unfreeze victims when their spike process exits
+            let exited: Vec<u32> = spike_tracker.spike_pids()
+                .into_iter().filter(|pid| !live_pids.contains(pid)).collect();
+            let mut total_released = 0usize;
+            let mut last_spike_name: Option<String> = None;
+            for spike_pid in exited {
+                let victims = spike_tracker.on_spike_exit(spike_pid);
+                // on_spike_exit returns names before draining; capture name from first victim
+                if let Some(v) = victims.first() {
+                    last_spike_name = spike_procs.iter()
+                        .find(|p| p.pid == v.frozen_for_spike_pid)
+                        .map(|p| p.name.clone());
+                }
+                for v in victims {
+                    let r = crate::executor::freezer::unfreeze_checked(v.pid, v.start_time);
+                    if r.success {
+                        mgd_common::sync_print!(
+                            "[spike] Unfroze {} (PID {}) — spike PID {} exited",
+                            v.name, v.pid, v.frozen_for_spike_pid
+                        );
+                        log.log(&LogEntry::new("SPIKE_UNFREEZE", v.pid, &v.name, 0.0, "spike exited"));
+                        total_released += 1;
+                    }
+                }
+            }
+            if total_released > 0 {
+                let spike_name = last_spike_name.as_deref().unwrap_or("build");
+                let msg = format!("Build session ended — {} process{} resumed",
+                    total_released, if total_released == 1 { "" } else { "es" });
+                let _ = std::process::Command::new("notify-send")
+                    .args(["--urgency=low", "--app-name=mgd", spike_name, &msg])
+                    .spawn();
+            }
+
+            // Release victims that have been frozen beyond max_victim_freeze_sec
+            let max_secs = crate::config::get().spike_max_victim_freeze_sec;
+            for v in spike_tracker.drain_timed_out_victims(max_secs) {
+                let r = crate::executor::freezer::unfreeze_checked(v.pid, v.start_time);
+                if r.success {
+                    mgd_common::sync_print!(
+                        "[spike] Released timed-out victim {} (PID {}): frozen >{}s",
+                        v.name, v.pid, max_secs
+                    );
+                    log.log(&LogEntry::new("SPIKE_UNFREEZE_TIMEOUT", v.pid, &v.name, 0.0, "max_victim_freeze_sec"));
+                }
+            }
+
+            // Release victims whose initiator spike already exited but were deferred
+            // (frozen_for_spike_pid no longer in the active spike set).
+            for v in spike_tracker.drain_orphaned_victims() {
+                let r = crate::executor::freezer::unfreeze_checked(v.pid, v.start_time);
+                if r.success {
+                    mgd_common::sync_print!(
+                        "[spike] Released orphaned victim {} (PID {}): spike PID {} already gone",
+                        v.name, v.pid, v.frozen_for_spike_pid
+                    );
+                    log.log(&LogEntry::new("SPIKE_UNFREEZE_ORPHAN", v.pid, &v.name, 0.0, "initiator exited"));
+                }
+            }
+
+            // Update tracker and execute decisions
+            for decision in spike_tracker.update(&spike_procs, meminfo.available_kb) {
+                match decision {
+                    crate::spike_mode::SpikeDecision::FreezeForHeadroom { needed_kb } => {
+                        let spike_pids  = spike_tracker.spike_pids();
+                        let victim_pids = spike_tracker.victim_pids();
+                        let exclude: HashSet<u32> = frozen.lock().unwrap().frozen_pids()
+                            .into_iter()
+                            .chain(spike_pids.iter().copied())
+                            .chain(victim_pids.iter().copied())
+                            .collect();
+                        // Highest-priority (most expendable) first, then largest RSS
+                        let spike_cfg = crate::config::get();
+                        let mut candidates: Vec<&Process> = spike_procs.iter()
+                            .filter(|p| !exclude.contains(&p.pid))
+                            .filter(|p| get_priority(&p.name, p.exe_basename.as_deref()) >= 60)
+                            .filter(|p| !spike_cfg.spike_victim_exclude.iter().any(|re| re.is_match(&p.name)))
+                            .collect();
+                        candidates.sort_by(|a, b| {
+                            let pa = get_priority(&a.name, a.exe_basename.as_deref());
+                            let pb = get_priority(&b.name, b.exe_basename.as_deref());
+                            pb.cmp(&pa).then(b.rss_kb.cmp(&a.rss_kb))
+                        });
+                        let mut needed = needed_kb;
+                        for proc in candidates {
+                            if needed == 0 { break; }
+                            let Some(st) = crate::executor::read_start_time(proc.pid) else { continue };
+                            let r = crate::executor::freezer::freeze_checked(proc.pid, st);
+                            if r.success {
+                                mgd_common::sync_print!(
+                                    "[spike] Froze {} (PID {}, {:.0}MB) for headroom",
+                                    proc.name, proc.pid, proc.rss_kb as f64 / 1024.0
+                                );
+                                log.log(&LogEntry::new(
+                                    "SPIKE_FREEZE", proc.pid, &proc.name,
+                                    proc.rss_kb as f64 / 1024.0, "proactive headroom",
+                                ));
+                                spike_tracker.record_victim_frozen(crate::spike_mode::SpikeVictim {
+                                    pid: proc.pid,
+                                    name: proc.name.clone(),
+                                    start_time: st,
+                                    frozen_for_spike_pid: spike_pids.iter().next().copied().unwrap_or(0),
+                                    frozen_at: std::time::Instant::now(),
+                                });
+                                // Push victim RSS to zram; SIGSTOP means no re-faults so 100% is safe.
+                                if let Some(cg) = proc.cgroup_path.as_deref() {
+                                    let _ = reclaim_cgroup(cg, proc.rss_kb * 1024);
+                                }
+                                needed = needed.saturating_sub(proc.rss_kb);
+                            }
+                        }
+                    }
+                    crate::spike_mode::SpikeDecision::ThrottleSpike { spike_pid, cgroup_path } => {
+                        let weight = crate::config::get().spike_throttled_cpu_weight;
+                        let _ = crate::throttle::write_cgroup_cpu_weight(&cgroup_path, weight);
+                        mgd_common::sync_print!("[spike] Throttled PID {} cpu.weight={}", spike_pid, weight);
+                    }
+                    crate::spike_mode::SpikeDecision::RestoreThrottle { spike_pid, cgroup_path } => {
+                        let _ = crate::throttle::write_cgroup_cpu_weight(&cgroup_path, 100);
+                        mgd_common::sync_print!("[spike] Restored cpu.weight for PID {}", spike_pid);
+                    }
+                }
+            }
+            *spike_snapshot.lock().unwrap() = spike_tracker.snapshot();
         }
 
         if effective_level == PressureLevel::Normal {
@@ -435,8 +581,15 @@ pub fn run(
         let now_inst = std::time::Instant::now();
         recently_killed_cgroups.retain(|_, time| now_inst.duration_since(*time).as_secs() < 45);
 
-        // Exclude frozen PIDs and recently killed cgroups so their RSS isn't double-counted toward the deficit.
-        let frozen_set: HashSet<u32> = frozen.lock().unwrap().frozen_pids().into_iter().collect();
+        // Exclude frozen PIDs, spike PIDs (active build/IDE processes), and spike victims
+        // from plan() candidates. Spike processes are protected while tracked — killing
+        // them mid-build corrupts the output and defeats the whole point of spike mode.
+        let spike_pids_active = spike_tracker.spike_pids();
+        let spike_victim_pids = spike_tracker.victim_pids();
+        let frozen_set: HashSet<u32> = frozen.lock().unwrap().frozen_pids().into_iter()
+            .chain(spike_pids_active)
+            .chain(spike_victim_pids)
+            .collect();
         let plan_procs: Vec<&Process> = procs.iter()
             .filter(|p| !frozen_set.contains(&p.pid))
             .filter(|p| {
@@ -1091,6 +1244,7 @@ mod tests {
             oom_score: 0,
             cgroup_path: None,
             cpu_pct: 0.0,
+            majflt: 0,
         }
     }
 

@@ -498,6 +498,136 @@ each evictor cycle so plugins can adapt their polling rate.
 
 ---
 
+## 8.9 Spike mode — proactive headroom manager (`spike_mode.rs`, evictor thread)
+
+Build tools and container runtimes exhibit **oscillating memory usage**: each
+compilation unit or layer operation allocs several GB, links/writes, then frees —
+only for the next unit to alloc more. The pattern is `alloc 4 GB → free → alloc
+5 GB → free → alloc 6 GB`, with each peak higher than the last as the build
+progresses. Docker image builds, `cargo build --workspace`, `cmake && make -j`,
+`gradle build` all follow this shape.
+
+Heavy desktop apps (JetBrains IDEs, Blender, Qt Creator) are a different case:
+they spike once on startup (class loading, JIT warmup, asset streaming) then
+stabilise at a high-but-steady RSS plateau. They are **not** oscillators. Spike
+mode's startup discrimination (the OBSERVING → TRACKING gate) keeps them in
+OBSERVING indefinitely — which is the correct behaviour. The only case where
+spike mode acts on an IDE is if it later exhibits genuine oscillation (e.g.,
+repeated large project reindex cycles), which is uncommon.
+
+The reactive evictor waits for PSI to rise; for build tools, by the time PSI
+registers the next peak is already in flight and the system is already scrambling.
+
+Spike mode flips this: detect oscillating-memory processes by _behaviour_, track
+their peak within a 2-minute rolling window, and **proactively freeze background
+processes before the next peak hits** — even when current PSI is Normal.
+
+### Detection (behavioral, not name-based)
+
+Every evictor cycle, `SpikeTracker::update_impl()` checks all live user processes:
+
+1. **Growth signal**: `rss_delta > growth_threshold_kb` (default 100 MB) since
+   last cycle — catches a compiler linking a large binary in one shot.
+2. **Major-fault signal**: `majflt_delta > majflt_threshold` (default 500) since
+   last cycle — catches demand-paging a large working set that was swapped out.
+
+A process is **registered as a candidate** if either signal fires AND
+`rss_kb ≥ min_rss_kb` (default 512 MB). Name patterns in `[spike_mode] include`
+force registration regardless of size/signals; `exclude` suppresses it.
+
+### Startup discrimination (OBSERVING → TRACKING)
+
+IDEs spike monotonically on startup — loading class files, warming JIT — which
+looks like a spike but is not an oscillation. Spike mode tracks two flags:
+
+- **`has_peaked`**: `rss_max > initial_rss + growth_threshold_kb`. Set once the
+  process has grown meaningfully above its pre-registration baseline.
+- **`has_oscillated`**: `current_rss < rss_max × oscillation_drop_factor` (default
+  0.90). Set once the process has dropped ≥ 10% from its peak (genuine valley).
+
+A process only transitions from **OBSERVING** → **TRACKING** (and actions begin)
+when both flags are set _and_ `≥ min_samples` (default 6, i.e. ≥ 30 s) have been
+collected. Monotonic startup growth never reaches TRACKING.
+
+### Rolling window
+
+Each tracked process keeps a `VecDeque<RssSample>` with samples older than
+`window_sec` (default 120 s) evicted every cycle. `rss_max_kb` is recomputed from
+the surviving window — so a peak that happened >2 min ago no longer inflates the
+required headroom.
+
+### Decisions (returned as `Vec<SpikeDecision>`)
+
+`update()` returns decisions; the evictor executes them **before** the Normal-pressure
+`continue` guard, so spike actions fire every cycle regardless of PSI:
+
+| Decision | Trigger | Action |
+|----------|---------|--------|
+| `FreezeForHeadroom { needed_kb }` | `available_kb < sum(rss_max) × headroom_factor` | Freeze background procs (prio ≥ 60) highest-priority first until `needed_kb` covered |
+| `ThrottleSpike { spike_pid, cgroup_path }` | `cpu_pct ≥ cpu_threshold_pct` (default 80%) and not foreground | Write `cpu.weight = throttled_cpu_weight` (default 20) to spike process's own cgroup |
+| `RestoreThrottle { spike_pid, cgroup_path }` | `cpu_pct` drops below threshold | Restore `cpu.weight = 100` |
+
+RAM decisions execute before CPU decisions. The freeze loop is **deficit-aware** —
+it stops as soon as cumulative victim RSS covers `needed_kb`, preventing over-freezing.
+
+### Victim tracking
+
+Spike-frozen processes go into `SpikeTracker.victims`, _not_ `FrozenRegistry`.
+They are excluded from the reactive evictor's `plan()` candidates (so their RSS
+isn't double-counted) and from the normal process lists seen by maintenance.
+
+**Deferred release**: victims are unfrozen only when _all_ tracked spike processes
+exit — avoids releasing headroom mid-session when `cargo` and `rustc` are
+both tracked.
+
+### Spike process protection
+
+Tracked spike PIDs (the build tool / IDE itself) are also excluded from `plan()`
+so the reactive evictor cannot freeze or kill a process mid-build. Protection
+applies from the moment the process is registered (cycle 1 of detection), before
+the 30 s oscillation gate is reached.
+
+### Configuration (`[spike_mode]` in `priorities.toml`)
+
+```toml
+[spike_mode]
+enabled                  = false      # off by default
+include                  = []         # name regexes that force tracking
+exclude                  = []         # name regexes that suppress tracking (false-positive orchestrators)
+victim_exclude           = []         # name regexes that protect from victim freeze (build workers)
+window_sec               = 120        # rolling RSS window
+headroom_factor          = 1.25       # required free RAM = rss_max × factor
+min_rss_kb               = 524288     # 512 MB pre-filter
+growth_threshold_kb      = 102400     # 100 MB growth signal threshold
+majflt_threshold         = 500        # major-fault delta signal threshold
+oscillation_drop_factor  = 0.90       # 10% drop from peak = genuine valley
+min_samples              = 6          # samples before acting (~30 s)
+cpu_threshold_pct        = 80.0       # CPU % that triggers ThrottleSpike
+throttled_cpu_weight     = 20         # cpu.weight applied to throttled spike
+max_victim_freeze_sec    = 0          # 0 = unlimited; future safety valve
+```
+
+`exclude` and `victim_exclude` serve distinct roles:
+
+| Field | Scope | Use case |
+|---|---|---|
+| `exclude` | Tracking only | Suppress false-positive orchestrators (e.g. `firefox`) |
+| `victim_exclude` | Victim selection only | Protect build workers (`rustc`, `cc`, `ld`) spawned by tracked orchestrators |
+
+A process in `victim_exclude` can still be tracked as a spike orchestrator. A process in `exclude` is invisible to spike mode entirely.
+
+### `mgctl spike-status`
+
+```
+$ mgctl spike-status
+OK spike candidates:
+  pid=12345   name=cargo                 phase=tracking   rss_max=4198MB samples=14 cpu_throttled=false
+frozen victims:
+  pid=9876    name=firefox               frozen_for_spike=12345
+```
+
+---
+
 ## 9. Privilege model (summary)
 
 Full treatment in [`PRIVILEGE_DESIGN.md`](PRIVILEGE_DESIGN.md). The core

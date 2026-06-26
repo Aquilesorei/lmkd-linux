@@ -20,6 +20,7 @@ pub struct Process {
     pub cgroup_path: Option<String>,
     /// CPU usage percent over the last sample interval (0.0 on first observation).
     pub cpu_pct: f32,
+    pub majflt: u64,
 }
 
 /// pid → (total_ticks, unix_timestamp_secs) from previous list_processes() call.
@@ -36,12 +37,14 @@ pub fn list_processes() -> Vec<Process> {
         return vec![];
     };
 
-    entries
+    let procs: Vec<Process> = entries
         .filter_map(|e| e.ok())
         .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok().map(|pid| (pid, e.path())))
         .filter(|(pid, _)| *pid != own_pid)
         .filter_map(|(pid, path)| read_process(pid, &path).ok())
-        .collect()
+        .collect();
+    prune_cpu_cache(&procs);
+    procs
 }
 
 fn read_process(pid: u32, path: &Path) -> Result<Process, MgdError> {
@@ -87,18 +90,19 @@ fn read_process(pid: u32, path: &Path) -> Result<Process, MgdError> {
         .ok()
         .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()));
 
-    let cpu_pct = compute_cpu_pct(pid);
+    let (ticks, majflt) = mgd_common::process::read_proc_stat(pid);
+    let cpu_pct = compute_cpu_pct(pid, ticks);
 
-    Ok(Process { pid, name, exe_basename, rss_kb, swap_kb, oom_score, cgroup_path, cpu_pct })
+    Ok(Process { pid, name, exe_basename, rss_kb, swap_kb, oom_score, cgroup_path, cpu_pct, majflt })
 }
 
 
-fn compute_cpu_pct(pid: u32) -> f32 {
-    let now = mgd_common::util::unix_timestamp_secs();
-    let ticks = match mgd_common::process::read_proc_cpu_ticks(pid) {
+fn compute_cpu_pct(pid: u32, ticks: Option<u64>) -> f32 {
+    let ticks = match ticks {
         Some(t) => t,
         None => return 0.0,
     };
+    let now = mgd_common::util::unix_timestamp_secs();
     let mut cache = CPU_CACHE.lock().unwrap();
     let cpu_pct = if let Some(&(prev_ticks, prev_time)) = cache.get(&pid) {
         let delta_ticks = ticks.saturating_sub(prev_ticks) as f32;
@@ -109,6 +113,11 @@ fn compute_cpu_pct(pid: u32) -> f32 {
     };
     cache.insert(pid, (ticks, now));
     cpu_pct
+}
+
+fn prune_cpu_cache(live_pids: &[Process]) {
+    let mut cache = CPU_CACHE.lock().unwrap();
+    cache.retain(|pid, _| live_pids.iter().any(|p| p.pid == *pid));
 }
 
 fn num_cpus() -> f32 {

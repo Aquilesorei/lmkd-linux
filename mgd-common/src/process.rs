@@ -1,14 +1,34 @@
 use std::fs;
 
+/// Read both cpu ticks and major page faults from /proc/<pid>/stat in a single read.
+/// After the last ')': state(0) ppid(1)...minflt(7) cminflt(8) majflt(9)...utime(11) stime(12)
+/// Returns (Option<utime+stime>, majflt).
+pub fn read_proc_stat(pid: u32) -> (Option<u64>, u64) {
+    let stat = match fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(s) => s,
+        Err(_) => return (None, 0),
+    };
+    let after_comm = match stat.rsplit_once(") ") {
+        Some((_, rest)) => rest,
+        None => return (None, 0),
+    };
+    let fields: Vec<&str> = after_comm.split_whitespace().collect();
+    let majflt = fields.get(9).and_then(|s| s.parse().ok()).unwrap_or(0);
+    let cpu_ticks = fields.get(11)
+        .zip(fields.get(12))
+        .and_then(|(u, s)| u.parse::<u64>().ok().zip(s.parse::<u64>().ok()))
+        .map(|(u, s)| u + s);
+    (cpu_ticks, majflt)
+}
+
 /// Read utime+stime ticks from /proc/<pid>/stat. Returns None on any parse failure.
 pub fn read_proc_cpu_ticks(pid: u32) -> Option<u64> {
-    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    // After the last ')': state(0) ppid(1) ... utime(11) stime(12)
-    let after_comm = stat.rsplit_once(") ")?.1;
-    let mut it = after_comm.split_whitespace().skip(11);
-    let utime: u64 = it.next()?.parse().ok()?;
-    let stime: u64 = it.next()?.parse().ok()?;
-    Some(utime + stime)
+    read_proc_stat(pid).0
+}
+
+/// Read cumulative major page faults from /proc/<pid>/stat. Returns 0 on any parse failure.
+pub fn read_proc_majflt(pid: u32) -> u64 {
+    read_proc_stat(pid).1
 }
 
 /// Return true if the cgroup file content places the process in the user session.

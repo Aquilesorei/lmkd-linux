@@ -21,7 +21,15 @@ impl ThrottleManager {
         }
     }
 
-    pub(crate) fn update(&mut self, plan_procs: &[&Process], active_pid: Option<u32>) {
+    pub(crate) fn update(&mut self, plan_procs: &[&Process], active_pid: Option<u32>, active: bool, exclude: &[regex::Regex]) {
+        if !active {
+            for path in self.states.keys() {
+                restore_cgroup_cpu(path);
+            }
+            self.states.clear();
+            self.tracker.clear();
+            return;
+        }
         let mut cgroup_groups: HashMap<String, Vec<&Process>> = HashMap::new();
         for p in plan_procs {
             if let Some(path) = p.cgroup_path.clone() {
@@ -69,6 +77,19 @@ impl ThrottleManager {
                         "[throttle] Restored background cgroup {} to normal CPU shares (priority < 60)",
                         cgroup_path
                     );
+                }
+                self.tracker.remove(cgroup_path);
+                continue;
+            }
+
+            let excluded = !exclude.is_empty() && processes.iter().any(|p| {
+                let name = p.exe_basename.as_deref().unwrap_or(&p.name);
+                exclude.iter().any(|re| re.is_match(name) || re.is_match(&p.name))
+            });
+            if excluded {
+                if current != ThrottledState::None {
+                    restore_cgroup_cpu(cgroup_path);
+                    self.states.insert(cgroup_path.clone(), ThrottledState::None);
                 }
                 self.tracker.remove(cgroup_path);
                 continue;
@@ -140,7 +161,7 @@ fn restore_cgroup_cpu(path: &str) {
     let _ = write_cgroup_cpu_max(path, "max 100000");
 }
 
-pub(crate) fn write_cgroup_cpu_weight(cgroup_path: &str, weight: u32) -> Result<(), std::io::Error> {
+pub fn write_cgroup_cpu_weight(cgroup_path: &str, weight: u32) -> Result<(), std::io::Error> {
     let path = cgroup_sysfs_path(cgroup_path, "cpu.weight");
     if path.exists() {
         std::fs::write(&path, format!("{}", weight))?;
@@ -292,6 +313,7 @@ mod tests {
             oom_score: 200,
             cgroup_path: cgroup.map(|s| s.to_string()),
             cpu_pct: 0.0,
+            majflt: 0,
         }
     }
 

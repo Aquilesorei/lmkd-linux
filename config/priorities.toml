@@ -514,3 +514,39 @@ priority = 85
 name    = "docker-proxy"
 pattern = "^docker-proxy$"
 priority = 88
+
+# ── Spike Mode ───────────────────────────────────────────────────────────────
+# Proactive headroom manager for build tools and container runtimes that exhibit
+# oscillating memory usage: cargo build, make, cmake, docker build, gradle, etc.
+# Each compilation unit allocs several GB, links, then frees — only for the next
+# unit to alloc more. Spike mode detects this pattern and freezes background
+# processes early to guarantee headroom before the next peak.
+#
+# Heavy desktop apps (IDEs, Blender) spike on startup then plateau — they are NOT
+# oscillators and will stay in OBSERVING phase indefinitely due to the oscillation
+# gate, which is the correct behaviour. Only genuine oscillation triggers action.
+#
+# Set enabled = true to activate. Behavioral detection (RSS growth + major faults)
+# triggers automatically; no include patterns are needed for build tools.
+[spike_mode]
+enabled                = false
+# include = ["^plasmashell$"]   # force-track even if below behavioral signals
+# exclude: never track as a spike orchestrator (false-positive suppression).
+# exclude = ["^firefox$"]
+# victim_exclude: never freeze as a victim — build workers spawned by the orchestrator.
+victim_exclude = ["^(rustc|cc|cc1|ld|lld|javac|kotlinc)$"]
+window_sec             = 120
+headroom_factor        = 1.25
+min_rss_kb             = 524288    # 512 MB pre-filter (must be true before signals checked)
+growth_threshold_kb    = 102400    # 100 MB/5s-cycle RSS growth → growth signal
+majflt_threshold       = 500       # major faults/cycle → majflt signal
+oscillation_drop_factor = 0.90     # 10% drop from peak → genuine valley
+cpu_threshold_pct      = 80.0
+throttled_cpu_weight   = 20
+min_samples            = 6         # 30s observation before acting
+max_victim_freeze_sec  = 0         # 0 = no limit on victim freeze duration
+
+[throttle]
+# Processes matching these patterns are never CPU-throttled, even at Elevated+ pressure.
+# Protects build workers from cpu.weight=1 suppression during compilation.
+exclude = ["^(rustc|cc|cc1|ld|lld|cargo|make|cmake|ninja|gcc|g\\+\\+|clang|clang\\+\\+|javac|kotlinc)$"]
