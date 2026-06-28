@@ -330,9 +330,9 @@ falls back to SIGKILL when checkpoint fails. See the opt-in setup below.
 - [x] Plugin IPC protocol types (`PluginMessage`, `CoreMessage`)
 - [x] Registry persistence across daemon restart
 - [x] fdinfo GPU sweep cost reduction (pluginized decoupled architecture)
+- [x] UMA GPU memory pressure wired into composite score (`resident - shared` deduplication, i915 + xe region-agnostic)
 - [x] `mgctl doctor` + `mgctl calibrate` portability UX
 - [x] PSI kernel trigger via `mgd-psi-trigger` capped subprocess (`cap_perfmon+ep`) with epoll fallback and auto-respawn
-- [ ] Benchmark harness vs earlyoom / nohang / systemd-oomd
 - [ ] COSMIC DE / Pop!_OS 24 plugin (`mgd-cosmic`)
 
 ## Tested on

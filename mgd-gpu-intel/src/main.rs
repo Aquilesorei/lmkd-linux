@@ -12,14 +12,8 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 const FULL_SCAN_INTERVAL: Duration = Duration::from_secs(30);
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
 
-fn send_obs(writer: &mut impl Write, pid: u32, gpu_kb: u64) {
-    let obs = PluginMessage::Observation {
-        plugin: PLUGIN_NAME.to_string(),
-        metric: Metric::GpuResidentKb,
-        pid: Some(pid),
-        value: gpu_kb as f64,
-    };
-    let _ = writeln!(writer, "{}", serde_json::to_string(&obs).unwrap());
+fn send_obs(writer: &mut impl Write, pid: u32, stats: &mgd_common::gpu::SingleProcessGpuMemory) {
+    mgd_common::gpu::send_gpu_stats(writer, PLUGIN_NAME, pid, stats);
 }
 
 fn main() {
@@ -52,9 +46,9 @@ fn main() {
                     let Ok(meta) = fs::metadata(entry.path()) else { continue };
                     if meta.uid() != own_uid { continue; }
 
-                    if let Some(kb) = mgd_common::gpu::process_gpu_kb(pid) {
-                        send_obs(&mut writer, pid, kb);
-                        if kb > 0 { new_known.insert(pid); }
+                    if let Some(stats) = mgd_common::gpu::get_process_gpu_stats(pid) {
+                        if stats.resident_kb > 0 { new_known.insert(pid); }
+                        send_obs(&mut writer, pid, &stats);
                     }
                 }
             }
@@ -62,9 +56,9 @@ fn main() {
         } else {
             // Fast path: only probe PIDs that previously had GPU pages.
             known_gpu_pids.retain(|&pid| {
-                match mgd_common::gpu::process_gpu_kb(pid) {
-                    Some(kb) => { send_obs(&mut writer, pid, kb); kb > 0 }
-                    None => false, // process gone
+                match mgd_common::gpu::get_process_gpu_stats(pid) {
+                    Some(stats) => { send_obs(&mut writer, pid, &stats); stats.resident_kb > 0 }
+                    None => false,
                 }
             });
         }

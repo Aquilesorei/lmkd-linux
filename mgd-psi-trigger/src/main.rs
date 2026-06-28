@@ -29,8 +29,6 @@ fn main() -> ! {
         }
     };
 
-    // Open and arm the trigger on /proc/pressure/memory.
-    // Requires cap_perfmon (Linux 6.0+) or cap_sys_admin.
     let file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -46,8 +44,6 @@ fn main() -> ! {
         std::process::exit(2);
     }
 
-    // Lock stdout once; the lock bypasses line-buffering and gives us a
-    // consistent handle. Flush explicitly after each event byte.
     let mut out = io::stdout().lock();
 
     let psi_fd = file.as_raw_fd();
@@ -60,8 +56,7 @@ fn main() -> ! {
         };
         let ret = unsafe { libc::poll(&mut pfd, 1, 5000) };
         if ret > 0 {
-            // Check errors before POLLPRI — both flags can be set simultaneously;
-            // checking POLLPRI first would emit a spurious event byte before dying.
+         
             if (pfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL)) != 0 {
                 eprintln!("mgd-psi-trigger: poll error/hangup on psi fd");
                 std::process::exit(2);

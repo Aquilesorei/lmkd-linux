@@ -59,8 +59,14 @@ pub enum PluginMessage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Metric {
-    /// GPU memory resident in system RAM, KB.
+    /// GPU memory currently resident in system RAM (includes shared), KB.
     GpuResidentKb,
+    /// Imported dma-buf KB also counted by other clients — subtract from resident for true pressure.
+    GpuSharedKb,
+    /// All GEM BOs the client has handles to (resident + non-resident + shared overhead), KB.
+    GpuTotalKb,
+    /// Purgeable KB — shrinker free path, no migration needed.
+    GpuPurgeableKb,
     /// Process RSS, KB (alternative source, e.g. cgroup accounting).
     RssKb,
     /// Custom metric — name identifies the plugin-specific meaning.
@@ -104,8 +110,14 @@ pub enum CoreMessage {
     /// Response to `QueryGpu`.
     GpuObservation {
         pid: u32,
-        /// GPU Resident KB, or 0 if unknown/none.
+        /// GPU resident KB (includes shared).
         kb: u64,
+        /// Shared/imported dma-buf KB (double-counted in resident).
+        shared_kb: u64,
+        /// Total allocated KB (diagnostic only).
+        total_kb: u64,
+        /// Purgeable KB (shrinker free path).
+        purgeable_kb: u64,
     },
 
     /// Sent by core immediately before it exits. Plugins should disconnect.
