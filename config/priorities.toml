@@ -90,6 +90,13 @@ rss_min_mb = 50                # min RSS of the process to qualify
 reclaim_pct = 20               # percentage of process RSS to reclaim per cycle
 global_cooldown_sec = 30       # minimum seconds between any idle reclaim operations
 max_swap_occupancy_pct = 60.0  # skip if swap/zram usage exceeds this percentage
+# Reclaim cold pages from important (priority < 50) processes when backgrounded.
+# Safe: only memory.reclaim cgroup write — process keeps running, Wayland/GPU state intact.
+# Useful for IDEs, databases, apps at priority 20–49 that accumulate cold heap over time.
+important_enabled = false
+important_min_priority = 20   # reclaim processes with priority >= this (IDEs=35, DBs=35)
+important_idle_sec = 300      # must be backgrounded this long before qualifying
+important_pct = 10            # conservative: 10% of RSS pushed to zram per cycle
 
 # ── page-cache drop before freeze ────────────────────────────────────────────
 # Under pressure the kernel often evicts app pages to swap while keeping file
@@ -344,6 +351,7 @@ priority = 55
 name    = "screenshot"
 pattern = "^(spectacle|flameshot)$"
 priority = 58
+auto_kill_idle_after = 300
 
 # ── LOW (60–79) ──────────────────────────────────────────────────────────────
 

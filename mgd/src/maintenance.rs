@@ -5,6 +5,7 @@
 //! they run here on a 60s poll. Acts only at Normal pressure; under pressure the
 //! evictor owns all process actions and the two must not act on one concurrently.
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -17,6 +18,7 @@ use crate::executor::registry::{CheckpointRegistry, FrozenRegistry};
 use crate::monitor;
 use crate::monitor::psi::PressureLevel;
 use mgd_common::output::locked_print;
+use libc;
 
 const POLL_SECS: u64 = 60;
 
@@ -44,6 +46,8 @@ pub fn run(
     reclaim_wake: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
 ) {
     let mut last_calibration_flush = Instant::now();
+    // (pid, start_time) → last instant we saw cpu_pct > 0
+    let mut auto_kill_last_active: HashMap<(u32, u64), Instant> = HashMap::new();
 
     loop {
         if crate::should_shutdown() {
@@ -70,6 +74,8 @@ pub fn run(
 
         let cycle_start = Instant::now();
         if calm {
+            check_auto_kill_idle(&mut auto_kill_last_active, &frozen, &log);
+
             if let Some(p) = pressure.as_ref() {
                 check_proactive_reclaim(p, &log, false);
 
@@ -177,6 +183,54 @@ fn now_secs() -> u64 {
     mgd_common::util::unix_timestamp_secs()
 }
 
+
+fn check_auto_kill_idle(
+    last_active: &mut HashMap<(u32, u64), Instant>,
+    frozen: &Arc<Mutex<FrozenRegistry>>,
+    log: &Logger,
+) {
+    let cfg = crate::config::get();
+    if cfg.auto_kill_rules.is_empty() {
+        return;
+    }
+    let procs = monitor::process::list_processes();
+    let now = Instant::now();
+
+    let live_keys: HashMap<(u32, u64), &crate::monitor::process::Process> = procs.iter()
+        .filter_map(|p| {
+            crate::executor::read_start_time(p.pid).map(|st| ((p.pid, st), p))
+        })
+        .collect();
+
+    for (&key, &p) in &live_keys {
+        let Some(idle_secs) = cfg.auto_kill_idle_after_for(&p.name) else { continue };
+        if frozen.lock().unwrap().is_frozen(p.pid) {
+            continue;
+        }
+        if p.cpu_pct > 0.1 {
+            last_active.insert(key, now);
+        } else {
+            last_active.entry(key).or_insert(now);
+        }
+        let elapsed = now.duration_since(last_active[&key]).as_secs();
+        if elapsed >= idle_secs {
+            // Safety: normal SIGTERM, process may be ours or in our slice.
+            let _ = unsafe { libc::kill(p.pid as libc::pid_t, libc::SIGTERM) };
+            mgd_common::sync_print!(
+                "[auto-kill] {} (pid {}) idle {}s >= {}s threshold — SIGTERM",
+                p.name, p.pid, elapsed, idle_secs
+            );
+            log.log(&LogEntry::new(
+                "KILL", p.pid, &p.name,
+                p.rss_kb as f64 / 1024.0,
+                "auto-kill-idle",
+            ));
+            last_active.remove(&key);
+        }
+    }
+
+    last_active.retain(|k, _| live_keys.contains_key(k));
+}
 
 /// Pure gate inputs for proactive reclaim (I/O-free for unit tests).
 struct ReclaimGates {

@@ -722,6 +722,10 @@ pub(crate) struct IdleReclaimConfig {
     pub idle_sec: u64,
     pub rss_min_mb: u64,
     pub reclaim_pct: u64,
+    pub important_enabled: bool,
+    pub important_min_priority: u8,
+    pub important_idle_sec: u64,
+    pub important_pct: u64,
 }
 
 /// Pure: returns (pid, reclaim_bytes) pairs for processes eligible for idle cgroup reclaim.
@@ -742,21 +746,22 @@ pub(crate) fn select_idle_candidates(
             continue;
         }
         let prio = crate::engine::decision::get_priority(&p.name, p.exe_basename.as_deref());
-        if prio < 50 {
-            continue;
-        }
-        if p.rss_kb < cfg.rss_min_mb * 1024 {
-            continue;
-        }
         let duration = background_tracker
             .get(&p.pid)
             .map(|t| t.elapsed().as_secs())
             .unwrap_or(0);
-        if duration < cfg.idle_sec {
-            continue;
+
+        if prio >= 50 {
+            if p.rss_kb < cfg.rss_min_mb * 1024 { continue; }
+            if duration < cfg.idle_sec { continue; }
+            let reclaim_bytes = (p.rss_kb * cfg.reclaim_pct / 100) * 1024;
+            candidates.push((p.pid, reclaim_bytes));
+        } else if cfg.important_enabled && prio >= cfg.important_min_priority {
+            if p.rss_kb < cfg.rss_min_mb * 1024 { continue; }
+            if duration < cfg.important_idle_sec { continue; }
+            let reclaim_bytes = (p.rss_kb * cfg.important_pct / 100) * 1024;
+            candidates.push((p.pid, reclaim_bytes));
         }
-        let reclaim_bytes = (p.rss_kb * cfg.reclaim_pct / 100) * 1024;
-        candidates.push((p.pid, reclaim_bytes));
     }
     candidates
 }
@@ -1122,6 +1127,10 @@ fn check_idle_process_reclaim(
         idle_sec: config.idle_reclaim_sec,
         rss_min_mb: config.idle_reclaim_rss_min_mb,
         reclaim_pct: config.idle_reclaim_pct,
+        important_enabled: config.idle_reclaim_important_enabled,
+        important_min_priority: config.idle_reclaim_important_min_priority,
+        important_idle_sec: config.idle_reclaim_important_idle_sec,
+        important_pct: config.idle_reclaim_important_pct,
     };
     let candidates = select_idle_candidates(plan_procs, active_pid, pid_tracker, swap_used_pct, &idle_cfg);
 
