@@ -31,14 +31,8 @@ fn main() {
                 let Ok(meta) = fs::metadata(entry.path()) else { continue };
                 if meta.uid() != own_uid { continue; }
 
-                if let Some(gpu_kb) = mgd_common::gpu::process_gpu_kb(pid) {
-                    let obs = PluginMessage::Observation {
-                        plugin: PLUGIN_NAME.to_string(),
-                        metric: Metric::GpuResidentKb,
-                        pid: Some(pid),
-                        value: gpu_kb as f64,
-                    };
-                    let _ = writeln!(writer, "{}", serde_json::to_string(&obs).unwrap());
+                if let Some(stats) = mgd_common::gpu::get_process_gpu_stats(pid) {
+                    mgd_common::gpu::send_gpu_stats(&mut writer, PLUGIN_NAME, pid, &stats);
                 }
             }
         }

@@ -211,6 +211,18 @@ struct IdleReclaim {
     max_swap_occupancy_pct: f64,
     #[serde(default)]
     freeze_after_sec: Option<u64>,
+    /// Reclaim cold pages from important (priority < 50) processes when idle.
+    #[serde(default)]
+    important_enabled: bool,
+    /// Priority floor for important-tier reclaim (processes with priority >= this AND < 50).
+    #[serde(default = "default_idle_reclaim_important_min_priority")]
+    important_min_priority: u8,
+    /// Seconds backgrounded before important-tier processes qualify for reclaim.
+    #[serde(default = "default_idle_reclaim_important_idle_sec")]
+    important_idle_sec: u64,
+    /// Percentage of RSS to reclaim per cycle for important-tier processes.
+    #[serde(default = "default_idle_reclaim_important_pct")]
+    important_pct: u64,
 }
 
 impl Default for IdleReclaim {
@@ -223,6 +235,10 @@ impl Default for IdleReclaim {
             global_cooldown_sec: default_idle_reclaim_global_cooldown_sec(),
             max_swap_occupancy_pct: default_idle_reclaim_max_swap_occupancy_pct(),
             freeze_after_sec: None,
+            important_enabled: false,
+            important_min_priority: default_idle_reclaim_important_min_priority(),
+            important_idle_sec: default_idle_reclaim_important_idle_sec(),
+            important_pct: default_idle_reclaim_important_pct(),
         }
     }
 }
@@ -233,6 +249,9 @@ fn default_idle_reclaim_rss_min_mb() -> u64 { 50 }
 fn default_idle_reclaim_reclaim_pct() -> u64 { 20 }
 fn default_idle_reclaim_global_cooldown_sec() -> u64 { 30 }
 fn default_idle_reclaim_max_swap_occupancy_pct() -> f64 { 60.0 }
+fn default_idle_reclaim_important_min_priority() -> u8 { 20 }
+fn default_idle_reclaim_important_idle_sec() -> u64 { 300 }
+fn default_idle_reclaim_important_pct() -> u64 { 10 }
 
 /// `[emergency]` — last-resort actions when pressure stays at Emergency level.
 #[derive(Deserialize)]
@@ -342,6 +361,9 @@ struct AppEntry {
     /// If None, use default decision logic.
     #[serde(default)]
     checkpoint: Option<bool>,
+    /// SIGTERM after this many seconds of CPU-idle at Normal pressure.
+    #[serde(default)]
+    auto_kill_idle_after: Option<u64>,
 }
 
 /// Entries in the [[protect]] table are never touched by mgd,
@@ -396,6 +418,10 @@ pub struct CompiledConfig {
     pub idle_reclaim_global_cooldown_sec: u64,
     pub idle_reclaim_max_swap_occupancy_pct: f64,
     pub idle_reclaim_freeze_after_sec: Option<u64>,
+    pub idle_reclaim_important_enabled: bool,
+    pub idle_reclaim_important_min_priority: u8,
+    pub idle_reclaim_important_idle_sec: u64,
+    pub idle_reclaim_important_pct: u64,
     pub emergency_hibernate_after_sec: u64,
     pub spike_mode_enabled: bool,
     pub spike_include: Vec<Regex>,
@@ -414,6 +440,8 @@ pub struct CompiledConfig {
     pub throttle_exclude: Vec<Regex>,
     /// (regex, priority, checkpoint_override)
     entries: Vec<(Regex, u8, Option<bool>)>,
+    /// (regex, idle_secs) — SIGTERM after this many CPU-idle seconds at Normal pressure
+    pub auto_kill_rules: Vec<(Regex, u64)>,
     /// Patterns that must never be touched
     protected: Vec<Regex>,
     /// exe_basename → priority derived from .desktop Categories=
@@ -447,6 +475,12 @@ impl CompiledConfig {
             }
         }
         None
+    }
+
+    pub fn auto_kill_idle_after_for(&self, name: &str) -> Option<u64> {
+        self.auto_kill_rules.iter()
+            .find(|(re, _)| re.is_match(name))
+            .map(|(_, secs)| *secs)
     }
 
     /// Returns true if this process is on the protect list and must not be
@@ -599,9 +633,15 @@ fn compile(content: &str) -> Result<CompiledConfig, String> {
         .unwrap_or_else(ram_scaled_target_pct);
 
     let mut entries = Vec::with_capacity(raw.apps.len());
+    let mut auto_kill_rules = Vec::new();
     for app in raw.apps {
         match Regex::new(&app.pattern) {
-            Ok(re) => entries.push((re, app.priority, app.checkpoint)),
+            Ok(re) => {
+                if let Some(secs) = app.auto_kill_idle_after {
+                    auto_kill_rules.push((re.clone(), secs));
+                }
+                entries.push((re, app.priority, app.checkpoint));
+            }
             Err(e) => eprintln!("mgd: skipping invalid regex '{}': {e}", app.pattern),
         }
     }
@@ -663,6 +703,10 @@ fn compile(content: &str) -> Result<CompiledConfig, String> {
         idle_reclaim_global_cooldown_sec: raw.idle_reclaim.global_cooldown_sec,
         idle_reclaim_max_swap_occupancy_pct: raw.idle_reclaim.max_swap_occupancy_pct,
         idle_reclaim_freeze_after_sec: raw.idle_reclaim.freeze_after_sec,
+        idle_reclaim_important_enabled: raw.idle_reclaim.important_enabled,
+        idle_reclaim_important_min_priority: raw.idle_reclaim.important_min_priority,
+        idle_reclaim_important_idle_sec: raw.idle_reclaim.important_idle_sec,
+        idle_reclaim_important_pct: raw.idle_reclaim.important_pct,
         emergency_hibernate_after_sec: raw.emergency.hibernate_after_sec,
         spike_mode_enabled: raw.spike_mode.enabled,
         spike_include: raw.spike_mode.include.iter()
@@ -697,6 +741,7 @@ fn compile(content: &str) -> Result<CompiledConfig, String> {
             .collect(),
         psi,
         entries,
+        auto_kill_rules,
         protected,
         desktop_index,
         config_path: None,

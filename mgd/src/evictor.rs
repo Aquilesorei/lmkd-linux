@@ -722,6 +722,10 @@ pub(crate) struct IdleReclaimConfig {
     pub idle_sec: u64,
     pub rss_min_mb: u64,
     pub reclaim_pct: u64,
+    pub important_enabled: bool,
+    pub important_min_priority: u8,
+    pub important_idle_sec: u64,
+    pub important_pct: u64,
 }
 
 /// Pure: returns (pid, reclaim_bytes) pairs for processes eligible for idle cgroup reclaim.
@@ -742,21 +746,22 @@ pub(crate) fn select_idle_candidates(
             continue;
         }
         let prio = crate::engine::decision::get_priority(&p.name, p.exe_basename.as_deref());
-        if prio < 50 {
-            continue;
-        }
-        if p.rss_kb < cfg.rss_min_mb * 1024 {
-            continue;
-        }
         let duration = background_tracker
             .get(&p.pid)
             .map(|t| t.elapsed().as_secs())
             .unwrap_or(0);
-        if duration < cfg.idle_sec {
-            continue;
+
+        if prio >= 50 {
+            if p.rss_kb < cfg.rss_min_mb * 1024 { continue; }
+            if duration < cfg.idle_sec { continue; }
+            let reclaim_bytes = (p.rss_kb * cfg.reclaim_pct / 100) * 1024;
+            candidates.push((p.pid, reclaim_bytes));
+        } else if cfg.important_enabled && prio >= cfg.important_min_priority {
+            if p.rss_kb < cfg.rss_min_mb * 1024 { continue; }
+            if duration < cfg.important_idle_sec { continue; }
+            let reclaim_bytes = (p.rss_kb * cfg.important_pct / 100) * 1024;
+            candidates.push((p.pid, reclaim_bytes));
         }
-        let reclaim_bytes = (p.rss_kb * cfg.reclaim_pct / 100) * 1024;
-        candidates.push((p.pid, reclaim_bytes));
     }
     candidates
 }
@@ -1008,8 +1013,11 @@ fn reclaim_cgroup(cgroup_path: &str, bytes_size: u64) -> Result<bool, std::io::E
     }
     let reclaim_path = crate::throttle::cgroup_sysfs_path(cgroup_path, "memory.reclaim");
     if reclaim_path.exists() {
-        std::fs::write(&reclaim_path, format!("{}", bytes_size))?;
-        return Ok(true);
+        match std::fs::write(&reclaim_path, format!("{}", bytes_size)) {
+            Ok(()) => return Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => return Ok(false),
+            Err(e) => return Err(e),
+        }
     }
     Err(std::io::Error::new(std::io::ErrorKind::NotFound, "cgroup memory.reclaim not found"))
 }
@@ -1122,6 +1130,10 @@ fn check_idle_process_reclaim(
         idle_sec: config.idle_reclaim_sec,
         rss_min_mb: config.idle_reclaim_rss_min_mb,
         reclaim_pct: config.idle_reclaim_pct,
+        important_enabled: config.idle_reclaim_important_enabled,
+        important_min_priority: config.idle_reclaim_important_min_priority,
+        important_idle_sec: config.idle_reclaim_important_idle_sec,
+        important_pct: config.idle_reclaim_important_pct,
     };
     let candidates = select_idle_candidates(plan_procs, active_pid, pid_tracker, swap_used_pct, &idle_cfg);
 
@@ -1249,7 +1261,7 @@ mod tests {
     }
 
     fn default_idle_cfg() -> IdleReclaimConfig {
-        IdleReclaimConfig { max_swap_occupancy_pct: 60.0, idle_sec: 180, rss_min_mb: 50, reclaim_pct: 20 }
+        IdleReclaimConfig { max_swap_occupancy_pct: 60.0, idle_sec: 180, rss_min_mb: 50, reclaim_pct: 20, important_enabled: false, important_min_priority: 20, important_idle_sec: 300, important_pct: 10 }
     }
 
     fn make_pid_tracker(pid: u32, secs_ago: u64) -> HashMap<u32, Instant> {
@@ -1380,7 +1392,7 @@ mod tests {
         let p2 = make_process(200, "app_b", 150_000);
         let mut tracker = make_pid_tracker(100, 300);
         tracker.insert(200, Instant::now() - Duration::from_secs(250));
-        let r = select_idle_candidates(&[&p1, &p2], None, &tracker, 10.0, &IdleReclaimConfig { max_swap_occupancy_pct: 60.0, idle_sec: 180, rss_min_mb: 50, reclaim_pct: 10 });
+        let r = select_idle_candidates(&[&p1, &p2], None, &tracker, 10.0, &IdleReclaimConfig { max_swap_occupancy_pct: 60.0, idle_sec: 180, rss_min_mb: 50, reclaim_pct: 10, important_enabled: false, important_min_priority: 20, important_idle_sec: 300, important_pct: 10 });
         assert_eq!(r.len(), 2);
         let pids: Vec<u32> = r.iter().map(|(pid, _)| *pid).collect();
         assert!(pids.contains(&100));

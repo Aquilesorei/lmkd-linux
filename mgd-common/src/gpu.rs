@@ -1,20 +1,34 @@
 use std::collections::HashMap;
 use std::fs;
 
-/// Resident GPU memory (KiB) summed across the process's DRM clients, or None if
-/// it has none. A DRM fd is dup'd many times but each dup reports identical
-/// per-client totals, so dedup by `drm-client-id`.
-///
-/// Only fds symlinked into `/dev/dri/` have their fdinfo read; the readlink gate
-/// keeps non-DRM fds (the bulk) to one cheap syscall.
-pub fn process_gpu_kb(pid: u32) -> Option<u64> {
-    let fd_dir = format!("/proc/{pid}/fd");
+/// Per-process GPU memory stats aggregated across all DRM clients.
+/// Region suffix (`system0`, `smem`, `lmem`) is ignored — works for i915 and xe.
+#[derive(Debug, Clone, Default)]
+pub struct SingleProcessGpuMemory {
+    /// Pages currently resident in system RAM (includes shared).
+    pub resident_kb: u64,
+    /// Imported dma-buf pages shared with other clients (compositor etc) — also
+    /// counted in their resident_kb. Pressure term = resident_kb - shared_kb.
+    pub shared_kb: u64,
+    /// All GEM BOs the client has handles to: resident + non-resident + shared overhead.
+    /// total - resident = non-resident BOs + shared overhead (not a reservation).
+    pub total_kb: u64,
+    /// Purgeable pages — shrinker can drop for free (no migration needed).
+    pub purgeable_kb: u64,
+}
+
+/// GPU memory stats for a process, or None if it has no DRM fds.
+/// DRM fds are deduped by `drm-client-id`; each dup reports identical totals.
+/// Only fds symlinked into `/dev/dri/` are read; readlink gate keeps cost low.
+pub fn get_process_gpu_stats(pid: u32) -> Option<SingleProcessGpuMemory> {
+    use std::os::unix::ffi::OsStrExt;
+    let fd_dir = format!("/proc/{pid}/fd"); //please excuse me for allocating  omg    crying
     let entries = fs::read_dir(&fd_dir).ok()?;
 
-    let mut per_client: HashMap<String, u64> = HashMap::new();
+    // client_id → (resident_kb, shared_kb, total_kb, purgeable_kb)
+    let mut per_client: HashMap<String, (u64, u64, u64, u64)> = HashMap::new();
     let mut saw_drm = false;
 
-    use std::os::unix::ffi::OsStrExt;
     let mut path_buf = Vec::with_capacity(64);
     path_buf.extend_from_slice(fd_dir.as_bytes());
     path_buf.push(b'/');
@@ -22,7 +36,7 @@ pub fn process_gpu_kb(pid: u32) -> Option<u64> {
 
     for entry in entries.filter_map(|e| e.ok()) {
         let file_name = entry.file_name();
-        
+
         path_buf.truncate(base_len);
         path_buf.extend_from_slice(file_name.as_bytes());
         path_buf.push(0);
@@ -40,41 +54,77 @@ pub fn process_gpu_kb(pid: u32) -> Option<u64> {
             continue;
         }
 
-        // fdinfo path mirrors the fd number. A read race (fd closed) is not fatal.
         let fdinfo = format!("/proc/{pid}/fdinfo/{}", entry.file_name().to_string_lossy());
         let Ok(content) = fs::read_to_string(&fdinfo) else { continue };
 
-        let mut client_id: Option<&str> = None;
+        let mut client_id: Option<String> = None;
         let mut resident_kb: u64 = 0;
-        let mut has_resident = false;
+        let mut shared_kb: u64 = 0;
+        let mut total_kb: u64 = 0;
+        let mut purgeable_kb: u64 = 0;
+        let mut has_drm = false;
 
         for line in content.lines() {
             if let Some(v) = line.strip_prefix("drm-client-id:") {
-                client_id = Some(v.trim());
-            } else if let Some(v) = line.strip_prefix("drm-resident-") {
-                // `drm-resident-<region>:\t<value> <unit>`
-                if let Some(kb) = v.split_once(':').and_then(|(_region, val)| parse_mem_kb(val.trim())) {
-                    resident_kb = resident_kb.saturating_add(kb);
-                    has_resident = true;
-                }
+                client_id = Some(v.trim().to_string());
+            } else if let Some(kb) = line.strip_prefix("drm-resident-").and_then(drm_region_kb) {
+                resident_kb = resident_kb.saturating_add(kb);
+                has_drm = true;
+            } else if let Some(kb) = line.strip_prefix("drm-shared-").and_then(drm_region_kb) {
+                shared_kb = shared_kb.saturating_add(kb);
+            } else if let Some(kb) = line.strip_prefix("drm-total-").and_then(drm_region_kb) {
+                total_kb = total_kb.saturating_add(kb);
+            } else if let Some(kb) = line.strip_prefix("drm-purgeable-").and_then(drm_region_kb) {
+                purgeable_kb = purgeable_kb.saturating_add(kb);
             }
         }
 
-        if !has_resident {
+        if !has_drm {
             continue;
         }
         saw_drm = true;
-        match client_id {
-            Some(id) => { per_client.insert(id.to_string(), resident_kb); }
-            // Pre-client-id kernels: synthetic per-fd key avoids collision.
-            None => { per_client.insert(format!("fd:{:?}", entry.file_name()), resident_kb); }
-        }
+        let key = client_id.unwrap_or_else(|| format!("fd:{:?}", entry.file_name()));
+        per_client.insert(key, (resident_kb, shared_kb, total_kb, purgeable_kb));
     }
 
     if !saw_drm {
         return None;
     }
-    Some(per_client.values().copied().fold(0u64, u64::saturating_add))
+
+    let mut stats = SingleProcessGpuMemory::default();
+    for (r, s, t, p) in per_client.into_values() {
+        stats.resident_kb  = stats.resident_kb.saturating_add(r);
+        stats.shared_kb    = stats.shared_kb.saturating_add(s);
+        stats.total_kb     = stats.total_kb.saturating_add(t);
+        stats.purgeable_kb = stats.purgeable_kb.saturating_add(p);
+    }
+    Some(stats)
+}
+
+
+/// Write resident/total/purgeable observations for `pid` to `writer`.
+/// Shared by mgd-gpu-intel and mgd-gpu-amd — same wire format, same metrics.
+pub fn send_gpu_stats(writer: &mut impl std::io::Write, plugin: &str, pid: u32, stats: &SingleProcessGpuMemory) {
+    use crate::protocol::{Metric, PluginMessage};
+    for (metric, kb) in [
+        (Metric::GpuResidentKb,  stats.resident_kb),
+        (Metric::GpuSharedKb,    stats.shared_kb),
+        (Metric::GpuTotalKb,     stats.total_kb),
+        (Metric::GpuPurgeableKb, stats.purgeable_kb),
+    ] {
+        let obs = PluginMessage::Observation {
+            plugin: plugin.to_string(),
+            metric,
+            pid: Some(pid),
+            value: kb as f64,
+        };
+        let _ = writeln!(writer, "{}", serde_json::to_string(&obs).unwrap());
+    }
+}
+
+/// Parse `<region>:<value> <unit>` — the part after stripping a `drm-<stat>-` prefix.
+fn drm_region_kb(v: &str) -> Option<u64> {
+    v.split_once(':').and_then(|(_, val)| parse_mem_kb(val.trim()))
 }
 
 /// Parse a DRM fdinfo size (`2247000 KiB` / `4 MiB` / `512`) into KiB. A bare

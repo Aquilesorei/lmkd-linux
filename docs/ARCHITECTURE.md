@@ -159,7 +159,7 @@ in `engine/decision.rs`.
 
 | Module | Reads | Provides |
 |--------|-------|----------|
-| `psi.rs` | `/proc/pressure/memory` | `MemoryPressure` (some/full avg10/60/300) → `PressureLevel` |
+| `psi.rs` | `/sys/fs/cgroup/.../memory.pressure` (cgroup-first) or `/proc/pressure/memory` | `MemoryPressure` (some/full avg10/60/300) → `PressureLevel` |
 | `meminfo.rs` | `/proc/meminfo`, `/proc/vmstat` | `MemInfo { available, total, swap_free, swap_total }`, `swap_used_pct()`; `read_vmstat_swap_counters()` → cumulative `pswpin`/`pswpout` page counters for I/O rate |
 | `process.rs` | `/proc/<pid>/{status,stat,oom_score,exe,cgroup}` | `Process` list including `cpu_pct` (delta from `/proc/<pid>/stat`), `cgroup_path` |
 | `zram.rs` | `/proc/swaps`, `/sys/block/zramN/mm_stat` | device list, compressed + decompressed sizes, `compact()` |
@@ -177,7 +177,7 @@ Emergency`), derived `PartialOrd`/`Ord` so callers can gate on
    The sub-scores are normalized between $0.0$ and $1.0$:
    *   $S_{\text{PSI}} = \text{clamp}\left(\frac{\text{PSI}_{\text{some\_avg10}}}{100.0},\, 0.0,\, 1.0\right)$
    *   $S_{\text{swap}} = \text{clamp}\left(\frac{\text{Swap}_{\text{used\_pct}}}{100.0},\, 0.0,\, 1.0\right)$ (defaults to $0.0$ if no swap)
-   *   $S_{\text{GPU}} = \text{clamp}\left(\frac{\text{GPU}_{\text{UMA\_kb}}}{\text{RAM}_{\text{total\_kb}}},\, 0.0,\, 1.0\right)$ (total GPU residency reported by driver plugins via `plugin_server::GPU_CACHE`, 30 s TTL)
+   *   $S_{\text{GPU}} = \text{clamp}\left(\frac{\sum(\text{resident\_kb} - \text{shared\_kb})}{\text{RAM}_{\text{total\_kb}}},\, 0.0,\, 1.0\right)$ — unique GPU RAM per process (resident minus imported dma-buf to avoid double-counting compositor pages); reported by driver plugins via `plugin_server::GPU_CACHE` (`SingleProcessGpuMemory`, 30 s TTL)
    *   $S_{\text{swapIO}} = \text{clamp}\left(\frac{(\Delta\text{pswpin} + \Delta\text{pswpout}) \cdot 4\,\text{KB/page}}{\Delta t \cdot 51200\,\text{KB/s}},\, 0.0,\, 1.0\right)$ — total swap I/O rate from `/proc/vmstat`, normalized at 50 MB/s (full-thrash signal). Catches fast-onset thrashing before the PSI 10 s moving average smooths it out.
 2. **Trend ($T$):** The derivative ($dP/dt$) calculated dynamically across cycles to measure pressure velocity (change per second):
    $$T = \frac{dP}{dt} \approx \frac{P_t - P_{t-1}}{\Delta t}$$
@@ -487,10 +487,14 @@ Active plugins:
   then tailing `journalctl --user -f`. When the active window changes, the evictor immediately
   unfreezes that process if frozen, and `MemCapManager`/`ThrottleManager` restore it to full
   CPU and memory limits.
-- **`mgd-gpu-intel`**: Scans `/proc/<pid>/fdinfo/` (DRM, `drm-resident-*` fields) every 5 s
-  to account for UMA graphics memory. Sends `Observation { metric: GpuResidentKb }` per-pid
-  to core; core stores in `plugin_server::GPU_CACHE` (30 s TTL). Auto-spawned for `i915` or
-  `xe` drivers detected in `/sys/class/drm/*/device/driver`.
+- **`mgd-gpu-intel`** / **`mgd-gpu-amd`**: Scan `/proc/<pid>/fdinfo/` every 5 s to account
+  for UMA graphics memory. Parse `drm-resident-*`, `drm-shared-*`, `drm-total-*`,
+  `drm-purgeable-*` fields in one pass via `mgd_common::gpu::get_process_gpu_stats()`
+  (region-suffix-agnostic: works for i915 `system0` and xe `smem`/`lmem`). Send four
+  `Observation` metrics per PID (`GpuResidentKb`, `GpuSharedKb`, `GpuTotalKb`,
+  `GpuPurgeableKb`) via shared `send_gpu_stats()` helper. Core upserts into
+  `plugin_server::GPU_CACHE` (`SingleProcessGpuMemory`, 30 s TTL). `mgd-gpu-intel`
+  auto-spawned for `i915`/`xe`; `mgd-gpu-amd` for `amdgpu`.
 
 Plugins observe the system and send `PluginMessage` to core; core routes via
 `plugin_server::serve_plugin_connection()`. Core broadcasts `CoreMessage::PressureChanged`
@@ -641,6 +645,7 @@ which is honored regardless of who launches the process.
 | zram compact | none (tmpfiles sysfs grant on `compact` node) | none | on |
 | swap reclaim | `mgd-zram-reclaim` (3rd binary) | `CAP_SYS_ADMIN` | **off** |
 | CRIU dump/restore | `mgd-checkpoint` wrapper → execs capped `criu` | `CAP_CHECKPOINT_RESTORE` + `CAP_SYS_PTRACE` (+`CAP_NET_ADMIN` for live TCP) | on if criu present |
+| PSI trigger | `mgd-psi-trigger` — arms highest writable cgroup PSI file | `cap_perfmon+ep` (compat; not needed on kernel 7.x) | on if installed |
 
 Principles: narrowest capability never root; smallest carrier (prefer a sysfs
 grant over a binary, a fixed-function binary over a flexible one); **policy stays
@@ -745,7 +750,7 @@ Everything mgd senses comes from procfs/sysfs — no kernel module, no BPF:
 
 | Path | Used for |
 |------|----------|
-| `/proc/pressure/memory` | PSI pressure levels |
+| `/sys/fs/cgroup/.../memory.pressure` | PSI pressure levels (read) and kernel trigger arming (write, cgroup-first; `/proc/pressure/memory` triggers broken on kernel 7.x) |
 | `/proc/meminfo` | available/total RAM, swap usage |
 | `/proc/<pid>/status` | name, VmRSS, VmSwap |
 | `/proc/<pid>/stat` | start_time (recycle guard), utime+stime (idle) |

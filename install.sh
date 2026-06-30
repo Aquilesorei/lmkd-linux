@@ -80,7 +80,6 @@ else
 fi
 cp target/release/mgctl "$BIN_DIR/mgctl"
 cp target/release/mgd-checkpoint "$BIN_DIR/mgd-checkpoint"
-cp target/release/mgd-psi-trigger "$BIN_DIR/mgd-psi-trigger"
 cp target/release/mgd-kde "$BIN_DIR/mgd-kde"
 cp target/release/mgd-gpu-intel "$BIN_DIR/mgd-gpu-intel"
 cp target/release/mgd-gpu-amd "$BIN_DIR/mgd-gpu-amd"
@@ -148,9 +147,9 @@ if [[ "$WITH_PRIVILEGED" == 1 ]]; then
         warn "could not setcap checkpoint helper (kernel may lack CAP_CHECKPOINT_RESTORE)"
     fi
 
-    # Fix 4 — PSI trigger helper: cap_perfmon+ep (Linux 6.0+ requires it for
-    # /proc/pressure/* writes). The daemon spawns this, polls its stdout for
-    # pressure events, and stays fully unprivileged itself.
+    # Fix 4 — PSI trigger helper: arms the highest writable cgroup memory.pressure
+    # file and proxies PSI events to the daemon via stdout. cap_perfmon+ep kept
+    # for compatibility with older kernels that gate /proc/pressure/* on it.
     PSI_TRIGGER_DEST="/usr/local/bin/mgd-psi-trigger"
     sudo install -m 0755 target/release/mgd-psi-trigger "$PSI_TRIGGER_DEST"
     if sudo setcap cap_perfmon+ep "$PSI_TRIGGER_DEST"; then
