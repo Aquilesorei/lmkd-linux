@@ -18,28 +18,33 @@ pub fn pressure_source() -> &'static str {
 /// Kernel PSI trigger for zero-CPU idle waiting.
 pub struct PsiTrigger {
     file: std::fs::File,
-    pub source: &'static str,
+    pub source: String,
 }
 
 impl PsiTrigger {
 
     pub fn new() -> Result<Self, MgdError> {
-        match Self::open(pressure_source()) {
-            Err(_) if pressure_source() != GLOBAL_PSI => Self::open(GLOBAL_PSI),
-            other => other,
+        // Kernel 7.x+: /proc/pressure/memory triggers return EINVAL; min window is 2s.
+        // Walk the cgroup hierarchy upward to find the highest writable PSI file.
+        if let Some(path) = mgd_common::psi::find_trigger_path() {
+            return Self::open(path);
         }
+        // Last resort: global PSI file (works on older kernels).
+        Self::open(GLOBAL_PSI.to_string())
     }
 
-    fn open(path: &'static str) -> Result<Self, MgdError> {
+    fn open(path: String) -> Result<Self, MgdError> {
         use std::io::Write;
-        let mut file = std::fs::OpenOptions::new()
+        let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
-            .open(path)?;
+            .open(&path)?;
 
-        // elevated_pct of the 1,000,000 us window (default 5% → 50,000 us)
-        let stall_us = (crate::config::get().psi.elevated_pct / 100.0 * 1_000_000.0) as u64;
-        file.write_all(format!("some {stall_us} 1000000").as_bytes())?;
+        let elevated_pct = crate::config::get().psi.elevated_pct;
+        // 2s window: valid on kernel <7.x ([500ms,10s]) and 7.x+ (min 2s, must be multiple of 2s).
+        let window_us: u64 = 2_000_000;
+        let stall_us = (elevated_pct / 100.0 * window_us as f64) as u64;
+        (&file).write_all(format!("some {stall_us} {window_us}").as_bytes())?;
 
         Ok(PsiTrigger { file, source: path })
     }

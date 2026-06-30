@@ -43,6 +43,40 @@ pub fn trigger_armable(path: &str) -> bool {
         .is_ok()
 }
 
+/// Walk the cgroup hierarchy upward from the calling process's own cgroup,
+/// returning the highest (broadest-scope) `memory.pressure` file that can be
+/// opened read-write (i.e. can have a PSI trigger armed on it).
+///
+/// On kernel 7.x+, `/proc/pressure/memory` triggers are broken (EINVAL) and
+/// the min trigger window rose from 1s to 2s. Cgroup PSI files owned by the
+/// user (e.g. `app.slice`) work; root-owned ancestors do not.
+/// Returns `None` if no writable PSI file is found (containers, etc.).
+pub fn find_trigger_path() -> Option<String> {
+    let cgroup_content = fs::read_to_string("/proc/self/cgroup").ok()?;
+    let rel = cgroup_content
+        .lines()
+        .find(|l| l.starts_with("0::"))?
+        .trim_start_matches("0::")
+        .trim_matches('/');
+
+    if rel.is_empty() {
+        return None;
+    }
+
+    let parts: Vec<&str> = rel.split('/').filter(|s| !s.is_empty()).collect();
+    let mut best: Option<String> = None;
+    // Leaf → root: stop at first non-writable level; keep the highest writable.
+    for len in (1..=parts.len()).rev() {
+        let path = format!("/sys/fs/cgroup/{}/memory.pressure", parts[..len].join("/"));
+        if trigger_armable(&path) {
+            best = Some(path);
+        } else {
+            break;
+        }
+    }
+    best
+}
+
 pub fn parse_kv(s: &str, prefix: &str) -> Result<f64, crate::error::MgdError> {
     s.strip_prefix(prefix)
         .ok_or_else(|| crate::error::MgdError::Parse(format!("expected '{prefix}', got '{s}'")))?

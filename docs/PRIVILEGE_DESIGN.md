@@ -231,6 +231,26 @@ The caps are placed on `mgd-checkpoint` (not on `criu` itself), so `criu` remain
 
 ---
 
+### 4. PSI kernel trigger — Tier A, **`cap_perfmon+ep` (retained for compat)**
+
+Operation: arm a kernel PSI pressure trigger for zero-CPU idle waiting.
+
+**Kernel 7.x breaking changes (discovered 2026-06-29):**
+- `/proc/pressure/memory` trigger writes return `EINVAL` unconditionally — the global file no longer accepts trigger arming.
+- Minimum trigger window raised from 500ms to **2s** (must be an exact multiple of 2s; `1000000`µs returns EINVAL).
+- Cgroup PSI files (`/sys/fs/cgroup/.../memory.pressure`) owned by the user still work with window ≥ 2s.
+
+**New behavior:** `mgd-psi-trigger` reads `/proc/self/cgroup`, walks the cgroup hierarchy upward, and arms the trigger on the highest writable `memory.pressure` file (typically `user@UID.service/app.slice/memory.pressure` — owned by the user, captures pressure across all user applications). Window `2000000`µs (2s) is used.
+
+`cap_perfmon+ep` is retained on the binary for compatibility with kernels < 7.x where `/proc/pressure/memory` required that capability. On kernel 7.x it is not exercised.
+
+- Carrier: `mgd-psi-trigger`.
+- Capability: `cap_perfmon+ep` (compat; not required on kernel 7.x cgroup path).
+- Input: none (cgroup path derived from `/proc/self/cgroup`; stall_us from argv, validated positive integer).
+- Graceful degrade: if no writable PSI file found → exits with code 2 → daemon falls back to in-process `PsiTrigger` → then 5s polling.
+
+---
+
 ## Capability cheat-sheet
 
 | Operation        | Carrier                        | Capability                                   | Input |
@@ -238,6 +258,7 @@ The caps are placed on `mgd-checkpoint` (not on `criu` itself), so `criu` remain
 | zram compact     | none (tmpfiles sysfs grant)    | none                                         | none  |
 | swap reclaim     | `mgd-zram-reclaim`             | `CAP_SYS_ADMIN`                              | none  |
 | CRIU dump/restore| `mgd-checkpoint` wrapper       | `CAP_CHECKPOINT_RESTORE` + `CAP_SYS_PTRACE` + `CAP_NET_ADMIN` | PID + images-dir (both validated) |
+| PSI trigger      | `mgd-psi-trigger`              | `cap_perfmon+ep` (compat; not needed on 7.x) | stall_us from argv (validated) |
 
 SIGSTOP/SIGCONT (freezer), SIGTERM/SIGKILL (killer), SIGUSR1 (Firefox GC), and
 fdinfo GPU reads all work on own-uid processes with **no** privilege and are not
@@ -282,6 +303,15 @@ sudo setcap cap_checkpoint_restore,cap_sys_ptrace,cap_net_admin+ep \
 ```
 
 `install.sh --privileged` does this automatically. Caps on `mgd-checkpoint`, not on `criu` itself.
+
+PSI trigger (Operation 4):
+
+```bash
+sudo install -m 0755 target/release/mgd-psi-trigger /usr/local/bin/mgd-psi-trigger
+sudo setcap cap_perfmon+ep /usr/local/bin/mgd-psi-trigger
+```
+
+Note: on kernel 7.x the cap is not required (cgroup PSI files are user-owned). It is retained for compatibility.
 
 Each step is independent. Skipping one disables only that feature; mgd logs the
 capability as unavailable at startup and continues.

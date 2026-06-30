@@ -159,7 +159,7 @@ in `engine/decision.rs`.
 
 | Module | Reads | Provides |
 |--------|-------|----------|
-| `psi.rs` | `/proc/pressure/memory` | `MemoryPressure` (some/full avg10/60/300) → `PressureLevel` |
+| `psi.rs` | `/sys/fs/cgroup/.../memory.pressure` (cgroup-first) or `/proc/pressure/memory` | `MemoryPressure` (some/full avg10/60/300) → `PressureLevel` |
 | `meminfo.rs` | `/proc/meminfo`, `/proc/vmstat` | `MemInfo { available, total, swap_free, swap_total }`, `swap_used_pct()`; `read_vmstat_swap_counters()` → cumulative `pswpin`/`pswpout` page counters for I/O rate |
 | `process.rs` | `/proc/<pid>/{status,stat,oom_score,exe,cgroup}` | `Process` list including `cpu_pct` (delta from `/proc/<pid>/stat`), `cgroup_path` |
 | `zram.rs` | `/proc/swaps`, `/sys/block/zramN/mm_stat` | device list, compressed + decompressed sizes, `compact()` |
@@ -645,6 +645,7 @@ which is honored regardless of who launches the process.
 | zram compact | none (tmpfiles sysfs grant on `compact` node) | none | on |
 | swap reclaim | `mgd-zram-reclaim` (3rd binary) | `CAP_SYS_ADMIN` | **off** |
 | CRIU dump/restore | `mgd-checkpoint` wrapper → execs capped `criu` | `CAP_CHECKPOINT_RESTORE` + `CAP_SYS_PTRACE` (+`CAP_NET_ADMIN` for live TCP) | on if criu present |
+| PSI trigger | `mgd-psi-trigger` — arms highest writable cgroup PSI file | `cap_perfmon+ep` (compat; not needed on kernel 7.x) | on if installed |
 
 Principles: narrowest capability never root; smallest carrier (prefer a sysfs
 grant over a binary, a fixed-function binary over a flexible one); **policy stays
@@ -749,7 +750,7 @@ Everything mgd senses comes from procfs/sysfs — no kernel module, no BPF:
 
 | Path | Used for |
 |------|----------|
-| `/proc/pressure/memory` | PSI pressure levels |
+| `/sys/fs/cgroup/.../memory.pressure` | PSI pressure levels (read) and kernel trigger arming (write, cgroup-first; `/proc/pressure/memory` triggers broken on kernel 7.x) |
 | `/proc/meminfo` | available/total RAM, swap usage |
 | `/proc/<pid>/status` | name, VmRSS, VmSwap |
 | `/proc/<pid>/stat` | start_time (recycle guard), utime+stime (idle) |

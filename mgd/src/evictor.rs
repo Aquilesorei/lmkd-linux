@@ -1013,8 +1013,11 @@ fn reclaim_cgroup(cgroup_path: &str, bytes_size: u64) -> Result<bool, std::io::E
     }
     let reclaim_path = crate::throttle::cgroup_sysfs_path(cgroup_path, "memory.reclaim");
     if reclaim_path.exists() {
-        std::fs::write(&reclaim_path, format!("{}", bytes_size))?;
-        return Ok(true);
+        match std::fs::write(&reclaim_path, format!("{}", bytes_size)) {
+            Ok(()) => return Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => return Ok(false),
+            Err(e) => return Err(e),
+        }
     }
     Err(std::io::Error::new(std::io::ErrorKind::NotFound, "cgroup memory.reclaim not found"))
 }
@@ -1258,7 +1261,7 @@ mod tests {
     }
 
     fn default_idle_cfg() -> IdleReclaimConfig {
-        IdleReclaimConfig { max_swap_occupancy_pct: 60.0, idle_sec: 180, rss_min_mb: 50, reclaim_pct: 20 }
+        IdleReclaimConfig { max_swap_occupancy_pct: 60.0, idle_sec: 180, rss_min_mb: 50, reclaim_pct: 20, important_enabled: false, important_min_priority: 20, important_idle_sec: 300, important_pct: 10 }
     }
 
     fn make_pid_tracker(pid: u32, secs_ago: u64) -> HashMap<u32, Instant> {
@@ -1389,7 +1392,7 @@ mod tests {
         let p2 = make_process(200, "app_b", 150_000);
         let mut tracker = make_pid_tracker(100, 300);
         tracker.insert(200, Instant::now() - Duration::from_secs(250));
-        let r = select_idle_candidates(&[&p1, &p2], None, &tracker, 10.0, &IdleReclaimConfig { max_swap_occupancy_pct: 60.0, idle_sec: 180, rss_min_mb: 50, reclaim_pct: 10 });
+        let r = select_idle_candidates(&[&p1, &p2], None, &tracker, 10.0, &IdleReclaimConfig { max_swap_occupancy_pct: 60.0, idle_sec: 180, rss_min_mb: 50, reclaim_pct: 10, important_enabled: false, important_min_priority: 20, important_idle_sec: 300, important_pct: 10 });
         assert_eq!(r.len(), 2);
         let pids: Vec<u32> = r.iter().map(|(pid, _)| *pid).collect();
         assert!(pids.contains(&100));
