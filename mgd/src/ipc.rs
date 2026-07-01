@@ -309,6 +309,7 @@ fn cmd_list(
 
 fn cmd_reload() -> String {
     crate::config::reload();
+    crate::plugin_server::broadcast_config_reload();
     ok("config reloaded")
 }
 
@@ -545,7 +546,7 @@ fn cmd_kill(arg: &str, event_log: &crate::events::EventLog) -> String {
     for p in candidates {
         let r = crate::executor::killer::sigkill(p.pid);
         if r.success {
-            crate::events::push(event_log, "KILL_MANUAL", p.pid, &p.name, "killed via mgctl");
+            crate::events::push(event_log, mgd_common::logger::LogAction::KillManual, p.pid, &p.name, "killed via mgctl");
             results.push(format!("✓ killed pid={} ({})", p.pid, p.name));
         } else {
             results.push(format!("✗ pid={} ({}): {}", p.pid, p.name, r.error.unwrap_or_default()));
@@ -589,7 +590,7 @@ fn cmd_events(event_log: &crate::events::EventLog) -> String {
         return ok("(no events recorded)");
     }
     let lines: Vec<String> = q.iter().map(|e| {
-        format!("  {} {:<14} pid={:<7} name={:<22} {}", format_ts(e.timestamp), e.action, e.pid, e.name, e.detail)
+        format!("  {} {:<14} pid={:<7} name={:<22} {}", format_ts(e.timestamp), e.action.as_str(), e.pid, e.name, e.detail)
     }).collect();
     ok(&lines.join("\n"))
 }
@@ -668,7 +669,7 @@ mod tests {
     #[test]
     fn events_records_and_retrieves() {
         let log = empty_events();
-        events::push(&log, "FREEZE", 42, "test_proc", "frozen");
+        events::push(&log, mgd_common::logger::LogAction::Freeze, 42, "test_proc", "frozen");
         let r = cmd_events(&log);
         assert!(r.contains("FREEZE"), "expected FREEZE in: {r}");
         assert!(r.contains("test_proc"), "expected test_proc in: {r}");

@@ -3,18 +3,54 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Structured log entry for a daemon action.
-pub struct LogEntry<'a> {
-    pub action: &'a str,
-    pub pid:    u32,
-    pub name:   &'a str,
-    pub rss_mb: f64,
-    pub result: &'a str,
+#[derive(Copy, Clone)]
+pub enum LogAction {
+    Freeze,
+    FreezeReclaim,
+    IdleFreeze,
+    Terminate,
+    Kill,
+    KillManual,
+    Checkpoint,
+    Unfreeze,
+    Restore,
+    RestoreAbandon,
+    RestoreFail,
+    Reclaim,
+    EarlyReclaim,
+    Zram,
+    Cache,
+    Calibrate,
+    SpikeFreeze,
+    SpikeUnfreeze,
+    SpikeUnfreezeTimeout,
+    SpikeUnfreezeOrphan,
 }
 
-impl<'a> LogEntry<'a> {
-    pub fn new(action: &'a str, pid: u32, name: &'a str, rss_mb: f64, result: &'a str) -> Self {
-        LogEntry { action, pid, name, rss_mb, result }
+impl LogAction {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Freeze               => "FREEZE",
+            Self::FreezeReclaim        => "FREEZE_RECLAIM",
+            Self::IdleFreeze           => "IDLE_FREEZE",
+            Self::Terminate            => "TERMINATE",
+            Self::Kill                 => "KILL",
+            Self::KillManual           => "KILL_MANUAL",
+            Self::Checkpoint           => "CHECKPOINT",
+            Self::Unfreeze             => "UNFREEZE",
+            Self::Restore              => "RESTORE",
+            Self::RestoreAbandon       => "RESTORE_ABANDON",
+            Self::RestoreFail          => "RESTORE_FAIL",
+            Self::Reclaim              => "RECLAIM",
+            Self::EarlyReclaim         => "EARLY_RECLAIM",
+            Self::Zram                 => "ZRAM",
+            Self::Cache                => "CACHE",
+            Self::Calibrate            => "CALIBRATE",
+            Self::SpikeFreeze          => "SPIKE_FREEZE",
+            Self::SpikeUnfreeze        => "SPIKE_UNFREEZE",
+            Self::SpikeUnfreezeTimeout => "SPIKE_UNFREEZE_TIMEOUT",
+            Self::SpikeUnfreezeOrphan  => "SPIKE_UNFREEZE_ORPHAN",
+        }
     }
 }
 
@@ -41,10 +77,10 @@ impl Logger {
     }
 
     /// Append a structured action entry to the session log.
-    pub fn log(&self, entry: &LogEntry) {
+    pub fn log(&self, action: LogAction, pid: u32, name: &str, rss_mb: f64, result: &str) {
         self.write_line(&format!(
             "[{}] {} pid={} name={} rss={:.0}MB result={}",
-            timestamp_now(), entry.action, entry.pid, entry.name, entry.rss_mb, entry.result,
+            timestamp_now(), action.as_str(), pid, name, rss_mb, result,
         ));
     }
 

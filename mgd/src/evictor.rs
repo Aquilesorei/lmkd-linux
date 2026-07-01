@@ -9,7 +9,7 @@ use mgd_common::util::unix_timestamp_secs;
 
 use crate::engine::decision::{Action, Decision, plan, get_priority};
 use crate::executor::registry::{FrozenRegistry, CheckpointRegistry};
-use mgd_common::logger::{LogEntry, Logger};
+use mgd_common::logger::{LogAction, Logger};
 use crate::monitor;
 use crate::monitor::meminfo::MemInfo;
 use crate::monitor::process::Process;
@@ -114,6 +114,7 @@ pub fn run(
 
         if crate::should_reload() {
             crate::config::reload();
+            crate::plugin_server::broadcast_config_reload();
             // Respawn PSI subprocess if elevated_pct changed (new threshold needs
             // a fresh fd — the kernel trigger can't be re-armed on an existing fd).
             let new_pct = crate::config::get().psi.elevated_pct;
@@ -456,7 +457,7 @@ pub fn run(
                             "[spike] Unfroze {} (PID {}) — spike PID {} exited",
                             v.name, v.pid, v.frozen_for_spike_pid
                         );
-                        log.log(&LogEntry::new("SPIKE_UNFREEZE", v.pid, &v.name, 0.0, "spike exited"));
+                        log.log(LogAction::SpikeUnfreeze, v.pid, &v.name, 0.0, "spike exited");
                         total_released += 1;
                     }
                 }
@@ -479,7 +480,7 @@ pub fn run(
                         "[spike] Released timed-out victim {} (PID {}): frozen >{}s",
                         v.name, v.pid, max_secs
                     );
-                    log.log(&LogEntry::new("SPIKE_UNFREEZE_TIMEOUT", v.pid, &v.name, 0.0, "max_victim_freeze_sec"));
+                    log.log(LogAction::SpikeUnfreezeTimeout, v.pid, &v.name, 0.0, "max_victim_freeze_sec");
                 }
             }
 
@@ -492,7 +493,7 @@ pub fn run(
                         "[spike] Released orphaned victim {} (PID {}): spike PID {} already gone",
                         v.name, v.pid, v.frozen_for_spike_pid
                     );
-                    log.log(&LogEntry::new("SPIKE_UNFREEZE_ORPHAN", v.pid, &v.name, 0.0, "initiator exited"));
+                    log.log(LogAction::SpikeUnfreezeOrphan, v.pid, &v.name, 0.0, "initiator exited");
                 }
             }
 
@@ -529,10 +530,8 @@ pub fn run(
                                     "[spike] Froze {} (PID {}, {:.0}MB) for headroom",
                                     proc.name, proc.pid, proc.rss_kb as f64 / 1024.0
                                 );
-                                log.log(&LogEntry::new(
-                                    "SPIKE_FREEZE", proc.pid, &proc.name,
-                                    proc.rss_kb as f64 / 1024.0, "proactive headroom",
-                                ));
+                                log.log(LogAction::SpikeFreeze, proc.pid, &proc.name,
+                                    proc.rss_kb as f64 / 1024.0, "proactive headroom");
                                 spike_tracker.record_victim_frozen(crate::spike_mode::SpikeVictim {
                                     pid: proc.pid,
                                     name: proc.name.clone(),
@@ -633,13 +632,8 @@ pub fn run(
                                     "[reclaim] Post-freeze: pushed ~{:.0}MB from PID {} ({}) to zram",
                                     d.rss_mb, d.pid, d.name
                                 );
-                                log.log(&LogEntry::new(
-                                    "FREEZE_RECLAIM",
-                                    d.pid,
-                                    &d.name,
-                                    d.rss_mb,
-                                    "pushed to zram after pressure freeze",
-                                ));
+                                log.log(LogAction::FreezeReclaim, d.pid, &d.name,
+                                    d.rss_mb, "pushed to zram after pressure freeze");
                             }
                             Ok(false) => {}
                             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
@@ -800,10 +794,8 @@ fn compact_zram(level: &PressureLevel, log: &Logger) {
                 mgd_common::sync_print!(
                     "[zram] compacted {device} — {before_mb}MB→{after_mb}MB used ({reclaimed}MB reclaimed)"
                 );
-                log.log(&LogEntry::new(
-                    "ZRAM", 0, &device, reclaimed as f64,
-                    &format!("compacted {before_mb}MB->{after_mb}MB"),
-                ));
+                log.log(LogAction::Zram, 0, &device, reclaimed as f64,
+                    &format!("compacted {before_mb}MB->{after_mb}MB"));
             }
             Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
                 ZRAM_COMPACT_DISABLED.store(true, Ordering::Relaxed);
@@ -811,7 +803,7 @@ fn compact_zram(level: &PressureLevel, log: &Logger) {
                     "[zram] compact unavailable ({device}): sysfs grant absent — disabling for \
                      session. See docs/PRIVILEGE_DESIGN.md §1."
                 );
-                log.log(&LogEntry::new("ZRAM", 0, &device, 0.0, "unavailable: EACCES (grant absent)"));
+                log.log(LogAction::Zram, 0, &device, 0.0, "unavailable: EACCES (grant absent)");
                 return;
             }
             Err(e) => {
@@ -848,11 +840,9 @@ fn check_cache_drop(level: &PressureLevel, log: &Logger) {
     let mut total_bytes = 0u64;
     for r in crate::monitor::cache::drop_caches(&paths) {
         if r.files_advised > 0 {
-            log.log(&LogEntry::new(
-                "CACHE", 0, &r.pattern,
+            log.log(LogAction::Cache, 0, &r.pattern,
                 (r.bytes_advised / (1024 * 1024)) as f64,
-                &format!("advised {} files", r.files_advised),
-            ));
+                &format!("advised {} files", r.files_advised));
         }
         total_files += r.files_advised;
         total_bytes += r.bytes_advised;
@@ -909,15 +899,16 @@ fn execute_decision(
     log: &Logger,
     event_log: &crate::events::EventLog,
 ) -> String {
-    let (action_name, s) = match d.action {
-        Action::Freeze => ("FREEZE", freeze_process(d, frozen)),
-        Action::Terminate => ("TERMINATE", terminate_process(d)),
-        Action::Kill => ("KILL", kill_process(d)),
+    let (action, s) = match d.action {
+        Action::Freeze => (LogAction::Freeze, freeze_process(d, frozen)),
+        Action::Terminate => (LogAction::Terminate, terminate_process(d)),
+        Action::Kill => (LogAction::Kill, kill_process(d)),
         Action::Checkpoint => execute_checkpoint(d, checkpointed),
         Action::None => return String::new(),
     };
-    log.log(&LogEntry::new(action_name, d.pid, &d.name, d.rss_mb, &s));
-    crate::events::push(event_log, action_name, d.pid, &d.name, &s);
+    let detail = format!("{s} [{}]", d.reason);
+    log.log(action, d.pid, &d.name, d.rss_mb, &detail);
+    crate::events::push(event_log, action, d.pid, &d.name, &detail);
     s
 }
 
@@ -957,13 +948,13 @@ fn kill_process(d: &Decision) -> String {
     }
 }
 
-fn execute_checkpoint(d: &Decision, checkpointed: &Arc<Mutex<CheckpointRegistry>>) -> (&'static str, String) {
+fn execute_checkpoint(d: &Decision, checkpointed: &Arc<Mutex<CheckpointRegistry>>) -> (LogAction, String) {
     let r = crate::executor::checkpoint::checkpoint(d.pid, &d.name);
     if r.success {
         let dir = r.snapshot_dir.unwrap();
         checkpointed.lock().unwrap()
             .add(d.pid, &d.name, dir.clone(), d.rss_mb as u64 * 1024);
-        ("CHECKPOINT", format!("checkpointed → {dir:?}"))
+        (LogAction::Checkpoint, format!("checkpointed → {dir:?}"))
     } else {
         // Dump failed — this binary is not safely checkpointable; record it so
         // future cycles skip CRIU for it and route directly here.
@@ -973,13 +964,13 @@ fn execute_checkpoint(d: &Decision, checkpointed: &Arc<Mutex<CheckpointRegistry>
         // dump likely failed due to complex state, don't wait for SIGTERM).
         if d.prio >= 60 {
             terminate_process(d);
-            ("TERMINATE", format!("terminating (CRIU failed: {})", r.error.unwrap_or_default()))
+            (LogAction::Terminate, format!("terminating (CRIU failed: {})", r.error.unwrap_or_default()))
         } else {
             let kr = crate::executor::killer::sigkill(d.pid);
             if kr.success {
-                ("KILL", format!("killed (CRIU failed: {})", r.error.unwrap_or_default()))
+                (LogAction::Kill, format!("killed (CRIU failed: {})", r.error.unwrap_or_default()))
             } else {
-                ("KILL", format!("kill_fail: {}", kr.error.unwrap_or_default()))
+                (LogAction::Kill, format!("kill_fail: {}", kr.error.unwrap_or_default()))
             }
         }
     }
@@ -1076,13 +1067,8 @@ fn check_early_process_reclaim(
                     p.pid,
                     p.name
                 );
-                log.log(&LogEntry::new(
-                    "EARLY_RECLAIM",
-                    p.pid,
-                    &p.name,
-                    (reclaim_bytes_size / (1024 * 1024)) as f64,
-                    "pushed to zram via cgroup reclaim",
-                ));
+                log.log(LogAction::EarlyReclaim, p.pid, &p.name,
+                    (reclaim_bytes_size / (1024 * 1024)) as f64, "pushed to zram via cgroup reclaim");
             }
             Ok(false) => {}
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -1165,13 +1151,9 @@ fn check_idle_process_reclaim(
                     pid
                 );
                 if let Some(p) = proc_entry {
-                    log.log(&LogEntry::new(
-                        "EARLY_RECLAIM",
-                        p.pid,
-                        &p.name,
+                    log.log(LogAction::EarlyReclaim, p.pid, &p.name,
                         (*bytes_to_reclaim_size / (1024 * 1024)) as f64,
-                        "proactively pushed idle process to zram",
-                    ));
+                        "proactively pushed idle process to zram");
                 }
                 // Reset timer → serves as per-process cooldown
                 pid_tracker.insert(*pid, std::time::Instant::now());
@@ -1220,13 +1202,8 @@ fn check_idle_process_reclaim(
                         "[idle-freeze] Froze idle background process {} (PID {}, idle {}s)",
                         p.name, p.pid, elapsed
                     );
-                    log.log(&LogEntry::new(
-                        "IDLE_FREEZE",
-                        p.pid,
-                        &p.name,
-                        p.rss_kb as f64 / 1024.0,
-                        "proactively froze idle background process",
-                    ));
+                    log.log(LogAction::IdleFreeze, p.pid, &p.name,
+                        p.rss_kb as f64 / 1024.0, "proactively froze idle background process");
                     freeze_pid_tracker.remove(&p.pid);
                     freeze_count += 1;
                 } else {

@@ -1,28 +1,18 @@
-//! PSI source resolution shared by the daemon (`mgd`) and the diagnostic
-//! client (`mgctl doctor`), so both always agree on which file is in use.
-
 use std::fs;
 
-/// System-wide PSI — always present when CONFIG_PSI is enabled.
 pub const GLOBAL_PSI: &str = "/proc/pressure/memory";
-
-/// The per-session PSI file under the systemd user-manager cgroup.
-/// Pressure here reflects only this session, not system-wide noise.
 pub fn cgroup_psi_path() -> String {
     let uid = unsafe { libc::getuid() };
     format!("/sys/fs/cgroup/user.slice/user-{uid}.slice/user@{uid}.service/memory.pressure")
 }
 
-/// A PSI file is usable if it can be read and looks like PSI output.
-/// (A cgroup file may exist but return ENOTSUP when PSI is compiled out.)
-pub fn is_usable_psi_file(path: &str) -> bool {
+
+fn is_usable_psi_file(path: &str) -> bool {
     fs::read_to_string(path)
         .map(|c| c.starts_with("some "))
         .unwrap_or(false)
 }
 
-/// Resolve the PSI file to read: per-session cgroup first, global fallback
-/// (cgroup-v1 hosts or kernels without per-cgroup PSI).
 pub fn resolve_pressure_source() -> String {
     let cgroup = cgroup_psi_path();
     if is_usable_psi_file(&cgroup) {
@@ -32,9 +22,6 @@ pub fn resolve_pressure_source() -> String {
     }
 }
 
-/// Whether a kernel PSI trigger can be armed on `path` (requires opening
-/// read-write; the cgroup file is root-owned on systemd < 254). Probes by
-/// opening only — no trigger is registered, and the fd is dropped here.
 pub fn trigger_armable(path: &str) -> bool {
     fs::OpenOptions::new()
         .read(true)
@@ -43,14 +30,7 @@ pub fn trigger_armable(path: &str) -> bool {
         .is_ok()
 }
 
-/// Walk the cgroup hierarchy upward from the calling process's own cgroup,
-/// returning the highest (broadest-scope) `memory.pressure` file that can be
-/// opened read-write (i.e. can have a PSI trigger armed on it).
-///
-/// On kernel 7.x+, `/proc/pressure/memory` triggers are broken (EINVAL) and
-/// the min trigger window rose from 1s to 2s. Cgroup PSI files owned by the
-/// user (e.g. `app.slice`) work; root-owned ancestors do not.
-/// Returns `None` if no writable PSI file is found (containers, etc.).
+
 pub fn find_trigger_path() -> Option<String> {
     let cgroup_content = fs::read_to_string("/proc/self/cgroup").ok()?;
     let rel = cgroup_content

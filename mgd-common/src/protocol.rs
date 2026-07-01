@@ -14,33 +14,23 @@ use serde::{Deserialize, Serialize};
 pub enum PluginMessage {
     /// First message after connect: plugin introduces itself.
     Identify {
-        /// Human-readable plugin name, e.g. `"mgd-gpu-intel"`.
         name: String,
-        /// Semver string matching the plugin binary's own version.
         version: String,
-        /// Capability tokens the plugin supports, e.g. `["gpu_residency"]`.
         capabilities: Vec<String>,
     },
 
     /// A new measurement the plugin wants core to factor into decisions.
     Observation {
-        /// Plugin name (matches the `name` in `Identify`).
         plugin: String,
-        /// What was measured.
         metric: Metric,
-        /// The PID this measurement is scoped to, if any.
         pid: Option<u32>,
-        /// Measured value in the unit implied by `metric`.
         value: f64,
     },
 
     /// Plugin requests that core take an action (core decides whether to approve).
     ActionRequest {
-        /// Plugin name.
         plugin: String,
-        /// The action being requested.
         action: PluginAction,
-        /// Human-readable rationale for logging.
         reason: String,
     },
 
@@ -122,4 +112,8 @@ pub enum CoreMessage {
 
     /// Sent by core immediately before it exits. Plugins should disconnect.
     Shutdown,
+
+    /// Sent after the daemon reloads its config (SIGHUP or `mgctl reload`).
+    /// Plugins should discard cached config and re-read from disk.
+    ConfigReload,
 }

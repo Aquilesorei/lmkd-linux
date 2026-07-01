@@ -157,24 +157,7 @@ fn get_version_from_proc(name: &str) -> Option<String> {
 
 // ── PSI availability ──────────────────────────────────────────────────────────
 
-use mgd_common::psi::{GLOBAL_PSI, resolve_pressure_source, trigger_armable};
-
-/// Parse "systemd 256 (...)" from `systemctl --version`. Relevant because
-/// systemd < 254 leaves the delegated cgroup's memory.pressure root-owned,
-/// so the daemon's kernel trigger falls back to the global file.
-fn systemd_version() -> Option<u32> {
-    let out = std::process::Command::new("systemctl")
-        .arg("--version")
-        .output()
-        .ok()?;
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .next()?
-        .split_whitespace()
-        .nth(1)?
-        .parse()
-        .ok()
-}
+use mgd_common::psi::{GLOBAL_PSI, resolve_pressure_source, find_trigger_path};
 
 /// Report the PSI source exactly as the daemon resolves it, plus whether the
 /// zero-CPU kernel trigger can be armed on it.
@@ -192,18 +175,9 @@ fn report_psi() {
         println!("  {}", ok(&format!("PSI monitoring ({source}, per-session cgroup)")));
     }
 
-    if trigger_armable(&source) {
-        println!("  {}", ok("PSI kernel trigger armable (zero-CPU idle)"));
-    } else if source != GLOBAL_PSI && trigger_armable(GLOBAL_PSI) {
-        let hint = match systemd_version() {
-            Some(v) if v < 254 => format!("systemd {v} < 254 leaves it root-owned"),
-            _ => "cgroup file not writable".to_string(),
-        };
-        println!("  {}", warn(&format!(
-            "cgroup PSI trigger not armable ({hint}) — daemon falls back to global trigger"
-        )));
-    } else {
-        println!("  {}", warn("PSI trigger not armable — daemon falls back to 5s polling"));
+    match find_trigger_path() {
+        Some(path) => println!("  {}", ok(&format!("PSI kernel trigger armable on {path} (zero-CPU idle)"))),
+        None => println!("  {}", warn("PSI trigger not armable — daemon falls back to 5s polling")),
     }
 }
 

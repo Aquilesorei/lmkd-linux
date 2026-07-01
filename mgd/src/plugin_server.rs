@@ -213,6 +213,12 @@ pub fn broadcast_pressure(level: &str) {
     clients.retain(|tx| tx.send(msg.clone()).is_ok());
 }
 
+pub fn broadcast_config_reload() {
+    let msg = CoreMessage::ConfigReload;
+    let mut clients = PLUGIN_CLIENTS.lock().unwrap();
+    clients.retain(|tx| tx.send(msg.clone()).is_ok());
+}
+
 
 
 

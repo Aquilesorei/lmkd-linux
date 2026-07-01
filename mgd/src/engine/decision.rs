@@ -32,12 +32,12 @@ impl std::fmt::Display for Action {
     }
 }
 
-#[allow(dead_code)]
 pub struct Decision {
     pub pid: u32,
     pub name: String,
     pub action: Action,
     pub rss_mb: f64,
+    #[allow(dead_code)]
     pub swap_mb: f64,
     pub reason: String,
     pub prio: u8,

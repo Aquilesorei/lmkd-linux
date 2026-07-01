@@ -3,11 +3,9 @@
 //! Uses the same DRM fdinfo accounting as mgd-gpu-intel; the kernel interface
 //! is driver-independent (drm-client-id + drm-resident-* fields).
 use std::fs;
-use std::io::Write;
 use std::os::unix::fs::MetadataExt;
 use std::thread;
 use std::time::Duration;
-use mgd_common::protocol::{Metric, PluginMessage};
 
 const PLUGIN_NAME: &str = "mgd-gpu-amd";
 const VERSION: &str = env!("CARGO_PKG_VERSION");

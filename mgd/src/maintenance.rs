@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use mgd_common::logger::{LogEntry, Logger};
+use mgd_common::logger::{LogAction, Logger};
 use crate::engine::calibrate::{render_suggestion, Calibrator};
 use crate::executor::registry::{CheckpointRegistry, FrozenRegistry};
 use crate::monitor;
@@ -169,11 +169,9 @@ pub fn flush_calibration(calibrator: &Arc<Mutex<Calibrator>>, log: &Logger) {
                 "[calibrate] [psi] suggestion ready ({:.0}h observed, {} stalls) → {}",
                 s.observed_hours, s.stall_events, sug_path.display()
             );
-            log.log(&LogEntry::new(
-                "CALIBRATE", 0, "psi", s.elevated_pct,
+            log.log(LogAction::Calibrate, 0, "psi", s.elevated_pct,
                 &format!("suggested elevated_pct={:.1} full_critical_pct={:.1}",
-                    s.elevated_pct, s.full_critical_pct),
-            ));
+                    s.elevated_pct, s.full_critical_pct));
         }
         Err(e) => mgd_common::sync_print!("[calibrate] cannot write suggestion to {}: {e}", sug_path.display()),
     }
@@ -220,11 +218,7 @@ fn check_auto_kill_idle(
                 "[auto-kill] {} (pid {}) idle {}s >= {}s threshold — SIGTERM",
                 p.name, p.pid, elapsed, idle_secs
             );
-            log.log(&LogEntry::new(
-                "KILL", p.pid, &p.name,
-                p.rss_kb as f64 / 1024.0,
-                "auto-kill-idle",
-            ));
+            log.log(LogAction::Kill, p.pid, &p.name, p.rss_kb as f64 / 1024.0, "auto-kill-idle");
             last_active.remove(&key);
         }
     }
@@ -323,7 +317,7 @@ fn check_proactive_reclaim(
             "[reclaim] swap reclaim unavailable: mgd-zram-reclaim not found in \
              /usr/local/bin or /usr/bin — disabling for session. See docs/PRIVILEGE_DESIGN.md §2."
         );
-        log.log(&LogEntry::new("RECLAIM", 0, "zram", 0.0, "unavailable: helper absent"));
+        log.log(LogAction::Reclaim, 0, "zram", 0.0, "unavailable: helper absent");
         return;
     };
 
@@ -339,7 +333,7 @@ fn check_proactive_reclaim(
     };
 
     if let Err(reason) = reclaim_gates_pass(&gates) {
-        log.log(&LogEntry::new("RECLAIM", 0, "zram", 0.0, &format!("skipped: {reason}")));
+        log.log(LogAction::Reclaim, 0, "zram", 0.0, &format!("skipped: {reason}"));
         return;
     }
 
@@ -354,19 +348,15 @@ fn check_proactive_reclaim(
         Ok(()) => {
             LAST_RECLAIM.store(now, Ordering::Relaxed);
             let after = monitor::meminfo::read_meminfo();
-            log.log(&LogEntry::new(
-                "RECLAIM", 0, "zram", gates.zram_orig_mb as f64,
-                &format!(
-                    "reclaimed: swap {:.0}%→{:.0}%, avail {}MB→{}MB",
+            log.log(LogAction::Reclaim, 0, "zram", gates.zram_orig_mb as f64,
+                &format!("reclaimed: swap {:.0}%→{:.0}%, avail {}MB→{}MB",
                     gates.swap_used_pct, after.swap_used_pct(),
-                    gates.mem_available_mb, after.available_kb / 1024
-                ),
-            ));
+                    gates.mem_available_mb, after.available_kb / 1024));
         }
         Err((code, e)) => {
             // Don't arm the cooldown on failure.
             mgd_common::sync_print!("[reclaim] helper failed (exit {code:?}): {e}");
-            log.log(&LogEntry::new("RECLAIM", 0, "zram", 0.0, &format!("failed: {e}")));
+            log.log(LogAction::Reclaim, 0, "zram", 0.0, &format!("failed: {e}"));
             // Exit 2 = uncapped binary (persistent); other codes are transient.
             if code == Some(2) {
                 RECLAIM_DISABLED.store(true, Ordering::Relaxed);
