@@ -6,7 +6,7 @@ const MAX_EVENTS: usize = 100;
 
 pub struct ActionEvent {
     pub timestamp: u64,
-    pub action: &'static str,
+    pub action: mgd_common::logger::LogAction,
     pub pid: u32,
     pub name: String,
     pub detail: String,
@@ -18,7 +18,7 @@ pub fn new_log() -> EventLog {
     Arc::new(Mutex::new(VecDeque::with_capacity(MAX_EVENTS)))
 }
 
-pub fn push(log: &EventLog, action: &'static str, pid: u32, name: &str, detail: &str) {
+pub fn push(log: &EventLog, action: mgd_common::logger::LogAction, pid: u32, name: &str, detail: &str) {
     let event = ActionEvent {
         timestamp: unix_timestamp_secs(),
         action,

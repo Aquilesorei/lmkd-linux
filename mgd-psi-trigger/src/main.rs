@@ -75,7 +75,6 @@ fn main() -> ! {
     let window_us: u64 = 2_000_000;
     let threshold = (stall_us as f64 * window_us as f64 / 1_000_000.0) as u64;
     let trigger = format!("some {threshold} {window_us}");
-    use std::io::Write;
     if let Err(e) = (&file).write_all(trigger.as_bytes()) {
         eprintln!("mgd-psi-trigger: arm '{trigger}' on {psi_path}: {e}");
         std::process::exit(2);

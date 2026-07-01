@@ -52,6 +52,7 @@ struct SpikeState {
     has_oscillated: bool,
     cpu_throttled: bool,
     cgroup_path: Option<String>,
+    #[allow(dead_code)] // read in test assertions
     force_included: bool,
 }
 
@@ -70,6 +71,7 @@ pub(crate) struct Params<'a> {
     pub exclude:                 Vec<&'a Regex>,
 }
 
+#[cfg(test)]
 impl<'a> Params<'a> {
     pub(crate) fn default_test() -> Params<'static> {
         Params {

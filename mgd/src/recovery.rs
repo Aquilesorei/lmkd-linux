@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use crate::engine::health::HealthBaseline;
 use crate::executor::registry::{FrozenRegistry, CheckpointRegistry};
-use mgd_common::logger::{LogEntry, Logger};
+use mgd_common::logger::{LogAction, Logger};
 use crate::monitor;
 
 const MAX_RESTORE_ATTEMPTS: u32 = 3;
@@ -101,7 +101,7 @@ fn unfreeze_pass(
         if r.success {
             let name = reg.name(pid);
             mgd_common::sync_print!("  ✓ Unfroze PID {pid} name={name} (frozen {age}s)");
-            log.log(&LogEntry::new("UNFREEZE", pid, name, 0.0, "unfrozen"));
+            log.log(LogAction::Unfreeze, pid, name, 0.0, "unfrozen");
             reg.remove(pid);
             unfrozen_this_cycle += 1;
         } else {
@@ -128,20 +128,20 @@ fn restore_pass(
 
     if attempts >= MAX_RESTORE_ATTEMPTS {
         mgd_common::sync_print!("  ✗ {name} exceeded {MAX_RESTORE_ATTEMPTS} restore attempts — abandoning");
-        log.log(&LogEntry::new("RESTORE_ABANDON", pid, &name, rss_kb as f64 / 1024.0, "max attempts"));
+        log.log(LogAction::RestoreAbandon, pid, &name, rss_kb as f64 / 1024.0, "max attempts");
         let _ = std::fs::remove_dir_all(&snapshot_dir);
         cp_reg.remove(pid);
     } else if baseline.safe_to_restore(meminfo.available_kb, meminfo.total_kb, rss_kb) {
         let result = crate::executor::checkpoint::restore(&snapshot_dir);
         if result.success {
             mgd_common::sync_print!("  ✓ Restored {name} (was PID {pid}, {:.0}MB)", rss_kb as f64 / 1024.0);
-            log.log(&LogEntry::new("RESTORE", pid, &name, rss_kb as f64 / 1024.0, "restored"));
+            log.log(LogAction::Restore, pid, &name, rss_kb as f64 / 1024.0, "restored");
             let _ = std::fs::remove_dir_all(&snapshot_dir);
             cp_reg.remove(pid);
         } else {
             let err = result.error.unwrap_or_default();
             mgd_common::sync_print!("  ✗ Restore failed for {name} (attempt {}/{MAX_RESTORE_ATTEMPTS}): {err}", attempts + 1);
-            log.log(&LogEntry::new("RESTORE_FAIL", pid, &name, rss_kb as f64 / 1024.0, &err));
+            log.log(LogAction::RestoreFail, pid, &name, rss_kb as f64 / 1024.0, &err);
             cp_reg.increment_attempts(pid);
         }
     } else {

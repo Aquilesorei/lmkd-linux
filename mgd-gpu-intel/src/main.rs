@@ -5,7 +5,6 @@ use std::os::unix::fs::MetadataExt;
 use std::io::Write;
 use std::thread;
 use std::time::{Duration, Instant};
-use mgd_common::protocol::{Metric, PluginMessage};
 
 const PLUGIN_NAME: &str = "mgd-gpu-intel";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
