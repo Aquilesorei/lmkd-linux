@@ -168,10 +168,13 @@ fn dispatch(
     let cmd = parts[0];
     let arg = parts.get(1).copied().unwrap_or("").trim();
 
+    // Request-scoped config snapshot — commands below borrow it.
+    let cfg = crate::config::get();
+
     match cmd {
-        "status"   => cmd_status(frozen, checkpointed, throttle_snapshot, spike_snapshot),
+        "status"   => cmd_status(frozen, checkpointed, throttle_snapshot, spike_snapshot, &cfg),
         "list"     => cmd_list(frozen, checkpointed, throttle_snapshot),
-        "ps"       => cmd_ps(frozen, throttle_snapshot),
+        "ps"       => cmd_ps(frozen, throttle_snapshot, &cfg),
         "events"   => cmd_events(event_log),
         "reload"   => cmd_reload(),
         "unfreeze" => {
@@ -206,7 +209,7 @@ fn dispatch(
             if arg.is_empty() {
                 err("usage: info <pid|name>")
             } else {
-                cmd_info(arg, frozen, checkpointed, throttle_snapshot)
+                cmd_info(arg, frozen, checkpointed, throttle_snapshot, &cfg)
             }
         }
         "gpu-info"      => cmd_gpu_info(),
@@ -222,10 +225,11 @@ fn cmd_status(
     checkpointed: &Arc<Mutex<CheckpointRegistry>>,
     throttle_snapshot: &ThrottleSnapshot,
     spike_snapshot: &Arc<Mutex<crate::spike_mode::SpikeSnapshot>>,
+    cfg: &crate::config::CompiledConfig,
 ) -> String {
     let pressure = monitor::psi::read_pressure()
         .map(|p| {
-            let level = monitor::psi::pressure_level(&p);
+            let level = monitor::psi::pressure_level_with(&p, &cfg.psi);
             format!("{level} (some_avg10={:.2}%)", p.some_avg10)
         })
         .unwrap_or_else(|_| "unavailable".into());
@@ -251,7 +255,6 @@ fn cmd_status(
     );
 
     // Per-feature gate state: enabled? last fired? blocked by what?
-    let cfg = crate::config::get();
     let gates = crate::evictor::feature_gates();
     let (last_reclaim, reclaim_disabled) = crate::maintenance::reclaim_gate();
     let (spike_tracked, spike_victims) = {
@@ -474,6 +477,7 @@ fn cmd_info(
     frozen: &Arc<Mutex<FrozenRegistry>>,
     checkpointed: &Arc<Mutex<CheckpointRegistry>>,
     throttle_snapshot: &ThrottleSnapshot,
+    cfg: &crate::config::CompiledConfig,
 ) -> String {
     let target_pid: Option<u32> = arg.parse().ok();
     let arg_lower = arg.to_lowercase();
@@ -514,7 +518,7 @@ fn cmd_info(
                 _                                => "normal".to_string(),
             }
         };
-        let priority = crate::engine::decision::get_priority(&p.name, p.exe_basename.as_deref());
+        let priority = crate::engine::decision::get_priority(&p.name, p.exe_basename.as_deref(), cfg);
         lines.push(format!(
             "pid={:<8} name={:<24} state={:<16} rss={:.0}MB swap={:.0}MB oom={} priority={} cgroup={}",
             p.pid, p.name, state,
@@ -538,6 +542,7 @@ fn cmd_info(
 fn cmd_ps(
     frozen: &Arc<Mutex<FrozenRegistry>>,
     throttle_snapshot: &ThrottleSnapshot,
+    cfg: &crate::config::CompiledConfig,
 ) -> String {
     let procs = monitor::process::list_processes();
     let frozen_reg = frozen.lock().unwrap();
@@ -561,7 +566,7 @@ fn cmd_ps(
                 _                                => "normal",
             }
         };
-        let priority = crate::engine::decision::get_priority(&p.name, p.exe_basename.as_deref());
+        let priority = crate::engine::decision::get_priority(&p.name, p.exe_basename.as_deref(), cfg);
         lines.push(format!(
             "  pid={:<7} name={:<22} rss={:>6.0}MB swap={:>5.0}MB cpu={:>5.1}% prio={:<3} state={}",
             p.pid, p.name,
@@ -700,6 +705,7 @@ mod tests {
             &empty_frozen(),
             &empty_checkpointed(),
             &empty_throttle(),
+            &crate::config::test_config(),
         );
         assert!(r.starts_with("ERR"), "expected ERR, got: {r}");
     }
@@ -727,7 +733,7 @@ mod tests {
 
     #[test]
     fn ps_returns_ok() {
-        let r = cmd_ps(&empty_frozen(), &empty_throttle());
+        let r = cmd_ps(&empty_frozen(), &empty_throttle(), &crate::config::test_config());
         assert!(r.starts_with("OK"), "expected OK, got: {r}");
     }
 }

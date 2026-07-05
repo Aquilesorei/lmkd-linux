@@ -126,7 +126,7 @@ fn main() {
     shutdown_unfreeze(&frozen);
 
     // Persist calibration aggregates gathered since the last periodic flush.
-    maintenance::flush_calibration(&calibrator, &logger);
+    maintenance::flush_calibration(&calibrator, &logger, &config::get().psi);
 }
 
 /// Handle `mgd freeze <pid>` and `mgd unfreeze <pid>`.

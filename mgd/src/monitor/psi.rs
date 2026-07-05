@@ -23,24 +23,23 @@ pub struct PsiTrigger {
 
 impl PsiTrigger {
 
-    pub fn new() -> Result<Self, MgdError> {
+    pub fn new(elevated_pct: f64) -> Result<Self, MgdError> {
         // Kernel 7.x+: /proc/pressure/memory triggers return EINVAL; min window is 2s.
         // Walk the cgroup hierarchy upward to find the highest writable PSI file.
         if let Some(path) = mgd_common::psi::find_trigger_path() {
-            return Self::open(path);
+            return Self::open(path, elevated_pct);
         }
         // Last resort: global PSI file (works on older kernels).
-        Self::open(GLOBAL_PSI.to_string())
+        Self::open(GLOBAL_PSI.to_string(), elevated_pct)
     }
 
-    fn open(path: String) -> Result<Self, MgdError> {
+    fn open(path: String, elevated_pct: f64) -> Result<Self, MgdError> {
         use std::io::Write;
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .open(&path)?;
 
-        let elevated_pct = crate::config::get().psi.elevated_pct;
         // 2s window: valid on kernel <7.x ([500ms,10s]) and 7.x+ (min 2s, must be multiple of 2s).
         let window_us: u64 = 2_000_000;
         let stall_us = (elevated_pct / 100.0 * window_us as f64) as u64;
@@ -309,12 +308,8 @@ impl PsiThresholds {
     }
 }
 
-/// Maps pressure values to action levels using the loaded `[psi]` config.
-pub fn pressure_level(p: &MemoryPressure) -> PressureLevel {
-    pressure_level_with(p, &crate::config::get().psi)
-}
-
-/// Pure mapping — config-free, used directly by tests.
+/// Maps pressure values to action levels. Pure — callers pass the `[psi]`
+/// thresholds from their cycle-scoped config borrow.
 /// Uses full_avg10 as an accelerator — complete stalls indicate worse conditions.
 pub fn pressure_level_with(p: &MemoryPressure, t: &PsiThresholds) -> PressureLevel {
     // full_avg10 over the floor means ALL tasks are stalled — Critical minimum

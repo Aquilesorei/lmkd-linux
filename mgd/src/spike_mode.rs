@@ -56,7 +56,7 @@ struct SpikeState {
     force_included: bool,
 }
 
-// ── Params (pub(crate) for unit tests to bypass global config) ────────────────
+// ── Params — borrowed view of the `[spike_mode]` config fields ────────────────
 
 pub(crate) struct Params<'a> {
     pub window_sec:              u64,
@@ -69,6 +69,25 @@ pub(crate) struct Params<'a> {
     pub cpu_threshold_pct:       f32,
     pub include:                 Vec<&'a Regex>,
     pub exclude:                 Vec<&'a Regex>,
+}
+
+impl<'a> Params<'a> {
+    /// Borrow the spike-mode fields from a cycle-scoped config snapshot.
+    /// The caller gates on `cfg.spike_mode_enabled`.
+    pub(crate) fn from_config(cfg: &'a crate::config::CompiledConfig) -> Params<'a> {
+        Params {
+            window_sec:              cfg.spike_window_sec,
+            min_rss_kb:              cfg.spike_min_rss_kb,
+            growth_threshold_kb:     cfg.spike_growth_threshold_kb,
+            majflt_threshold:        cfg.spike_majflt_threshold,
+            oscillation_drop_factor: cfg.spike_oscillation_drop_factor,
+            min_samples:             cfg.spike_min_samples,
+            headroom_factor:         cfg.spike_headroom_factor,
+            cpu_threshold_pct:       cfg.spike_cpu_threshold_pct,
+            include:                 cfg.spike_include.iter().collect(),
+            exclude:                 cfg.spike_exclude.iter().collect(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -124,29 +143,9 @@ impl SpikeTracker {
 
     /// Update spike tracking and return decisions for this cycle.
     /// RAM decisions come before CPU decisions in the returned Vec.
-    pub fn update(&mut self, procs: &[Process], available_kb: u64) -> Vec<SpikeDecision> {
-        let cfg = crate::config::get();
-        if !cfg.spike_mode_enabled {
-            return vec![];
-        }
-        let params = Params {
-            window_sec:              cfg.spike_window_sec,
-            min_rss_kb:              cfg.spike_min_rss_kb,
-            growth_threshold_kb:     cfg.spike_growth_threshold_kb,
-            majflt_threshold:        cfg.spike_majflt_threshold,
-            oscillation_drop_factor: cfg.spike_oscillation_drop_factor,
-            min_samples:             cfg.spike_min_samples,
-            headroom_factor:         cfg.spike_headroom_factor,
-            cpu_threshold_pct:       cfg.spike_cpu_threshold_pct,
-            include:                 cfg.spike_include.iter().collect(),
-            exclude:                 cfg.spike_exclude.iter().collect(),
-        };
-        self.update_impl(procs, available_kb, &params)
-    }
-
-    // ponytail: pub(crate) so unit tests can inject config values directly,
-    // bypassing the global config static and its spike_mode_enabled=false default.
-    pub(crate) fn update_impl(
+    /// The caller builds `Params` via `Params::from_config()` from its
+    /// cycle-scoped config borrow (tests inject values directly).
+    pub(crate) fn update(
         &mut self,
         procs: &[Process],
         available_kb: u64,
@@ -516,7 +515,7 @@ mod tests {
     fn feed(pid: u32, name: &str, rss_vals: &[u64], params: &Params) -> SpikeTracker {
         let mut t = SpikeTracker::new();
         for &rss in rss_vals {
-            t.update_impl(&[make_process(pid, name, rss, 0.0, 0)], u64::MAX, params);
+            t.update(&[make_process(pid, name, rss, 0.0, 0)], u64::MAX, params);
         }
         t
     }
@@ -546,7 +545,7 @@ mod tests {
             min_samples: 1, ..p()
         };
         let mut t = feed(1, "blender", &[600_000], &params);
-        t.update_impl(&[make_process(1, "blender", 700_000, 0.0, 0)], u64::MAX, &params);
+        t.update(&[make_process(1, "blender", 700_000, 0.0, 0)], u64::MAX, &params);
         let s = t.spikes.get(&1).unwrap();
         assert_eq!(s.samples.len(), 1);
         assert_eq!(s.samples[0].rss_kb, 700_000);
@@ -560,9 +559,9 @@ mod tests {
         let mut t = SpikeTracker::new();
         t.spikes.insert(1, make_state_tracking(1, "blender", 0));
         // Push peak sample; window_sec=0 means it evicts as soon as time advances.
-        t.update_impl(&[make_process(1, "blender", 2_000_000, 0.0, 0)], u64::MAX, &params);
+        t.update(&[make_process(1, "blender", 2_000_000, 0.0, 0)], u64::MAX, &params);
         // Next cycle: old sample evicted, rss_max recalculated from surviving samples.
-        t.update_impl(&[make_process(1, "blender", 800_000, 0.0, 0)], u64::MAX, &params);
+        t.update(&[make_process(1, "blender", 800_000, 0.0, 0)], u64::MAX, &params);
         assert_eq!(t.spikes.get(&1).unwrap().rss_max_kb, 800_000);
     }
 
@@ -574,7 +573,7 @@ mod tests {
         assert_eq!(t.spikes.get(&1).unwrap().phase, SpikePhase::Tracking);
         let rss_max = t.spikes.get(&1).unwrap().rss_max_kb;
         let available = (rss_max as f64 * 1.0) as u64; // < headroom_factor 1.25
-        let d = t.update_impl(&[make_process(1, "cargo", 3_500_000, 0.0, 0)], available, &p_fast());
+        let d = t.update(&[make_process(1, "cargo", 3_500_000, 0.0, 0)], available, &p_fast());
         assert!(d.iter().any(|x| matches!(x, SpikeDecision::FreezeForHeadroom { .. })));
     }
 
@@ -584,7 +583,7 @@ mod tests {
         let mut t = feed(1, "cargo", &[500_000, 4_200_000, 3_500_000], &p_fast());
         let rss_max = t.spikes.get(&1).unwrap().rss_max_kb;
         let available = (rss_max as f64 * 2.0) as u64;
-        let d = t.update_impl(&[make_process(1, "cargo", 3_500_000, 0.0, 0)], available, &p_fast());
+        let d = t.update(&[make_process(1, "cargo", 3_500_000, 0.0, 0)], available, &p_fast());
         assert!(!d.iter().any(|x| matches!(x, SpikeDecision::FreezeForHeadroom { .. })));
     }
 
@@ -592,7 +591,7 @@ mod tests {
     #[test]
     fn t5_throttle_spike_high_cpu() {
         let mut t = feed(1, "blender", &[500_000, 4_200_000, 3_500_000], &p_fast());
-        let d = t.update_impl(&[make_process(1, "blender", 3_500_000, 90.0, 0)], u64::MAX, &p_fast());
+        let d = t.update(&[make_process(1, "blender", 3_500_000, 90.0, 0)], u64::MAX, &p_fast());
         assert!(d.iter().any(|x| matches!(x, SpikeDecision::ThrottleSpike { .. })));
     }
 
@@ -600,9 +599,9 @@ mod tests {
     #[test]
     fn t6_restore_throttle_on_cpu_drop() {
         let mut t = feed(1, "blender", &[500_000, 4_200_000, 3_500_000], &p_fast());
-        t.update_impl(&[make_process(1, "blender", 3_500_000, 90.0, 0)], u64::MAX, &p_fast());
+        t.update(&[make_process(1, "blender", 3_500_000, 90.0, 0)], u64::MAX, &p_fast());
         assert!(t.spikes.get(&1).unwrap().cpu_throttled);
-        let d = t.update_impl(&[make_process(1, "blender", 3_500_000, 10.0, 0)], u64::MAX, &p_fast());
+        let d = t.update(&[make_process(1, "blender", 3_500_000, 10.0, 0)], u64::MAX, &p_fast());
         assert!(d.iter().any(|x| matches!(x, SpikeDecision::RestoreThrottle { .. })));
         assert!(!t.spikes.get(&1).unwrap().cpu_throttled);
     }
@@ -613,7 +612,7 @@ mod tests {
         // Only 1 sample with default min_samples=6 → Observing
         let params = Params { min_rss_kb: 0, cpu_threshold_pct: 80.0, ..p() };
         let mut t = SpikeTracker::new();
-        let d = t.update_impl(&[make_process(1, "blender", 600_000, 95.0, 0)], u64::MAX, &params);
+        let d = t.update(&[make_process(1, "blender", 600_000, 95.0, 0)], u64::MAX, &params);
         assert!(!d.iter().any(|x| matches!(x, SpikeDecision::ThrottleSpike { .. })));
     }
 
@@ -651,7 +650,7 @@ mod tests {
         // 3 samples (< 6): oscillation seen but not enough samples
         let mut t = feed(1, "cargo", &[500_000, 4_200_000, 3_500_000], &params);
         assert_eq!(t.spikes.get(&1).unwrap().phase, SpikePhase::Observing);
-        let d = t.update_impl(&[make_process(1, "cargo", 3_500_000, 0.0, 0)], 0, &params);
+        let d = t.update(&[make_process(1, "cargo", 3_500_000, 0.0, 0)], 0, &params);
         assert!(d.is_empty());
     }
 
@@ -668,7 +667,7 @@ mod tests {
             make_process(2, "blender", 3_000_000, 0.0, 0),
         ];
         // available < 4_000_000 + 3_000_000 = 7_000_000 → freeze
-        let d = t.update_impl(&procs, 6_000_000, &params);
+        let d = t.update(&procs, 6_000_000, &params);
         assert!(d.iter().any(|x| matches!(x, SpikeDecision::FreezeForHeadroom { .. })));
     }
 
@@ -721,7 +720,7 @@ mod tests {
             exclude: vec![&excl], ..p()
         };
         let mut t = SpikeTracker::new();
-        t.update_impl(&[make_process(1, "blender", 10_000_000, 0.0, 9999)], 0, &params);
+        t.update(&[make_process(1, "blender", 10_000_000, 0.0, 9999)], 0, &params);
         assert!(t.spikes.is_empty());
     }
 
@@ -741,7 +740,7 @@ mod tests {
         assert!(s.force_included);
         assert_eq!(s.phase, SpikePhase::Observing);
         // No decisions at Observing
-        let d = t.update_impl(&[make_process(1, "plasmashell", 400_000, 0.0, 0)], 0, &params);
+        let d = t.update(&[make_process(1, "plasmashell", 400_000, 0.0, 0)], 0, &params);
         assert!(d.is_empty());
     }
 
@@ -752,7 +751,7 @@ mod tests {
         let rss_max = t.spikes.get(&1).unwrap().rss_max_kb;
         let required = (rss_max as f64 * 1.25) as u64;
         let available = required.saturating_sub(500_000);
-        let d = t.update_impl(&[make_process(1, "cargo", 3_500_000, 0.0, 0)], available, &p_fast());
+        let d = t.update(&[make_process(1, "cargo", 3_500_000, 0.0, 0)], available, &p_fast());
         let SpikeDecision::FreezeForHeadroom { needed_kb } = d.into_iter().next().unwrap() else {
             panic!("expected FreezeForHeadroom");
         };
@@ -770,12 +769,12 @@ mod tests {
         };
         let mut t = SpikeTracker::new();
         // Cycle 1: cumulative majflt=50, no prev → delta=0, below threshold → not tracked
-        t.update_impl(&[make_process(1, "ld", 600_000, 0.0, 50)], u64::MAX, &params);
+        t.update(&[make_process(1, "ld", 600_000, 0.0, 50)], u64::MAX, &params);
         assert!(t.spikes.is_empty(), "delta=0 on first observation, should not track");
         assert_eq!(*t.prev_majflt.get(&1).unwrap(), 50, "prev_majflt must be updated");
 
         // Cycle 2: cumulative=250, delta=200 > 100 → should track now
-        t.update_impl(&[make_process(1, "ld", 600_000, 0.0, 250)], u64::MAX, &params);
+        t.update(&[make_process(1, "ld", 600_000, 0.0, 250)], u64::MAX, &params);
         assert!(!t.spikes.is_empty(), "delta=200>100 should trigger tracking");
         assert_eq!(*t.prev_majflt.get(&1).unwrap(), 250);
     }

@@ -35,7 +35,9 @@ pub fn run(
             Ok(p) => p,
             Err(_) => { thread::sleep(Duration::from_secs(3)); continue; }
         };
-        if monitor::psi::pressure_level(&pressure) != monitor::psi::PressureLevel::Normal {
+        // Cycle-scoped config snapshot (only the [psi] thresholds are needed).
+        let cfg = crate::config::get();
+        if monitor::psi::pressure_level_with(&pressure, &cfg.psi) != monitor::psi::PressureLevel::Normal {
             thread::sleep(Duration::from_secs(3));
             continue;
         }

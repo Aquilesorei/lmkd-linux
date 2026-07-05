@@ -7,6 +7,7 @@ use std::time::Duration;
 use mgd_common::util::unix_timestamp_secs;
 
 
+use crate::config::CompiledConfig;
 use crate::engine::decision::{Action, Decision, plan, get_priority};
 use crate::executor::registry::{FrozenRegistry, CheckpointRegistry};
 use mgd_common::logger::{LogAction, Logger};
@@ -246,7 +247,7 @@ pub fn run(
     let mut psi_elevated_pct = crate::config::get().psi.elevated_pct;
     let mut psi_subprocess = monitor::psi::PsiSubprocess::new(psi_elevated_pct);
     let mut psi_trigger = if psi_subprocess.is_none() {
-        monitor::psi::PsiTrigger::new().ok()
+        monitor::psi::PsiTrigger::new(psi_elevated_pct).ok()
     } else {
         None
     };
@@ -292,15 +293,19 @@ pub fn run(
         if crate::should_reload() {
             crate::config::reload();
             crate::plugin_server::broadcast_config_reload();
-            // Respawn PSI subprocess if elevated_pct changed (new threshold needs
-            // a fresh fd — the kernel trigger can't be re-armed on an existing fd).
-            let new_pct = crate::config::get().psi.elevated_pct;
-            if (new_pct - psi_elevated_pct).abs() > 0.001 {
-                psi_elevated_pct = new_pct;
-                psi_subprocess = monitor::psi::PsiSubprocess::new(psi_elevated_pct);
-                if psi_subprocess.is_some() {
-                    mgd_common::sync_print!("[responder] PSI trigger respawned at elevated_pct={:.1}%.", psi_elevated_pct);
-                }
+        }
+
+        // One config snapshot per cycle (cheap Arc clone, no lock held);
+        // a reload swaps the global and is picked up here next iteration.
+        let cfg = crate::config::get();
+
+        // Respawn PSI subprocess if elevated_pct changed on reload (new threshold
+        // needs a fresh fd — the kernel trigger can't be re-armed on an existing fd).
+        if (cfg.psi.elevated_pct - psi_elevated_pct).abs() > 0.001 {
+            psi_elevated_pct = cfg.psi.elevated_pct;
+            psi_subprocess = monitor::psi::PsiSubprocess::new(psi_elevated_pct);
+            if psi_subprocess.is_some() {
+                mgd_common::sync_print!("[responder] PSI trigger respawned at elevated_pct={:.1}%.", psi_elevated_pct);
             }
         }
 
@@ -312,7 +317,7 @@ pub fn run(
                 match sub.wait(5000) {
                     monitor::psi::WaitResult::Event => false,
                     monitor::psi::WaitResult::Timeout => {
-                        idle_timeout_reclaim(&frozen, &spike_tracker, &log,
+                        idle_timeout_reclaim(&cfg, &frozen, &spike_tracker, &log,
                             &mut idle_reclaim_pid_tracker, &mut idle_freeze_pid_tracker,
                             &mut last_idle_reclaim_check);
                         continue; // no pressure event → skip full cycle
@@ -321,7 +326,7 @@ pub fn run(
                 }
             } else if let Some(trigger) = &psi_trigger {
                 if !trigger.wait(5000) {
-                    idle_timeout_reclaim(&frozen, &spike_tracker, &log,
+                    idle_timeout_reclaim(&cfg, &frozen, &spike_tracker, &log,
                         &mut idle_reclaim_pid_tracker, &mut idle_freeze_pid_tracker,
                         &mut last_idle_reclaim_check);
                     continue;
@@ -340,7 +345,7 @@ pub fn run(
                 mgd_common::sync_print!("[psi] mgd-psi-trigger exited — attempting respawn");
                 psi_subprocess = monitor::psi::PsiSubprocess::new(psi_elevated_pct);
                 if psi_subprocess.is_none() && psi_trigger.is_none() {
-                    psi_trigger = monitor::psi::PsiTrigger::new().ok();
+                    psi_trigger = monitor::psi::PsiTrigger::new(psi_elevated_pct).ok();
                     if let Some(t) = &psi_trigger {
                         mgd_common::sync_print!("[psi] subprocess respawn failed — fell back to epoll trigger on {}", t.source);
                     }
@@ -413,7 +418,7 @@ pub fn run(
         // Hibernate last-resort: if Emergency sustained beyond threshold (disabled by default)
         if effective_level >= PressureLevel::Emergency {
             let start = sustained_emergency_start.get_or_insert(now);
-            let threshold = crate::config::get().emergency_hibernate_after_sec;
+            let threshold = cfg.emergency_hibernate_after_sec;
             if !hibernate_triggered && threshold > 0 && now.duration_since(*start).as_secs() >= threshold {
                 hibernate_triggered = true;
                 mgd_common::sync_print!(
@@ -442,10 +447,9 @@ pub fn run(
         }
 
         // Background CPU Throttling and Idle cgroup reclaim manager
-        let config = crate::config::get();
         let active_pid = crate::plugin_server::get_active_foreground_pid();
         let now_inst = std::time::Instant::now();
-        let idle_reclaim_interval_elapsed = now_inst.duration_since(last_idle_reclaim_check).as_secs() >= config.idle_reclaim_global_cooldown_sec;
+        let idle_reclaim_interval_elapsed = now_inst.duration_since(last_idle_reclaim_check).as_secs() >= cfg.idle_reclaim_global_cooldown_sec;
         let active_pid_changed = active_pid != last_active_pid;
 
         if active_pid_changed || idle_reclaim_interval_elapsed {
@@ -486,17 +490,16 @@ pub fn run(
                 .collect();
 
             // Update CPU throttling (tiered, debounced) — only at Elevated+ pressure
-            let throttle_exclude = crate::config::get().throttle_exclude.clone();
-            throttle.update(&plan_procs, active_pid, effective_level >= PressureLevel::Elevated, &throttle_exclude);
+            throttle.update(&plan_procs, active_pid, effective_level >= PressureLevel::Elevated, &cfg);
             *throttle_snapshot.lock().unwrap() = throttle.snapshot();
 
             // Cap memory.max on expendable background cgroups at High+ pressure
-            memcap.update(&plan_procs, active_pid, &effective_level);
+            memcap.update(&plan_procs, active_pid, &effective_level, &cfg);
 
             // Idle cgroup reclaim: only runs at Normal/Calm pressure
             if effective_level == PressureLevel::Normal
-                && config.idle_reclaim_enabled {
-                    check_idle_process_reclaim(&plan_procs, active_pid, &mut idle_reclaim_pid_tracker, &mut idle_freeze_pid_tracker, &frozen, &log);
+                && cfg.idle_reclaim_enabled {
+                    check_idle_process_reclaim(&cfg, &plan_procs, active_pid, &mut idle_reclaim_pid_tracker, &mut idle_freeze_pid_tracker, &frozen, &log);
                 }
         }
 
@@ -506,7 +509,7 @@ pub fn run(
         }
 
         // ── Spike mode: runs every cycle, even at Normal PSI ─────────────────
-        run_spike_cycle(&mut spike_tracker, &frozen, &log, meminfo.available_kb, &spike_snapshot);
+        run_spike_cycle(&cfg, &mut spike_tracker, &frozen, &log, meminfo.available_kb, &spike_snapshot);
 
         if effective_level == PressureLevel::Normal {
             continue;
@@ -515,13 +518,13 @@ pub fn run(
         let mut procs = monitor::process::list_processes();
         procs.sort_by_key(|p| std::cmp::Reverse(p.rss_kb));
 
-        print_status(&pressure, &effective_level, &procs, &meminfo, &frozen);
+        print_status(&pressure, &effective_level, &procs, &meminfo, &frozen, &cfg);
 
         crate::plugin_server::broadcast_pressure(&effective_level.to_string());
 
         // System pre-actions run before plan() so their freed RAM shrinks the
         // deficit. zram compact (cheaper) first, then cache drop.
-        compact_zram(&effective_level, &log);
+        compact_zram(&effective_level, &log, &cfg);
 
         // Cleanup expired recently killed cgroups (cooldown = 45s)
         let now_inst = std::time::Instant::now();
@@ -548,10 +551,10 @@ pub fn run(
             .collect();
 
         let active_pid = crate::plugin_server::get_active_foreground_pid();
-        check_early_process_reclaim(&effective_level, &plan_procs, active_pid, &log);
-        check_cache_drop(&effective_level, &log);
+        check_early_process_reclaim(&effective_level, &plan_procs, active_pid, &log, &cfg);
+        check_cache_drop(&effective_level, &log, &cfg);
 
-        let decisions = plan(&effective_level, &plan_procs, meminfo.available_kb, meminfo.total_kb, swap_exhausted);
+        let decisions = plan(&effective_level, &plan_procs, meminfo.available_kb, meminfo.total_kb, swap_exhausted, &cfg);
         if decisions.is_empty() {
             mgd_common::sync_print!("✓ No action needed.");
         } else {
@@ -601,6 +604,7 @@ pub fn run(
 /// cgroup reclaim on its cooldown. Shared by the subprocess and direct-trigger
 /// wait paths; the caller `continue`s afterwards to skip the full cycle.
 fn idle_timeout_reclaim(
+    cfg: &CompiledConfig,
     frozen: &Arc<Mutex<FrozenRegistry>>,
     spike_tracker: &crate::spike_mode::SpikeTracker,
     log: &Logger,
@@ -608,13 +612,12 @@ fn idle_timeout_reclaim(
     idle_freeze_pid_tracker: &mut HashMap<u32, std::time::Instant>,
     last_idle_reclaim_check: &mut std::time::Instant,
 ) {
-    let config = crate::config::get();
-    if !config.idle_reclaim_enabled {
+    if !cfg.idle_reclaim_enabled {
         return;
     }
     let now_inst = std::time::Instant::now();
     if now_inst.duration_since(*last_idle_reclaim_check).as_secs()
-        < config.idle_reclaim_global_cooldown_sec
+        < cfg.idle_reclaim_global_cooldown_sec
     {
         return;
     }
@@ -628,7 +631,7 @@ fn idle_timeout_reclaim(
         procs.iter().filter(|p| !frozen_set.contains(&p.pid)).collect();
     let active_pid = crate::plugin_server::get_active_foreground_pid();
     check_idle_process_reclaim(
-        &plan_procs, active_pid,
+        cfg, &plan_procs, active_pid,
         idle_reclaim_pid_tracker, idle_freeze_pid_tracker,
         frozen, log,
     );
@@ -639,6 +642,7 @@ fn idle_timeout_reclaim(
 /// spike exit detection and proactive headroom management are independent of
 /// reactive eviction and must not be gated by the Normal continue.
 fn run_spike_cycle(
+    cfg: &CompiledConfig,
     spike_tracker: &mut crate::spike_mode::SpikeTracker,
     frozen: &Arc<Mutex<FrozenRegistry>>,
     log: &Logger,
@@ -683,7 +687,7 @@ fn run_spike_cycle(
     }
 
     // Release victims that have been frozen beyond max_victim_freeze_sec
-    let max_secs = crate::config::get().spike_max_victim_freeze_sec;
+    let max_secs = cfg.spike_max_victim_freeze_sec;
     for v in spike_tracker.drain_timed_out_victims(max_secs) {
         let r = crate::executor::freezer::unfreeze_checked(v.pid, v.start_time);
         if r.success {
@@ -709,7 +713,12 @@ fn run_spike_cycle(
     }
 
     // Update tracker and execute decisions
-    for decision in spike_tracker.update(&spike_procs, available_kb) {
+    let spike_decisions = if cfg.spike_mode_enabled {
+        spike_tracker.update(&spike_procs, available_kb, &crate::spike_mode::Params::from_config(cfg))
+    } else {
+        vec![]
+    };
+    for decision in spike_decisions {
         match decision {
             crate::spike_mode::SpikeDecision::FreezeForHeadroom { needed_kb } => {
                 let spike_pids  = spike_tracker.spike_pids();
@@ -720,15 +729,14 @@ fn run_spike_cycle(
                     .chain(victim_pids.iter().copied())
                     .collect();
                 // Highest-priority (most expendable) first, then largest RSS
-                let spike_cfg = crate::config::get();
                 let mut candidates: Vec<&Process> = spike_procs.iter()
                     .filter(|p| !exclude.contains(&p.pid))
-                    .filter(|p| get_priority(&p.name, p.exe_basename.as_deref()) >= 60)
-                    .filter(|p| !spike_cfg.spike_victim_exclude.iter().any(|re| re.is_match(&p.name)))
+                    .filter(|p| get_priority(&p.name, p.exe_basename.as_deref(), cfg) >= 60)
+                    .filter(|p| !cfg.spike_victim_exclude.iter().any(|re| re.is_match(&p.name)))
                     .collect();
                 candidates.sort_by(|a, b| {
-                    let pa = get_priority(&a.name, a.exe_basename.as_deref());
-                    let pb = get_priority(&b.name, b.exe_basename.as_deref());
+                    let pa = get_priority(&a.name, a.exe_basename.as_deref(), cfg);
+                    let pb = get_priority(&b.name, b.exe_basename.as_deref(), cfg);
                     pb.cmp(&pa).then(b.rss_kb.cmp(&a.rss_kb))
                 });
                 let mut needed = needed_kb;
@@ -759,7 +767,7 @@ fn run_spike_cycle(
                 }
             }
             crate::spike_mode::SpikeDecision::ThrottleSpike { spike_pid, cgroup_path } => {
-                let weight = crate::config::get().spike_throttled_cpu_weight;
+                let weight = cfg.spike_throttled_cpu_weight;
                 let _ = crate::throttle::write_cgroup_cpu_weight(&cgroup_path, weight);
                 mgd_common::sync_print!("[spike] Throttled PID {} cpu.weight={}", spike_pid, weight);
             }
@@ -891,6 +899,7 @@ pub(crate) fn select_idle_candidates(
     background_tracker: &std::collections::HashMap<u32, std::time::Instant>,
     swap_used_pct: f64,
     cfg: &IdleReclaimConfig,
+    config: &CompiledConfig,
 ) -> Vec<(u32, u64)> {
     if swap_used_pct > cfg.max_swap_occupancy_pct {
         return vec![];
@@ -900,7 +909,7 @@ pub(crate) fn select_idle_candidates(
         if Some(p.pid) == active_pid {
             continue;
         }
-        let prio = crate::engine::decision::get_priority(&p.name, p.exe_basename.as_deref());
+        let prio = crate::engine::decision::get_priority(&p.name, p.exe_basename.as_deref(), config);
         let duration = background_tracker
             .get(&p.pid)
             .map(|t| t.elapsed().as_secs())
@@ -925,21 +934,17 @@ pub(crate) fn select_idle_candidates(
 /// Compact zram at Elevated+ to free fragmented pages before touching a process.
 /// No-op unless `[zram] compact_on_elevated = true`; skips pools < `min_used_mb`.
 /// EACCES (grant absent) disables the feature for the session.
-fn compact_zram(level: &PressureLevel, log: &Logger) {
+fn compact_zram(level: &PressureLevel, log: &Logger, cfg: &CompiledConfig) {
     if *level < PressureLevel::Elevated {
         return;
     }
     if ZRAM_COMPACT_DISABLED.load(Ordering::Relaxed) {
         return;
     }
-
-    let (enabled, min_used_mb) = {
-        let cfg = crate::config::get();
-        (cfg.compact_zram_on_elevated, cfg.zram_min_used_mb)
-    };
-    if !enabled {
+    if !cfg.compact_zram_on_elevated {
         return;
     }
+    let min_used_mb = cfg.zram_min_used_mb;
 
     for device in crate::monitor::zram::zram_devices() {
         // Gate before compacting; skip a device whose used-RAM is unreadable.
@@ -977,22 +982,17 @@ fn compact_zram(level: &PressureLevel, log: &Logger) {
 
 /// Drop page cache for configured trees at the trigger level+, before freezing.
 /// No-op unless `[cache_drop] enabled` with non-empty `paths`. Cooldown-gated.
-fn check_cache_drop(level: &PressureLevel, log: &Logger) {
-    let (trigger, cooldown_secs, paths) = {
-        let cfg = crate::config::get();
-        if !cfg.cache_drop_enabled || cfg.cache_drop_paths.is_empty() {
-            return;
-        }
-        (cfg.cache_drop_trigger.clone(), cfg.cache_drop_cooldown_secs, cfg.cache_drop_paths.clone())
-    };
-
-    if *level < trigger {
+fn check_cache_drop(level: &PressureLevel, log: &Logger, cfg: &CompiledConfig) {
+    if !cfg.cache_drop_enabled || cfg.cache_drop_paths.is_empty() {
+        return;
+    }
+    if *level < cfg.cache_drop_trigger {
         return;
     }
 
     let now = unix_timestamp_secs();
     let last = LAST_CACHE_DROP.load(Ordering::Relaxed);
-    if last != 0 && now.saturating_sub(last) < cooldown_secs {
+    if last != 0 && now.saturating_sub(last) < cfg.cache_drop_cooldown_secs {
         return;
     }
     // Arm up-front: the walk is the cost being rate-limited.
@@ -1000,7 +1000,7 @@ fn check_cache_drop(level: &PressureLevel, log: &Logger) {
 
     let mut total_files = 0usize;
     let mut total_bytes = 0u64;
-    for r in crate::monitor::cache::drop_caches(&paths) {
+    for r in crate::monitor::cache::drop_caches(&cfg.cache_drop_paths) {
         if r.files_advised > 0 {
             log.log(LogAction::Cache, 0, &r.pattern,
                 (r.bytes_advised / (1024 * 1024)) as f64,
@@ -1022,6 +1022,7 @@ fn print_status(
     procs: &[monitor::process::Process],
     meminfo: &MemInfo,
     frozen: &Arc<Mutex<FrozenRegistry>>,
+    cfg: &CompiledConfig,
 ) {
     let (total_rss, _) = procs.iter()
         .fold((0u64, 0u64), |(r, s), p| (r.saturating_add(p.rss_kb), s.saturating_add(p.swap_kb)));
@@ -1048,7 +1049,7 @@ fn print_status(
             p.rss_kb as f64 / 1024.0,
             p.swap_kb as f64 / 1024.0,
             p.oom_score,
-            get_priority(&p.name, p.exe_basename.as_deref()),
+            get_priority(&p.name, p.exe_basename.as_deref(), cfg),
             marker,
         );
     }
@@ -1180,6 +1181,7 @@ fn check_early_process_reclaim(
     plan_procs: &[&Process],
     active_pid: Option<u32>,
     log: &Logger,
+    cfg: &CompiledConfig,
 ) {
     if *level != PressureLevel::Elevated {
         return;
@@ -1208,7 +1210,7 @@ fn check_early_process_reclaim(
             p.rss_kb > 20_000
                 && Some(p.pid) != active_pid
                 && {
-                    let prio = get_priority(&p.name, p.exe_basename.as_deref());
+                    let prio = get_priority(&p.name, p.exe_basename.as_deref(), cfg);
                     (50..60).contains(&prio)
                 }
         })
@@ -1247,6 +1249,7 @@ fn check_early_process_reclaim(
 }
 
 fn check_idle_process_reclaim(
+    cfg: &CompiledConfig,
     plan_procs: &[&Process],
     active_pid: Option<u32>,
     pid_tracker: &mut HashMap<u32, std::time::Instant>,
@@ -1254,7 +1257,6 @@ fn check_idle_process_reclaim(
     frozen: &Arc<Mutex<FrozenRegistry>>,
     log: &Logger,
 ) {
-    let config = crate::config::get();
     let meminfo = crate::monitor::meminfo::read_meminfo();
 
     let swap_used_pct = if meminfo.swap_total_kb > 0 {
@@ -1274,16 +1276,16 @@ fn check_idle_process_reclaim(
 
     // Delegate candidate selection to the pure helper
     let idle_cfg = IdleReclaimConfig {
-        max_swap_occupancy_pct: config.idle_reclaim_max_swap_occupancy_pct,
-        idle_sec: config.idle_reclaim_sec,
-        rss_min_mb: config.idle_reclaim_rss_min_mb,
-        reclaim_pct: config.idle_reclaim_pct,
-        important_enabled: config.idle_reclaim_important_enabled,
-        important_min_priority: config.idle_reclaim_important_min_priority,
-        important_idle_sec: config.idle_reclaim_important_idle_sec,
-        important_pct: config.idle_reclaim_important_pct,
+        max_swap_occupancy_pct: cfg.idle_reclaim_max_swap_occupancy_pct,
+        idle_sec: cfg.idle_reclaim_sec,
+        rss_min_mb: cfg.idle_reclaim_rss_min_mb,
+        reclaim_pct: cfg.idle_reclaim_pct,
+        important_enabled: cfg.idle_reclaim_important_enabled,
+        important_min_priority: cfg.idle_reclaim_important_min_priority,
+        important_idle_sec: cfg.idle_reclaim_important_idle_sec,
+        important_pct: cfg.idle_reclaim_important_pct,
     };
-    let candidates = select_idle_candidates(plan_procs, active_pid, pid_tracker, swap_used_pct, &idle_cfg);
+    let candidates = select_idle_candidates(plan_procs, active_pid, pid_tracker, swap_used_pct, &idle_cfg, cfg);
 
     // Start the background clock for all eligible processes not yet tracked
     for p in plan_procs {
@@ -1340,12 +1342,12 @@ fn check_idle_process_reclaim(
     // Uses a PID-keyed tracker so duplicate process names don't share timers.
     freeze_pid_tracker.retain(|pid, _| live_pids.contains(pid));
 
-    if let Some(freeze_secs) = config.idle_reclaim_freeze_after_sec {
+    if let Some(freeze_secs) = cfg.idle_reclaim_freeze_after_sec {
         let mut freeze_count = 0;
         for p in plan_procs {
             if freeze_count >= 2 { break; }
             if Some(p.pid) == active_pid { continue; }
-            if p.rss_kb < config.idle_reclaim_rss_min_mb * 1024 { continue; }
+            if p.rss_kb < cfg.idle_reclaim_rss_min_mb * 1024 { continue; }
 
             let elapsed = freeze_pid_tracker
                 .entry(p.pid)
@@ -1384,7 +1386,11 @@ mod tests {
     use crate::monitor::psi::PressureLevel;
     use crate::monitor::process::Process;
     use std::collections::HashMap;
+    use std::sync::LazyLock;
     use std::time::{Duration, Instant};
+
+    /// Shared fixture — compiled once (the .desktop scan is not free).
+    static CFG: LazyLock<CompiledConfig> = LazyLock::new(crate::config::test_config);
 
     fn make_process(pid: u32, name: &str, rss_kb: u64) -> Process {
         Process {
@@ -1624,42 +1630,42 @@ mod tests {
     #[test]
     fn idle_reclaim_skips_foreground_pid() {
         let p = make_process(1234, "firefox", 200_000);
-        let r = select_idle_candidates(&[&p], Some(1234), &make_pid_tracker(1234, 300), 10.0, &default_idle_cfg());
+        let r = select_idle_candidates(&[&p], Some(1234), &make_pid_tracker(1234, 300), 10.0, &default_idle_cfg(), &CFG);
         assert!(r.is_empty());
     }
 
     #[test]
     fn idle_reclaim_skips_rss_below_minimum() {
         let p = make_process(5678, "app", 40 * 1024); // 40 MB < 50 MB min
-        let r = select_idle_candidates(&[&p], None, &make_pid_tracker(5678, 300), 10.0, &default_idle_cfg());
+        let r = select_idle_candidates(&[&p], None, &make_pid_tracker(5678, 300), 10.0, &default_idle_cfg(), &CFG);
         assert!(r.is_empty());
     }
 
     #[test]
     fn idle_reclaim_skips_swap_saturated() {
         let p = make_process(5678, "app", 200_000);
-        let r = select_idle_candidates(&[&p], None, &make_pid_tracker(5678, 300), 61.0, &default_idle_cfg());
+        let r = select_idle_candidates(&[&p], None, &make_pid_tracker(5678, 300), 61.0, &default_idle_cfg(), &CFG);
         assert!(r.is_empty());
     }
 
     #[test]
     fn idle_reclaim_skips_not_yet_idle() {
         let p = make_process(5678, "app", 200_000);
-        let r = select_idle_candidates(&[&p], None, &make_pid_tracker(5678, 100), 10.0, &default_idle_cfg());
+        let r = select_idle_candidates(&[&p], None, &make_pid_tracker(5678, 100), 10.0, &default_idle_cfg(), &CFG);
         assert!(r.is_empty());
     }
 
     #[test]
     fn idle_reclaim_skips_not_in_tracker() {
         let p = make_process(5678, "app", 200_000);
-        let r = select_idle_candidates(&[&p], None, &HashMap::<u32, Instant>::new(), 10.0, &default_idle_cfg());
+        let r = select_idle_candidates(&[&p], None, &HashMap::<u32, Instant>::new(), 10.0, &default_idle_cfg(), &CFG);
         assert!(r.is_empty());
     }
 
     #[test]
     fn idle_reclaim_selects_eligible() {
         let p = make_process(5678, "app", 200_000);
-        let r = select_idle_candidates(&[&p], None, &make_pid_tracker(5678, 300), 10.0, &default_idle_cfg());
+        let r = select_idle_candidates(&[&p], None, &make_pid_tracker(5678, 300), 10.0, &default_idle_cfg(), &CFG);
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].0, 5678);
         assert_eq!(r[0].1, 40_000 * 1024); // 20% of 200_000 KB * 1024
@@ -1671,7 +1677,7 @@ mod tests {
         let p2 = make_process(200, "app_b", 150_000);
         let mut tracker = make_pid_tracker(100, 300);
         tracker.insert(200, Instant::now() - Duration::from_secs(250));
-        let r = select_idle_candidates(&[&p1, &p2], None, &tracker, 10.0, &IdleReclaimConfig { max_swap_occupancy_pct: 60.0, idle_sec: 180, rss_min_mb: 50, reclaim_pct: 10, important_enabled: false, important_min_priority: 20, important_idle_sec: 300, important_pct: 10 });
+        let r = select_idle_candidates(&[&p1, &p2], None, &tracker, 10.0, &IdleReclaimConfig { max_swap_occupancy_pct: 60.0, idle_sec: 180, rss_min_mb: 50, reclaim_pct: 10, important_enabled: false, important_min_priority: 20, important_idle_sec: 300, important_pct: 10 }, &CFG);
         assert_eq!(r.len(), 2);
         let pids: Vec<u32> = r.iter().map(|(pid, _)| *pid).collect();
         assert!(pids.contains(&100));

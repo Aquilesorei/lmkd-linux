@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use crate::config::CompiledConfig;
 use crate::monitor::process::Process;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -21,7 +22,8 @@ impl ThrottleManager {
         }
     }
 
-    pub(crate) fn update(&mut self, plan_procs: &[&Process], active_pid: Option<u32>, active: bool, exclude: &[regex::Regex]) {
+    pub(crate) fn update(&mut self, plan_procs: &[&Process], active_pid: Option<u32>, active: bool, cfg: &CompiledConfig) {
+        let exclude = &cfg.throttle_exclude;
         if !active {
             for path in self.states.keys() {
                 restore_cgroup_cpu(path);
@@ -62,7 +64,7 @@ impl ThrottleManager {
             let mut min_priority = 100u8;
             let mut debug_name = String::new();
             for p in processes {
-                let prio = crate::engine::decision::get_priority(&p.name, p.exe_basename.as_deref());
+                let prio = crate::engine::decision::get_priority(&p.name, p.exe_basename.as_deref(), cfg);
                 if prio < min_priority {
                     min_priority = prio;
                     debug_name = p.name.clone();
@@ -209,6 +211,7 @@ impl MemCapManager {
         plan_procs: &[&Process],
         active_pid: Option<u32>,
         level: &crate::monitor::psi::PressureLevel,
+        cfg: &CompiledConfig,
     ) {
         use crate::monitor::psi::PressureLevel;
         if *level < PressureLevel::High {
@@ -220,7 +223,7 @@ impl MemCapManager {
         let mut cgroup_groups: HashMap<String, (u8, u64)> = HashMap::new();
         for p in plan_procs {
             if let Some(path) = p.cgroup_path.as_ref() {
-                let prio = crate::engine::decision::get_priority(&p.name, p.exe_basename.as_deref());
+                let prio = crate::engine::decision::get_priority(&p.name, p.exe_basename.as_deref(), cfg);
                 let entry = cgroup_groups.entry(path.clone()).or_insert((100u8, 0u64));
                 entry.0 = entry.0.min(prio);
                 entry.1 = entry.1.saturating_add(p.rss_kb);

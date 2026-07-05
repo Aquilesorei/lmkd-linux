@@ -4,26 +4,39 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
-// Hot-reloadable config: wrapped in an Arc<RwLock> so SIGHUP can swap it.
-static CONFIG: std::sync::OnceLock<Arc<RwLock<CompiledConfig>>> = std::sync::OnceLock::new();
+// Hot-reloadable config: RwLock'd Arc so SIGHUP can swap it while readers
+// keep their cycle-scoped snapshot.
+static CONFIG: std::sync::OnceLock<RwLock<Arc<CompiledConfig>>> = std::sync::OnceLock::new();
 
 const BUILTIN_CONFIG: &str = include_str!("../../config/priorities.toml");
 
-pub fn get_arc() -> &'static Arc<RwLock<CompiledConfig>> {
-    CONFIG.get_or_init(|| Arc::new(RwLock::new(load())))
+fn config_cell() -> &'static RwLock<Arc<CompiledConfig>> {
+    CONFIG.get_or_init(|| RwLock::new(Arc::new(load())))
 }
 
-/// Convenience wrapper — borrows a read guard long enough for a single call.
-/// Most callers use this.
-pub fn get() -> std::sync::RwLockReadGuard<'static, CompiledConfig> {
-    get_arc().read().unwrap()
+/// Snapshot of the current config — a cheap Arc clone; no lock is held after
+/// return, so the snapshot may live across blocking work. Called once per
+/// cycle/request at composition roots (thread loop tops, IPC dispatch, main);
+/// everything below receives `&CompiledConfig`. After a reload the next
+/// snapshot sees the new config.
+pub fn get() -> Arc<CompiledConfig> {
+    config_cell().read().unwrap().clone()
 }
 
 /// Reload config from disk (called when SIGHUP received).
 pub fn reload() {
-    let new_cfg = load();
-    *get_arc().write().unwrap() = new_cfg;
+    let new_cfg = Arc::new(load());
+    *config_cell().write().unwrap() = new_cfg;
     mgd_common::output::locked_eprint("[config] Reloaded.");
+}
+
+/// Deterministic fixture for unit tests: built-in TOML with a fixed 15% target
+/// (the RAM-scaled fallback would depend on the test machine's RAM).
+#[cfg(test)]
+pub(crate) fn test_config() -> CompiledConfig {
+    let mut cfg = compile(BUILTIN_CONFIG).expect("built-in config must be valid");
+    cfg.target_available_pct = 15.0;
+    cfg
 }
 
 // ── raw TOML structs ─────────────────────────────────────────────────────────

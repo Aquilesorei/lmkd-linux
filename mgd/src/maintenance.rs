@@ -60,11 +60,14 @@ pub fn run(
 
         crate::plugin_server::check_and_restart_plugins();
 
+        // One config snapshot per cycle; everything below borrows it.
+        let cfg = crate::config::get();
+
         let pressure = monitor::psi::read_pressure().ok();
         // A PSI read error counts as not-calm.
         let calm = pressure
             .as_ref()
-            .map(|p| monitor::psi::pressure_level(p) == PressureLevel::Normal)
+            .map(|p| monitor::psi::pressure_level_with(p, &cfg.psi) == PressureLevel::Normal)
             .unwrap_or(false);
 
         // Check if evictor signalled that kills freed headroom.
@@ -78,10 +81,10 @@ pub fn run(
 
         let cycle_start = Instant::now();
         if calm {
-            check_auto_kill_idle(&mut auto_kill_last_active, &frozen, &log);
+            check_auto_kill_idle(&mut auto_kill_last_active, &frozen, &log, &cfg);
 
             if let Some(p) = pressure.as_ref() {
-                check_proactive_reclaim(p, &log, false);
+                check_proactive_reclaim(p, &log, false, &cfg);
 
                 
                 let intervention = frozen.lock().unwrap().count() > 0
@@ -97,13 +100,13 @@ pub fn run(
 
         if last_calibration_flush.elapsed().as_secs() >= CALIBRATION_FLUSH_SECS {
             last_calibration_flush = Instant::now();
-            flush_calibration(&calibrator, &log);
+            flush_calibration(&calibrator, &log, &cfg.psi);
         }
 
         if kill_triggered && !calm
             && let Some(p) = pressure.as_ref() {
                 mgd_common::sync_print!("[maintenance] Kill-triggered reclaim attempt (post-eviction headroom)");
-                check_proactive_reclaim(p, &log, true);
+                check_proactive_reclaim(p, &log, true, &cfg);
             }
 
         // Subtract time already spent (the idle sample) to hold the period at ~POLL_SECS.
@@ -140,7 +143,12 @@ pub fn load_calibrator() -> Calibrator {
 
 /// Persist aggregates if dirty, and (re)write the suggestion file once the
 /// data gates pass. Called periodically from the loop and at shutdown.
-pub fn flush_calibration(calibrator: &Arc<Mutex<Calibrator>>, log: &Logger) {
+/// `psi` comes from the caller's config snapshot (loop cycle or main).
+pub fn flush_calibration(
+    calibrator: &Arc<Mutex<Calibrator>>,
+    log: &Logger,
+    psi: &crate::monitor::psi::PsiThresholds,
+) {
     let (state_toml, suggestion) = {
         let mut cal = calibrator.lock().unwrap();
         if !cal.dirty() {
@@ -159,7 +167,7 @@ pub fn flush_calibration(calibrator: &Arc<Mutex<Calibrator>>, log: &Logger) {
     }
 
     let Some(s) = suggestion else { return };
-    let rendered = render_suggestion(&s, &crate::config::get().psi, now_secs());
+    let rendered = render_suggestion(&s, psi, now_secs());
     let sug_path = calibration_suggestion_path();
     // Rewrite only on change so the mtime stays meaningful and we log once
     // per actual revision, not every flush.
@@ -189,8 +197,8 @@ fn check_auto_kill_idle(
     last_active: &mut HashMap<(u32, u64), Instant>,
     frozen: &Arc<Mutex<FrozenRegistry>>,
     log: &Logger,
+    cfg: &crate::config::CompiledConfig,
 ) {
-    let cfg = crate::config::get();
     if cfg.auto_kill_rules.is_empty() {
         return;
     }
@@ -281,23 +289,17 @@ fn check_proactive_reclaim(
     pressure: &monitor::psi::MemoryPressure,
     log: &Logger,
     skip_calm_gate: bool,
+    cfg: &crate::config::CompiledConfig,
 ) {
-    let (enabled, threshold_pct, cooldown_secs, min_used_mb, headroom_mult) = {
-        let cfg = crate::config::get();
-        if !cfg.proactive_swap_reclaim {
-            return;
-        }
-        (
-            cfg.proactive_swap_reclaim,
-            cfg.reclaim_threshold_pct,
-            cfg.reclaim_cooldown_secs,
-            cfg.reclaim_min_zram_used_mb,
-            cfg.reclaim_headroom_mult,
-        )
-    };
-    if !enabled || RECLAIM_DISABLED.load(Ordering::Relaxed) {
+    if !cfg.proactive_swap_reclaim || RECLAIM_DISABLED.load(Ordering::Relaxed) {
         return;
     }
+    let (threshold_pct, cooldown_secs, min_used_mb, headroom_mult) = (
+        cfg.reclaim_threshold_pct,
+        cfg.reclaim_cooldown_secs,
+        cfg.reclaim_min_zram_used_mb,
+        cfg.reclaim_headroom_mult,
+    );
 
     if !skip_calm_gate && pressure.some_avg60 >= 5.0 {
         return;
