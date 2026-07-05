@@ -110,10 +110,11 @@ fn init_de_environment(){
     let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default().to_lowercase();
     if desktop.contains("kde") {
         spawn_plugin_binary("mgd-kde");
-    } else if desktop.contains("gnome") {
-        spawn_plugin_binary("mgd-gnome");
-    } else if desktop.contains("cosmic") {
-        spawn_plugin_binary("mgd-cosmic");
+    } else if desktop.contains("gnome") || desktop.contains("cosmic") {
+        // mgd-gnome / mgd-cosmic are todo!() scaffolds: they panic on startup and
+        // the watchdog would respawn them every 60s forever. Don't spawn until
+        // they're implemented.
+        mgd_common::sync_print!("[core] No working plugin for desktop '{}' yet — skipping", desktop);
     }
 }
 
@@ -243,11 +244,10 @@ pub fn serve_plugin_connection(
     // Spawn a writer thread to push CoreMessages to the socket
     thread::spawn(move || {
         while let Ok(msg) = rx.recv() {
-            if let Ok(json) = serde_json::to_string(&msg) {
-                if writeln!(writer, "{}", json).is_err() {
+            if let Ok(json) = serde_json::to_string(&msg)
+                && writeln!(writer, "{}", json).is_err() {
                     break;
                 }
-            }
         }
     });
 
@@ -268,11 +268,10 @@ fn process_plugin_line(line: &str, frozen: &Arc<Mutex<FrozenRegistry>>) {
         }
         PluginMessage::Observation { plugin: _, metric, pid, value } => {
             use mgd_common::protocol::Metric;
-            if let Some(p) = pid {
-                if matches!(metric, Metric::GpuResidentKb | Metric::GpuSharedKb | Metric::GpuTotalKb | Metric::GpuPurgeableKb) {
+            if let Some(p) = pid
+                && matches!(metric, Metric::GpuResidentKb | Metric::GpuSharedKb | Metric::GpuTotalKb | Metric::GpuPurgeableKb) {
                     set_gpu_observation(p, &metric, value as u64);
                 }
-            }
         }
         PluginMessage::ActionRequest { plugin, action, reason } => {
             mgd_common::sync_print!("[plugin] {} requested action {:?}: {}", plugin, action, reason);
@@ -282,14 +281,12 @@ fn process_plugin_line(line: &str, frozen: &Arc<Mutex<FrozenRegistry>>) {
 
             // Core could implement rate-limiting or policy checks here.
             // For now, we approve RestartProcess and KillPid natively.
-            match &action {
-                PluginAction::KillPid { pid } => {
-                    let pid = *pid;
-                    std::thread::spawn(move || {
-                        let _ = crate::executor::killer::sigterm(pid);
-                    });
-                }
-                _ => {} // Other actions (like RestartProcess) are delegated back to the plugin to execute
+            // Other actions (like RestartProcess) are delegated back to the plugin to execute.
+            if let PluginAction::KillPid { pid } = &action {
+                let pid = *pid;
+                std::thread::spawn(move || {
+                    let _ = crate::executor::killer::sigterm(pid);
+                });
             }
 
             // Send approval back so the plugin can execute its own specific logic (e.g. restarting a DE service)

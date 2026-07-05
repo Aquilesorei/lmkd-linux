@@ -18,7 +18,6 @@ use crate::executor::registry::{CheckpointRegistry, FrozenRegistry};
 use crate::monitor;
 use crate::monitor::psi::PressureLevel;
 use mgd_common::output::locked_print;
-use libc;
 
 const POLL_SECS: u64 = 60;
 
@@ -37,6 +36,11 @@ static LAST_RECLAIM: AtomicU64 = AtomicU64::new(0);
 
 /// Set once when the reclaim helper is absent/uncapped, to log only once.
 static RECLAIM_DISABLED: AtomicBool = AtomicBool::new(false);
+
+/// (last_reclaim_unix_secs, disabled_for_session) — read by `mgctl status`.
+pub(crate) fn reclaim_gate() -> (u64, bool) {
+    (LAST_RECLAIM.load(Ordering::Relaxed), RECLAIM_DISABLED.load(Ordering::Relaxed))
+}
 
 pub fn run(
     log: Arc<Logger>,
@@ -96,12 +100,11 @@ pub fn run(
             flush_calibration(&calibrator, &log);
         }
 
-        if kill_triggered && !calm {
-            if let Some(p) = pressure.as_ref() {
+        if kill_triggered && !calm
+            && let Some(p) = pressure.as_ref() {
                 mgd_common::sync_print!("[maintenance] Kill-triggered reclaim attempt (post-eviction headroom)");
                 check_proactive_reclaim(p, &log, true);
             }
-        }
 
         // Subtract time already spent (the idle sample) to hold the period at ~POLL_SECS.
         let spent = cycle_start.elapsed().as_secs();

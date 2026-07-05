@@ -122,6 +122,9 @@ impl Calibrator {
         &self.state
     }
 
+    // Takes &mut self: flushing serializes the state *and* clears the dirty flag,
+    // so callers can't forget to reset it after a successful write.
+    #[allow(clippy::wrong_self_convention)]
     pub fn to_toml(&mut self) -> String {
         self.dirty = false;
         toml::to_string(&self.state).unwrap_or_default()

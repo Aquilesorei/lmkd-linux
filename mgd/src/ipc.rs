@@ -169,7 +169,7 @@ fn dispatch(
     let arg = parts.get(1).copied().unwrap_or("").trim();
 
     match cmd {
-        "status"   => cmd_status(frozen, checkpointed, throttle_snapshot),
+        "status"   => cmd_status(frozen, checkpointed, throttle_snapshot, spike_snapshot),
         "list"     => cmd_list(frozen, checkpointed, throttle_snapshot),
         "ps"       => cmd_ps(frozen, throttle_snapshot),
         "events"   => cmd_events(event_log),
@@ -221,6 +221,7 @@ fn cmd_status(
     frozen: &Arc<Mutex<FrozenRegistry>>,
     checkpointed: &Arc<Mutex<CheckpointRegistry>>,
     throttle_snapshot: &ThrottleSnapshot,
+    spike_snapshot: &Arc<Mutex<crate::spike_mode::SpikeSnapshot>>,
 ) -> String {
     let pressure = monitor::psi::read_pressure()
         .map(|p| {
@@ -243,11 +244,60 @@ fn cmd_status(
         " | swap=none".to_string()
     };
 
-    ok(&format!(
+    let mut out = format!(
         "pressure={pressure} | avail={:.0}MB/{:.0}MB{swap_str} | frozen={frozen_count} | checkpointed={cp_count} | throttled={throttle_count}",
         mem.available_kb as f64 / 1024.0,
         mem.total_kb as f64 / 1024.0,
-    ))
+    );
+
+    // Per-feature gate state: enabled? last fired? blocked by what?
+    let cfg = crate::config::get();
+    let gates = crate::evictor::feature_gates();
+    let (last_reclaim, reclaim_disabled) = crate::maintenance::reclaim_gate();
+    let (spike_tracked, spike_victims) = {
+        let s = spike_snapshot.lock().unwrap();
+        (s.active.len(), s.victims.len())
+    };
+    let fired = |ts: u64| if ts == 0 { "never".to_string() } else { format!("last={}", format_ts(ts)) };
+
+    out.push_str("\nfeatures:");
+    out.push_str(&format!(
+        "\n  zram_compact       enabled={} {}{}",
+        cfg.compact_zram_on_elevated, fired(gates.last_zram_compact),
+        if gates.zram_compact_disabled { " [DISABLED: sysfs grant absent]" } else { "" },
+    ));
+    out.push_str(&format!(
+        "\n  cache_drop         enabled={} trigger={} {}",
+        cfg.cache_drop_enabled, cfg.cache_drop_trigger, fired(gates.last_cache_drop),
+    ));
+    out.push_str(&format!(
+        "\n  early_reclaim      always-on (Elevated) {}",
+        fired(gates.last_early_reclaim),
+    ));
+    out.push_str(&format!(
+        "\n  idle_reclaim       enabled={} important={} {}",
+        cfg.idle_reclaim_enabled, cfg.idle_reclaim_important_enabled, fired(gates.last_idle_reclaim),
+    ));
+    out.push_str(&format!(
+        "\n  proactive_reclaim  enabled={} {}{}",
+        cfg.proactive_swap_reclaim, fired(last_reclaim),
+        if reclaim_disabled { " [DISABLED: helper absent/uncapped]" } else { "" },
+    ));
+    out.push_str(&format!(
+        "\n  spike_mode         enabled={} tracked={} victims={}",
+        cfg.spike_mode_enabled, spike_tracked, spike_victims,
+    ));
+    out.push_str(&format!(
+        "\n  auto_kill_idle     rules={}",
+        cfg.auto_kill_rules.len(),
+    ));
+    out.push_str(&format!(
+        "\n  hibernate          {}",
+        if cfg.emergency_hibernate_after_sec == 0 { "disabled".to_string() }
+        else { format!("after {}s Emergency", cfg.emergency_hibernate_after_sec) },
+    ));
+
+    ok(&out)
 }
 
 fn cmd_list(
@@ -499,7 +549,7 @@ fn cmd_ps(
 
     let mut lines = Vec::new();
     let mut sorted = procs;
-    sorted.sort_by(|a, b| b.rss_kb.cmp(&a.rss_kb));
+    sorted.sort_by_key(|p| std::cmp::Reverse(p.rss_kb));
 
     for p in &sorted {
         let state = if frozen_reg.is_frozen(p.pid) {

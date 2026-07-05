@@ -197,6 +197,11 @@ impl MemCapManager {
         Self { capped: HashMap::new(), tracker: HashMap::new() }
     }
 
+    /// Number of cgroups currently holding a memory.max cap (for cycle attribution).
+    pub(crate) fn capped_count(&self) -> usize {
+        self.capped.len()
+    }
+
     /// Apply `memory.max` caps to eligible background cgroups at High+ pressure.
     /// No-op below High (caller is responsible for calling `restore_all` then).
     pub(crate) fn update(
@@ -275,11 +280,10 @@ impl MemCapManager {
 
 fn restore_cgroup_memory(path: &str) {
     let p = cgroup_sysfs_path(path, "memory.max");
-    if p.exists() {
-        if std::fs::write(&p, "max\n").is_ok() {
+    if p.exists()
+        && std::fs::write(&p, "max\n").is_ok() {
             mgd_common::sync_print!("[memcap] Restored memory.max for cgroup {}", path);
         }
-    }
 }
 
 fn write_memory_max(cgroup_path: &str, bytes: u64) -> Result<(), std::io::Error> {

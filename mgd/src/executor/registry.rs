@@ -29,11 +29,10 @@ impl FrozenRegistry {
 
     pub fn load() -> Self {
         let path = state_dir().join("frozen.json");
-        if let Ok(data) = std::fs::read_to_string(&path) {
-            if let Ok(reg) = serde_json::from_str(&data) {
+        if let Ok(data) = std::fs::read_to_string(&path)
+            && let Ok(reg) = serde_json::from_str(&data) {
                 return reg;
             }
-        }
         Self::new()
     }
 
@@ -102,11 +101,10 @@ impl CheckpointRegistry {
 
     pub fn load() -> Self {
         let path = state_dir().join("checkpoint.json");
-        if let Ok(data) = std::fs::read_to_string(&path) {
-            if let Ok(reg) = serde_json::from_str(&data) {
+        if let Ok(data) = std::fs::read_to_string(&path)
+            && let Ok(reg) = serde_json::from_str(&data) {
                 return reg;
             }
-        }
         Self::new()
     }
 

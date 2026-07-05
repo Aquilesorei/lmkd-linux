@@ -36,6 +36,160 @@ impl ControlState {
     }
 }
 
+/// Map composite pressure score + trend to the target control state.
+/// A rising trend lowers the score needed to escalate.
+fn target_state_for(p_score: f64, trend: f64) -> ControlState {
+    if p_score >= 0.70 || (p_score >= 0.55 && trend > 0.05) {
+        ControlState::Emergency
+    } else if p_score >= 0.50 || (p_score >= 0.35 && trend > 0.03) {
+        ControlState::Critical
+    } else if p_score >= 0.30 || (p_score >= 0.20 && trend > 0.02) {
+        ControlState::Evicting
+    } else if p_score >= 0.15 {
+        ControlState::Warning
+    } else {
+        ControlState::Calm
+    }
+}
+
+/// Hysteresis state machine over `ControlState`. Escalation needs 2 consecutive
+/// ticks of the same target (instant on a sharp spike to Critical/Emergency);
+/// recovery needs 4–12 ticks depending on how far down the target is.
+struct StateMachine {
+    current: ControlState,
+    pending: ControlState,
+    pending_ticks: usize,
+}
+
+impl StateMachine {
+    fn new() -> Self {
+        Self { current: ControlState::Calm, pending: ControlState::Calm, pending_ticks: 0 }
+    }
+
+    /// Advance one tick toward `target`. Pure — no I/O, no logging.
+    /// Returns true when an instant escalation fired (caller logs it).
+    fn advance(&mut self, target: ControlState, trend: f64) -> bool {
+        if target > self.current {
+            // Escalation: needs 2 ticks of persistence, unless it's a massive spike (instant)
+            let instant_escalate = (target == ControlState::Emergency || target == ControlState::Critical) && trend > 0.08;
+            if instant_escalate {
+                self.current = target;
+                self.pending = target;
+                self.pending_ticks = 0;
+                return true;
+            }
+            if target == self.pending {
+                self.pending_ticks += 1;
+                if self.pending_ticks >= 2 {
+                    self.current = target;
+                    self.pending_ticks = 0;
+                }
+            } else {
+                self.pending = target;
+                self.pending_ticks = 1;
+            }
+        } else if target < self.current {
+            // Recovery: needs longer persistence
+            let required_ticks = match target {
+                ControlState::Calm => 12,    // 1 minute of Calm at 5s polling
+                ControlState::Warning => 6, // 30s
+                _ => 4,                     // 20s
+            };
+            if target == self.pending {
+                self.pending_ticks += 1;
+                if self.pending_ticks >= required_ticks {
+                    self.current = target;
+                    self.pending_ticks = 0;
+                }
+            } else {
+                self.pending = target;
+                self.pending_ticks = 1;
+            }
+        } else {
+            // Target matches current state: reset pending state
+            self.pending = self.current;
+            self.pending_ticks = 0;
+        }
+        false
+    }
+}
+
+/// Rolling inputs for the composite pressure score: previous score/time for
+/// the trend derivative, previous vmstat counters for the swap I/O rate.
+struct ScoreTracker {
+    last_score: f64,
+    last_time: std::time::Instant,
+    last_pswpin: u64,
+    last_pswpout: u64,
+}
+
+/// One cycle's composite score plus the inputs kept for attribution logging.
+struct CycleScore {
+    p_score: f64,
+    trend: f64,
+    swap_io_kbs: f64,
+    gpu_val: f64,
+}
+
+impl ScoreTracker {
+    fn new() -> Self {
+        let (last_pswpin, last_pswpout) = crate::monitor::meminfo::read_vmstat_swap_counters();
+        Self { last_score: 0.0, last_time: std::time::Instant::now(), last_pswpin, last_pswpout }
+    }
+
+    /// Read the per-cycle inputs (vmstat counters, GPU cache) and fold them in.
+    fn update(&mut self, some_avg10: f64, meminfo: &MemInfo, now: std::time::Instant) -> CycleScore {
+        let (pswpin, pswpout) = crate::monitor::meminfo::read_vmstat_swap_counters();
+        let gpu_kb = crate::plugin_server::get_total_gpu_kb();
+        self.update_with(some_avg10, meminfo, pswpin, pswpout, gpu_kb, now)
+    }
+
+    /// Pure: composite score = 55% PSI + 20% swap used + 15% GPU UMA + 10% swap I/O
+    /// rate, plus trend (dP/dt). Swap I/O is pswpin+pswpout delta over the cycle,
+    /// pages → KB/s, normalized at 50 MB/s (51200 KB/s) total — above that = thrash.
+    fn update_with(
+        &mut self,
+        some_avg10: f64,
+        meminfo: &MemInfo,
+        cur_pswpin: u64,
+        cur_pswpout: u64,
+        total_gpu_kb: u64,
+        now: std::time::Instant,
+    ) -> CycleScore {
+        let dt = now.duration_since(self.last_time).as_secs_f64();
+
+        let swap_io_pages = cur_pswpin.saturating_sub(self.last_pswpin)
+            .saturating_add(cur_pswpout.saturating_sub(self.last_pswpout));
+        self.last_pswpin = cur_pswpin;
+        self.last_pswpout = cur_pswpout;
+        let swap_io_kbs = if dt > 0.1 { (swap_io_pages * 4) as f64 / dt } else { 0.0 };
+        let swap_io_val = (swap_io_kbs / 51200.0).clamp(0.0, 1.0);
+
+        let psi_val = (some_avg10 / 100.0).clamp(0.0, 1.0);
+        let swap_val = if meminfo.swap_total_kb > 0 {
+            (meminfo.swap_used_pct() / 100.0).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let gpu_val = if meminfo.total_kb > 0 {
+            (total_gpu_kb as f64 / meminfo.total_kb as f64).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let p_score = 0.55 * psi_val + 0.20 * swap_val + 0.15 * gpu_val + 0.10 * swap_io_val;
+
+        let trend = if dt > 0.1 {
+            (p_score - self.last_score) / dt
+        } else {
+            0.0
+        };
+        self.last_score = p_score;
+        self.last_time = now;
+
+        CycleScore { p_score, trend, swap_io_kbs, gpu_val }
+    }
+}
+
 /// Set once on zram-compact EACCES (grant absent) to log only once per session.
 static ZRAM_COMPACT_DISABLED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -46,6 +200,33 @@ static LAST_CACHE_DROP: AtomicU64 = AtomicU64::new(0);
 /// Unix-seconds of the last early background process reclaim.
 static LAST_EARLY_RECLAIM: AtomicU64 = AtomicU64::new(0);
 
+/// Unix-seconds of the last successful zram compaction (0 = never).
+static LAST_ZRAM_COMPACT: AtomicU64 = AtomicU64::new(0);
+
+/// Unix-seconds of the last successful idle cgroup reclaim (0 = never).
+static LAST_IDLE_RECLAIM: AtomicU64 = AtomicU64::new(0);
+
+/// Feature gate state for `mgctl status` — read-only accessors over the
+/// evictor's private statics so the IPC thread can report per-feature state.
+pub(crate) struct FeatureGates {
+    pub zram_compact_disabled: bool,
+    pub last_zram_compact: u64,
+    pub last_cache_drop: u64,
+    pub last_early_reclaim: u64,
+    pub last_idle_reclaim: u64,
+}
+
+pub(crate) fn feature_gates() -> FeatureGates {
+    FeatureGates {
+        zram_compact_disabled: ZRAM_COMPACT_DISABLED.load(Ordering::Relaxed),
+        last_zram_compact: LAST_ZRAM_COMPACT.load(Ordering::Relaxed),
+        last_cache_drop: LAST_CACHE_DROP.load(Ordering::Relaxed),
+        last_early_reclaim: LAST_EARLY_RECLAIM.load(Ordering::Relaxed),
+        last_idle_reclaim: LAST_IDLE_RECLAIM.load(Ordering::Relaxed),
+    }
+}
+
+#[allow(clippy::too_many_arguments)] // one-shot thread entry point wired in main.rs; a params struct adds no clarity
 pub fn run(
     frozen: Arc<Mutex<FrozenRegistry>>,
     checkpointed: Arc<Mutex<CheckpointRegistry>>,
@@ -78,11 +259,8 @@ pub fn run(
     }
 
     let mut last_level = PressureLevel::Normal;
-    let mut last_time = std::time::Instant::now();
-    let mut last_score = 0.0;
-    let mut current_state = ControlState::Calm;
-    let mut pending_state = ControlState::Calm;
-    let mut pending_ticks = 0usize;
+    let mut score_tracker = ScoreTracker::new();
+    let mut state_machine = StateMachine::new();
     let mut throttle = crate::throttle::ThrottleManager::new();
     let mut idle_reclaim_pid_tracker: HashMap<u32, std::time::Instant> = HashMap::new();
     let mut idle_freeze_pid_tracker: HashMap<u32, std::time::Instant> = HashMap::new();
@@ -90,7 +268,6 @@ pub fn run(
     let mut last_active_pid = None;
     let mut recently_killed_cgroups: HashMap<String, std::time::Instant> = HashMap::new();
     let mut sustained_critical_swap_start: Option<std::time::Instant> = None;
-    let (mut last_pswpin, mut last_pswpout) = crate::monitor::meminfo::read_vmstat_swap_counters();
     let mut memcap = crate::throttle::MemCapManager::new();
     let mut sustained_emergency_start: Option<std::time::Instant> = None;
     let mut hibernate_triggered = false;
@@ -131,50 +308,35 @@ pub fn run(
         // PSI trigger instead of doing expensive /proc/pid walks.
         // Timeout 5s just to re-check shutdown flags and maintain the loop pulse.
         if last_level == PressureLevel::Normal {
-            // Helper closure: run idle reclaim on PSI timeout and skip the cycle.
-            // Extracted so the subprocess and direct-trigger paths share it.
-            macro_rules! on_psi_timeout {
-                () => {{
-                    let config = crate::config::get();
-                    if config.idle_reclaim_enabled {
-                        let now_inst = std::time::Instant::now();
-                        if now_inst.duration_since(last_idle_reclaim_check).as_secs()
-                            >= config.idle_reclaim_global_cooldown_sec
-                        {
-                            last_idle_reclaim_check = now_inst;
-                            let procs = monitor::process::list_processes();
-                            let frozen_set: HashSet<u32> =
-                                frozen.lock().unwrap().frozen_pids().into_iter()
-                                    .chain(spike_tracker.victim_pids())
-                                    .collect();
-                            let plan_procs: Vec<&Process> =
-                                procs.iter().filter(|p| !frozen_set.contains(&p.pid)).collect();
-                            let active_pid = crate::plugin_server::get_active_foreground_pid();
-                            check_idle_process_reclaim(
-                                &plan_procs, active_pid,
-                                &mut idle_reclaim_pid_tracker, &mut idle_freeze_pid_tracker,
-                                &frozen, &log,
-                            );
-                        }
-                    }
-                    continue; // no pressure event → skip full cycle
-                }};
-            }
-
             let helper_died = if let Some(sub) = &psi_subprocess {
                 match sub.wait(5000) {
                     monitor::psi::WaitResult::Event => false,
-                    monitor::psi::WaitResult::Timeout => { on_psi_timeout!(); }
+                    monitor::psi::WaitResult::Timeout => {
+                        idle_timeout_reclaim(&frozen, &spike_tracker, &log,
+                            &mut idle_reclaim_pid_tracker, &mut idle_freeze_pid_tracker,
+                            &mut last_idle_reclaim_check);
+                        continue; // no pressure event → skip full cycle
+                    }
                     monitor::psi::WaitResult::HelperDied => true,
                 }
             } else if let Some(trigger) = &psi_trigger {
-                if !trigger.wait(5000) { on_psi_timeout!(); }
+                if !trigger.wait(5000) {
+                    idle_timeout_reclaim(&frozen, &spike_tracker, &log,
+                        &mut idle_reclaim_pid_tracker, &mut idle_freeze_pid_tracker,
+                        &mut last_idle_reclaim_check);
+                    continue;
+                }
                 false
             } else {
                 thread::sleep(Duration::from_secs(5));
                 false
             };
             if helper_died {
+                // Helper death during shutdown is systemd killing the cgroup,
+                // not a crash — let the loop-top guard handle teardown.
+                if crate::should_shutdown() {
+                    continue;
+                }
                 mgd_common::sync_print!("[psi] mgd-psi-trigger exited — attempting respawn");
                 psi_subprocess = monitor::psi::PsiSubprocess::new(psi_elevated_pct);
                 if psi_subprocess.is_none() && psi_trigger.is_none() {
@@ -200,100 +362,15 @@ pub fn run(
         };
 
         let meminfo = crate::monitor::meminfo::read_meminfo();
-
         let now = std::time::Instant::now();
-        let dt = now.duration_since(last_time).as_secs_f64();
+        let score = score_tracker.update(pressure.some_avg10, &meminfo, now);
 
-        // Swap I/O rate: pswpin + pswpout delta over last cycle, pages → KB/s.
-        // Normalized at 50 MB/s (51200 KB/s) total I/O — above that = thrash.
-        let (cur_pswpin, cur_pswpout) = crate::monitor::meminfo::read_vmstat_swap_counters();
-        let swap_io_pages = cur_pswpin.saturating_sub(last_pswpin)
-            .saturating_add(cur_pswpout.saturating_sub(last_pswpout));
-        last_pswpin = cur_pswpin;
-        last_pswpout = cur_pswpout;
-        let swap_io_kbs = if dt > 0.1 { (swap_io_pages * 4) as f64 / dt } else { 0.0 };
-        let swap_io_val = (swap_io_kbs / 51200.0).clamp(0.0, 1.0);
-
-        // Continuous pressure score: 55% PSI + 20% swap used + 15% GPU UMA + 10% swap I/O rate
-        let psi_val = (pressure.some_avg10 / 100.0).clamp(0.0, 1.0);
-        let swap_val = if meminfo.swap_total_kb > 0 {
-            (meminfo.swap_used_pct() / 100.0).clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
-        let total_gpu = crate::plugin_server::get_total_gpu_kb();
-        let gpu_val = if meminfo.total_kb > 0 {
-            (total_gpu as f64 / meminfo.total_kb as f64).clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
-        let p_score = 0.55 * psi_val + 0.20 * swap_val + 0.15 * gpu_val + 0.10 * swap_io_val;
-
-        // Calculate trend (dP/dt)
-        let trend = if dt > 0.1 {
-            (p_score - last_score) / dt
-        } else {
-            0.0
-        };
-        last_score = p_score;
-        last_time = now;
-
-        // Determine target state based on score & trend
-        let target_state = if p_score >= 0.70 || (p_score >= 0.55 && trend > 0.05) {
-            ControlState::Emergency
-        } else if p_score >= 0.50 || (p_score >= 0.35 && trend > 0.03) {
-            ControlState::Critical
-        } else if p_score >= 0.30 || (p_score >= 0.20 && trend > 0.02) {
-            ControlState::Evicting
-        } else if p_score >= 0.15 {
-            ControlState::Warning
-        } else {
-            ControlState::Calm
-        };
-
-        // State transitions with hysteresis
-        if target_state > current_state {
-            // Escalation: Needs 2 ticks of persistence, unless it's a massive spike (instant)
-            let instant_escalate = (target_state == ControlState::Emergency || target_state == ControlState::Critical) && trend > 0.08;
-            if target_state == pending_state && !instant_escalate {
-                pending_ticks += 1;
-                if pending_ticks >= 2 {
-                    current_state = target_state;
-                    pending_ticks = 0;
-                }
-            } else if instant_escalate {
-                mgd_common::sync_print!("[controller] Instant escalation triggered due to rapid pressure spike (trend: {:.3})", trend);
-                current_state = target_state;
-                pending_state = target_state;
-                pending_ticks = 0;
-            } else {
-                pending_state = target_state;
-                pending_ticks = 1;
-            }
-        } else if target_state < current_state {
-            // Recovery: Needs longer persistence
-            let required_ticks = match target_state {
-                ControlState::Calm => 12,    // 1 minute of Calm at 5s polling
-                ControlState::Warning => 6, // 30s
-                _ => 4,                     // 20s
-            };
-            if target_state == pending_state {
-                pending_ticks += 1;
-                if pending_ticks >= required_ticks {
-                    current_state = target_state;
-                    pending_ticks = 0;
-                }
-            } else {
-                pending_state = target_state;
-                pending_ticks = 1;
-            }
-        } else {
-            // Target matches current state: reset pending state
-            pending_state = current_state;
-            pending_ticks = 0;
+        let target_state = target_state_for(score.p_score, score.trend);
+        if state_machine.advance(target_state, score.trend) {
+            mgd_common::sync_print!("[controller] Instant escalation triggered due to rapid pressure spike (trend: {:.3})", score.trend);
         }
 
-        let mut effective_level = current_state.to_pressure_level();
+        let mut effective_level = state_machine.current.to_pressure_level();
 
         let swap_used_pct = meminfo.swap_used_pct();
         // swap_exhausted (≥95%) is forwarded to plan() as a per-process Kill escalator for
@@ -326,7 +403,7 @@ pub fn run(
             } else {
                 mgd_common::sync_print!(
                     "[controller] Escalating to EMERGENCY (composite pressure score threshold exceeded: score={:.2})",
-                    p_score
+                    score.p_score
                 );
             }
         }
@@ -378,8 +455,8 @@ pub fn run(
             }
 
             // Unfreeze idle-frozen process when it becomes the active window
-            if active_pid_changed {
-                if let Some(apid) = active_pid {
+            if active_pid_changed
+                && let Some(apid) = active_pid {
                     let reg = frozen.lock().unwrap();
                     if reg.is_frozen(apid) {
                         let st = reg.start_time(apid);
@@ -399,7 +476,6 @@ pub fn run(
                         }
                     }
                 }
-            }
 
             let procs = monitor::process::list_processes();
             let frozen_set: HashSet<u32> = frozen.lock().unwrap().frozen_pids().into_iter()
@@ -418,11 +494,10 @@ pub fn run(
             memcap.update(&plan_procs, active_pid, &effective_level);
 
             // Idle cgroup reclaim: only runs at Normal/Calm pressure
-            if effective_level == PressureLevel::Normal {
-                if config.idle_reclaim_enabled {
+            if effective_level == PressureLevel::Normal
+                && config.idle_reclaim_enabled {
                     check_idle_process_reclaim(&plan_procs, active_pid, &mut idle_reclaim_pid_tracker, &mut idle_freeze_pid_tracker, &frozen, &log);
                 }
-            }
         }
 
         // Restore memory caps when pressure drops below High
@@ -431,135 +506,7 @@ pub fn run(
         }
 
         // ── Spike mode: runs every cycle, even at Normal PSI ─────────────────
-        // Spike exit detection and proactive headroom management are independent
-        // of reactive eviction — they must not be gated by the Normal continue.
-        {
-            let spike_procs = monitor::process::list_processes();
-            let live_pids: HashSet<u32> = spike_procs.iter().map(|p| p.pid).collect();
-
-            // Unfreeze victims when their spike process exits
-            let exited: Vec<u32> = spike_tracker.spike_pids()
-                .into_iter().filter(|pid| !live_pids.contains(pid)).collect();
-            let mut total_released = 0usize;
-            let mut last_spike_name: Option<String> = None;
-            for spike_pid in exited {
-                let victims = spike_tracker.on_spike_exit(spike_pid);
-                // on_spike_exit returns names before draining; capture name from first victim
-                if let Some(v) = victims.first() {
-                    last_spike_name = spike_procs.iter()
-                        .find(|p| p.pid == v.frozen_for_spike_pid)
-                        .map(|p| p.name.clone());
-                }
-                for v in victims {
-                    let r = crate::executor::freezer::unfreeze_checked(v.pid, v.start_time);
-                    if r.success {
-                        mgd_common::sync_print!(
-                            "[spike] Unfroze {} (PID {}) — spike PID {} exited",
-                            v.name, v.pid, v.frozen_for_spike_pid
-                        );
-                        log.log(LogAction::SpikeUnfreeze, v.pid, &v.name, 0.0, "spike exited");
-                        total_released += 1;
-                    }
-                }
-            }
-            if total_released > 0 {
-                let spike_name = last_spike_name.as_deref().unwrap_or("build");
-                let msg = format!("Build session ended — {} process{} resumed",
-                    total_released, if total_released == 1 { "" } else { "es" });
-                let _ = std::process::Command::new("notify-send")
-                    .args(["--urgency=low", "--app-name=mgd", spike_name, &msg])
-                    .spawn();
-            }
-
-            // Release victims that have been frozen beyond max_victim_freeze_sec
-            let max_secs = crate::config::get().spike_max_victim_freeze_sec;
-            for v in spike_tracker.drain_timed_out_victims(max_secs) {
-                let r = crate::executor::freezer::unfreeze_checked(v.pid, v.start_time);
-                if r.success {
-                    mgd_common::sync_print!(
-                        "[spike] Released timed-out victim {} (PID {}): frozen >{}s",
-                        v.name, v.pid, max_secs
-                    );
-                    log.log(LogAction::SpikeUnfreezeTimeout, v.pid, &v.name, 0.0, "max_victim_freeze_sec");
-                }
-            }
-
-            // Release victims whose initiator spike already exited but were deferred
-            // (frozen_for_spike_pid no longer in the active spike set).
-            for v in spike_tracker.drain_orphaned_victims() {
-                let r = crate::executor::freezer::unfreeze_checked(v.pid, v.start_time);
-                if r.success {
-                    mgd_common::sync_print!(
-                        "[spike] Released orphaned victim {} (PID {}): spike PID {} already gone",
-                        v.name, v.pid, v.frozen_for_spike_pid
-                    );
-                    log.log(LogAction::SpikeUnfreezeOrphan, v.pid, &v.name, 0.0, "initiator exited");
-                }
-            }
-
-            // Update tracker and execute decisions
-            for decision in spike_tracker.update(&spike_procs, meminfo.available_kb) {
-                match decision {
-                    crate::spike_mode::SpikeDecision::FreezeForHeadroom { needed_kb } => {
-                        let spike_pids  = spike_tracker.spike_pids();
-                        let victim_pids = spike_tracker.victim_pids();
-                        let exclude: HashSet<u32> = frozen.lock().unwrap().frozen_pids()
-                            .into_iter()
-                            .chain(spike_pids.iter().copied())
-                            .chain(victim_pids.iter().copied())
-                            .collect();
-                        // Highest-priority (most expendable) first, then largest RSS
-                        let spike_cfg = crate::config::get();
-                        let mut candidates: Vec<&Process> = spike_procs.iter()
-                            .filter(|p| !exclude.contains(&p.pid))
-                            .filter(|p| get_priority(&p.name, p.exe_basename.as_deref()) >= 60)
-                            .filter(|p| !spike_cfg.spike_victim_exclude.iter().any(|re| re.is_match(&p.name)))
-                            .collect();
-                        candidates.sort_by(|a, b| {
-                            let pa = get_priority(&a.name, a.exe_basename.as_deref());
-                            let pb = get_priority(&b.name, b.exe_basename.as_deref());
-                            pb.cmp(&pa).then(b.rss_kb.cmp(&a.rss_kb))
-                        });
-                        let mut needed = needed_kb;
-                        for proc in candidates {
-                            if needed == 0 { break; }
-                            let Some(st) = crate::executor::read_start_time(proc.pid) else { continue };
-                            let r = crate::executor::freezer::freeze_checked(proc.pid, st);
-                            if r.success {
-                                mgd_common::sync_print!(
-                                    "[spike] Froze {} (PID {}, {:.0}MB) for headroom",
-                                    proc.name, proc.pid, proc.rss_kb as f64 / 1024.0
-                                );
-                                log.log(LogAction::SpikeFreeze, proc.pid, &proc.name,
-                                    proc.rss_kb as f64 / 1024.0, "proactive headroom");
-                                spike_tracker.record_victim_frozen(crate::spike_mode::SpikeVictim {
-                                    pid: proc.pid,
-                                    name: proc.name.clone(),
-                                    start_time: st,
-                                    frozen_for_spike_pid: spike_pids.iter().next().copied().unwrap_or(0),
-                                    frozen_at: std::time::Instant::now(),
-                                });
-                                // Push victim RSS to zram; SIGSTOP means no re-faults so 100% is safe.
-                                if let Some(cg) = proc.cgroup_path.as_deref() {
-                                    let _ = reclaim_cgroup(cg, proc.rss_kb * 1024);
-                                }
-                                needed = needed.saturating_sub(proc.rss_kb);
-                            }
-                        }
-                    }
-                    crate::spike_mode::SpikeDecision::ThrottleSpike { spike_pid, cgroup_path } => {
-                        let weight = crate::config::get().spike_throttled_cpu_weight;
-                        let _ = crate::throttle::write_cgroup_cpu_weight(&cgroup_path, weight);
-                        mgd_common::sync_print!("[spike] Throttled PID {} cpu.weight={}", spike_pid, weight);
-                    }
-                    crate::spike_mode::SpikeDecision::RestoreThrottle { spike_pid, cgroup_path } => {
-                        let _ = crate::throttle::write_cgroup_cpu_weight(&cgroup_path, 100);
-                        mgd_common::sync_print!("[spike] Restored cpu.weight for PID {}", spike_pid);
-                    }
-                }
-            }
-            *spike_snapshot.lock().unwrap() = spike_tracker.snapshot();
-        }
+        run_spike_cycle(&mut spike_tracker, &frozen, &log, meminfo.available_kb, &spike_snapshot);
 
         if effective_level == PressureLevel::Normal {
             continue;
@@ -592,11 +539,10 @@ pub fn run(
         let plan_procs: Vec<&Process> = procs.iter()
             .filter(|p| !frozen_set.contains(&p.pid))
             .filter(|p| {
-                if let Some(ref cgroup_path) = p.cgroup_path {
-                    if recently_killed_cgroups.contains_key(cgroup_path) {
+                if let Some(ref cgroup_path) = p.cgroup_path
+                    && recently_killed_cgroups.contains_key(cgroup_path) {
                         return false; // Skip recently targeted cgroup
                     }
-                }
                 true
             })
             .collect();
@@ -609,56 +555,10 @@ pub fn run(
         if decisions.is_empty() {
             mgd_common::sync_print!("✓ No action needed.");
         } else {
-            mgd_common::sync_print!("⚡ EXECUTING:");
-            let mut destructive_count = 0u32;
-            for d in &decisions {
-                if frozen.lock().unwrap().is_frozen(d.pid) { continue; }
-
-                let result_str = execute_decision(d, &frozen, &checkpointed, &log, &event_log);
-                mgd_common::sync_print!("  {:<10} {:<8} {:<22} {:>6.1}MB  {}", d.action, d.pid, d.name, d.rss_mb, result_str);
-
-                // Post-freeze reclaim: push full RSS to zram while the process is immobile.
-                // SIGSTOP guarantees no re-faults, so 100% is safe (unlike active-process
-                // early reclaim which caps at 50% to preserve a working set).
-                if d.action == Action::Freeze && result_str == "frozen" {
-                    if let Some(cgroup_path) = plan_procs.iter()
-                        .find(|p| p.pid == d.pid)
-                        .and_then(|p| p.cgroup_path.as_deref())
-                    {
-                        let reclaim_bytes = (d.rss_mb * 1024.0 * 1024.0) as u64;
-                        match reclaim_cgroup(cgroup_path, reclaim_bytes) {
-                            Ok(true) => {
-                                mgd_common::sync_print!(
-                                    "[reclaim] Post-freeze: pushed ~{:.0}MB from PID {} ({}) to zram",
-                                    d.rss_mb, d.pid, d.name
-                                );
-                                log.log(LogAction::FreezeReclaim, d.pid, &d.name,
-                                    d.rss_mb, "pushed to zram after pressure freeze");
-                            }
-                            Ok(false) => {}
-                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                            Err(_) => {}
-                        }
-                    }
-                }
-
-                // Terminate is async (SIGTERM→5s→SIGKILL): RAM not freed yet when we
-                // signal maintenance. Only count synchronous kills (Kill, Checkpoint).
-                if matches!(d.action, Action::Kill | Action::Checkpoint) {
-                    destructive_count += 1;
-                }
-
-                // Track recently terminated/killed cgroups
-                if d.action == Action::Kill || d.action == Action::Terminate {
-                    let cgroup_path = plan_procs.iter()
-                        .find(|p| p.pid == d.pid)
-                        .and_then(|p| p.cgroup_path.clone())
-                        .or_else(|| mgd_common::util::read_process_cgroup_path(d.pid));
-                    if let Some(cgroup_path) = cgroup_path {
-                        recently_killed_cgroups.insert(cgroup_path, std::time::Instant::now());
-                    }
-                }
-            }
+            let destructive_count = execute_plan(
+                &decisions, &plan_procs, &frozen, &checkpointed,
+                &log, &event_log, &mut recently_killed_cgroups,
+            );
             // Ring the doorbell — recovery thread may have new work.
             let (lock, cvar) = &*recovery_wake;
             *lock.lock().unwrap() = true;
@@ -672,7 +572,268 @@ pub fn run(
                 cvar.notify_one();
             }
         }
+
+        // Cycle attribution: one grep-able line per active cycle tying the
+        // composite score inputs to what each feature did. The 3am question
+        // "which feature acted and why" is answered here, not by archaeology.
+        {
+            let frozen_n = frozen.lock().unwrap().count();
+            let throttled_n = throttle_snapshot.lock().unwrap()
+                .values()
+                .filter(|s| **s != crate::throttle::ThrottledState::None)
+                .count();
+            let attribution = format!(
+                "psi={:.1}% swap={:.0}% gpu={:.1}% swap_io={:.0}KB/s score={:.2} trend={:+.3} state={:?} level={} | frozen={} throttled={} memcap={} spike={}/{} decisions={}",
+                pressure.some_avg10, swap_used_pct, score.gpu_val * 100.0, score.swap_io_kbs,
+                score.p_score, score.trend, state_machine.current, effective_level,
+                frozen_n, throttled_n, memcap.capped_count(),
+                spike_tracker.spike_pids().len(), spike_tracker.victim_pids().len(),
+                decisions.len(),
+            );
+            mgd_common::sync_print!("[cycle] {attribution}");
+            log.log(LogAction::Cycle, 0, "cycle",
+                meminfo.available_kb as f64 / 1024.0, &attribution);
+        }
     }
+}
+
+/// Idle-cycle work on PSI trigger timeout: no pressure event fired, so run idle
+/// cgroup reclaim on its cooldown. Shared by the subprocess and direct-trigger
+/// wait paths; the caller `continue`s afterwards to skip the full cycle.
+fn idle_timeout_reclaim(
+    frozen: &Arc<Mutex<FrozenRegistry>>,
+    spike_tracker: &crate::spike_mode::SpikeTracker,
+    log: &Logger,
+    idle_reclaim_pid_tracker: &mut HashMap<u32, std::time::Instant>,
+    idle_freeze_pid_tracker: &mut HashMap<u32, std::time::Instant>,
+    last_idle_reclaim_check: &mut std::time::Instant,
+) {
+    let config = crate::config::get();
+    if !config.idle_reclaim_enabled {
+        return;
+    }
+    let now_inst = std::time::Instant::now();
+    if now_inst.duration_since(*last_idle_reclaim_check).as_secs()
+        < config.idle_reclaim_global_cooldown_sec
+    {
+        return;
+    }
+    *last_idle_reclaim_check = now_inst;
+    let procs = monitor::process::list_processes();
+    let frozen_set: HashSet<u32> =
+        frozen.lock().unwrap().frozen_pids().into_iter()
+            .chain(spike_tracker.victim_pids())
+            .collect();
+    let plan_procs: Vec<&Process> =
+        procs.iter().filter(|p| !frozen_set.contains(&p.pid)).collect();
+    let active_pid = crate::plugin_server::get_active_foreground_pid();
+    check_idle_process_reclaim(
+        &plan_procs, active_pid,
+        idle_reclaim_pid_tracker, idle_freeze_pid_tracker,
+        frozen, log,
+    );
+}
+
+/// Spike-mode cycle: release victims (spike exited / timed out / orphaned), feed
+/// the tracker, and execute its decisions. Runs every cycle, even at Normal PSI —
+/// spike exit detection and proactive headroom management are independent of
+/// reactive eviction and must not be gated by the Normal continue.
+fn run_spike_cycle(
+    spike_tracker: &mut crate::spike_mode::SpikeTracker,
+    frozen: &Arc<Mutex<FrozenRegistry>>,
+    log: &Logger,
+    available_kb: u64,
+    spike_snapshot: &Arc<Mutex<crate::spike_mode::SpikeSnapshot>>,
+) {
+    let spike_procs = monitor::process::list_processes();
+    let live_pids: HashSet<u32> = spike_procs.iter().map(|p| p.pid).collect();
+
+    // Unfreeze victims when their spike process exits
+    let exited: Vec<u32> = spike_tracker.spike_pids()
+        .into_iter().filter(|pid| !live_pids.contains(pid)).collect();
+    let mut total_released = 0usize;
+    let mut last_spike_name: Option<String> = None;
+    for spike_pid in exited {
+        let victims = spike_tracker.on_spike_exit(spike_pid);
+        // on_spike_exit returns names before draining; capture name from first victim
+        if let Some(v) = victims.first() {
+            last_spike_name = spike_procs.iter()
+                .find(|p| p.pid == v.frozen_for_spike_pid)
+                .map(|p| p.name.clone());
+        }
+        for v in victims {
+            let r = crate::executor::freezer::unfreeze_checked(v.pid, v.start_time);
+            if r.success {
+                mgd_common::sync_print!(
+                    "[spike] Unfroze {} (PID {}) — spike PID {} exited",
+                    v.name, v.pid, v.frozen_for_spike_pid
+                );
+                log.log(LogAction::SpikeUnfreeze, v.pid, &v.name, 0.0, "spike exited");
+                total_released += 1;
+            }
+        }
+    }
+    if total_released > 0 {
+        let spike_name = last_spike_name.as_deref().unwrap_or("build");
+        let msg = format!("Build session ended — {} process{} resumed",
+            total_released, if total_released == 1 { "" } else { "es" });
+        let _ = std::process::Command::new("notify-send")
+            .args(["--urgency=low", "--app-name=mgd", spike_name, &msg])
+            .spawn();
+    }
+
+    // Release victims that have been frozen beyond max_victim_freeze_sec
+    let max_secs = crate::config::get().spike_max_victim_freeze_sec;
+    for v in spike_tracker.drain_timed_out_victims(max_secs) {
+        let r = crate::executor::freezer::unfreeze_checked(v.pid, v.start_time);
+        if r.success {
+            mgd_common::sync_print!(
+                "[spike] Released timed-out victim {} (PID {}): frozen >{}s",
+                v.name, v.pid, max_secs
+            );
+            log.log(LogAction::SpikeUnfreezeTimeout, v.pid, &v.name, 0.0, "max_victim_freeze_sec");
+        }
+    }
+
+    // Release victims whose initiator spike already exited but were deferred
+    // (frozen_for_spike_pid no longer in the active spike set).
+    for v in spike_tracker.drain_orphaned_victims() {
+        let r = crate::executor::freezer::unfreeze_checked(v.pid, v.start_time);
+        if r.success {
+            mgd_common::sync_print!(
+                "[spike] Released orphaned victim {} (PID {}): spike PID {} already gone",
+                v.name, v.pid, v.frozen_for_spike_pid
+            );
+            log.log(LogAction::SpikeUnfreezeOrphan, v.pid, &v.name, 0.0, "initiator exited");
+        }
+    }
+
+    // Update tracker and execute decisions
+    for decision in spike_tracker.update(&spike_procs, available_kb) {
+        match decision {
+            crate::spike_mode::SpikeDecision::FreezeForHeadroom { needed_kb } => {
+                let spike_pids  = spike_tracker.spike_pids();
+                let victim_pids = spike_tracker.victim_pids();
+                let exclude: HashSet<u32> = frozen.lock().unwrap().frozen_pids()
+                    .into_iter()
+                    .chain(spike_pids.iter().copied())
+                    .chain(victim_pids.iter().copied())
+                    .collect();
+                // Highest-priority (most expendable) first, then largest RSS
+                let spike_cfg = crate::config::get();
+                let mut candidates: Vec<&Process> = spike_procs.iter()
+                    .filter(|p| !exclude.contains(&p.pid))
+                    .filter(|p| get_priority(&p.name, p.exe_basename.as_deref()) >= 60)
+                    .filter(|p| !spike_cfg.spike_victim_exclude.iter().any(|re| re.is_match(&p.name)))
+                    .collect();
+                candidates.sort_by(|a, b| {
+                    let pa = get_priority(&a.name, a.exe_basename.as_deref());
+                    let pb = get_priority(&b.name, b.exe_basename.as_deref());
+                    pb.cmp(&pa).then(b.rss_kb.cmp(&a.rss_kb))
+                });
+                let mut needed = needed_kb;
+                for proc in candidates {
+                    if needed == 0 { break; }
+                    let Some(st) = crate::executor::read_start_time(proc.pid) else { continue };
+                    let r = crate::executor::freezer::freeze_checked(proc.pid, st);
+                    if r.success {
+                        mgd_common::sync_print!(
+                            "[spike] Froze {} (PID {}, {:.0}MB) for headroom",
+                            proc.name, proc.pid, proc.rss_kb as f64 / 1024.0
+                        );
+                        log.log(LogAction::SpikeFreeze, proc.pid, &proc.name,
+                            proc.rss_kb as f64 / 1024.0, "proactive headroom");
+                        spike_tracker.record_victim_frozen(crate::spike_mode::SpikeVictim {
+                            pid: proc.pid,
+                            name: proc.name.clone(),
+                            start_time: st,
+                            frozen_for_spike_pid: spike_pids.iter().next().copied().unwrap_or(0),
+                            frozen_at: std::time::Instant::now(),
+                        });
+                        // Push victim RSS to zram; SIGSTOP means no re-faults so 100% is safe.
+                        if let Some(cg) = proc.cgroup_path.as_deref() {
+                            let _ = reclaim_cgroup(cg, proc.rss_kb * 1024);
+                        }
+                        needed = needed.saturating_sub(proc.rss_kb);
+                    }
+                }
+            }
+            crate::spike_mode::SpikeDecision::ThrottleSpike { spike_pid, cgroup_path } => {
+                let weight = crate::config::get().spike_throttled_cpu_weight;
+                let _ = crate::throttle::write_cgroup_cpu_weight(&cgroup_path, weight);
+                mgd_common::sync_print!("[spike] Throttled PID {} cpu.weight={}", spike_pid, weight);
+            }
+            crate::spike_mode::SpikeDecision::RestoreThrottle { spike_pid, cgroup_path } => {
+                let _ = crate::throttle::write_cgroup_cpu_weight(&cgroup_path, 100);
+                mgd_common::sync_print!("[spike] Restored cpu.weight for PID {}", spike_pid);
+            }
+        }
+    }
+    *spike_snapshot.lock().unwrap() = spike_tracker.snapshot();
+}
+
+/// Execute the planned decisions. Returns the number of synchronous destructive
+/// actions (Kill, Checkpoint) — Terminate is async (SIGTERM→5s→SIGKILL), its RAM
+/// isn't freed yet when the caller signals maintenance, so it doesn't count.
+fn execute_plan(
+    decisions: &[Decision],
+    plan_procs: &[&Process],
+    frozen: &Arc<Mutex<FrozenRegistry>>,
+    checkpointed: &Arc<Mutex<CheckpointRegistry>>,
+    log: &Logger,
+    event_log: &crate::events::EventLog,
+    recently_killed_cgroups: &mut HashMap<String, std::time::Instant>,
+) -> u32 {
+    mgd_common::sync_print!("⚡ EXECUTING:");
+    let mut destructive_count = 0u32;
+    for d in decisions {
+        if frozen.lock().unwrap().is_frozen(d.pid) { continue; }
+
+        let result_str = execute_decision(d, frozen, checkpointed, log, event_log);
+        mgd_common::sync_print!("  {:<10} {:<8} {:<22} {:>6.1}MB  {}", d.action, d.pid, d.name, d.rss_mb, result_str);
+
+        // Post-freeze reclaim: push full RSS to zram while the process is immobile.
+        // SIGSTOP guarantees no re-faults, so 100% is safe (unlike active-process
+        // early reclaim which caps at 50% to preserve a working set).
+        if d.action == Action::Freeze && result_str == "frozen"
+            && let Some(cgroup_path) = plan_procs.iter()
+                .find(|p| p.pid == d.pid)
+                .and_then(|p| p.cgroup_path.as_deref())
+            {
+                let reclaim_bytes = (d.rss_mb * 1024.0 * 1024.0) as u64;
+                match reclaim_cgroup(cgroup_path, reclaim_bytes) {
+                    Ok(true) => {
+                        mgd_common::sync_print!(
+                            "[reclaim] Post-freeze: pushed ~{:.0}MB from PID {} ({}) to zram",
+                            d.rss_mb, d.pid, d.name
+                        );
+                        log.log(LogAction::FreezeReclaim, d.pid, &d.name,
+                            d.rss_mb, "pushed to zram after pressure freeze");
+                    }
+                    Ok(false) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(_) => {}
+                }
+            }
+
+        // Terminate is async (SIGTERM→5s→SIGKILL): RAM not freed yet when we
+        // signal maintenance. Only count synchronous kills (Kill, Checkpoint).
+        if matches!(d.action, Action::Kill | Action::Checkpoint) {
+            destructive_count += 1;
+        }
+
+        // Track recently terminated/killed cgroups
+        if d.action == Action::Kill || d.action == Action::Terminate {
+            let cgroup_path = plan_procs.iter()
+                .find(|p| p.pid == d.pid)
+                .and_then(|p| p.cgroup_path.clone())
+                .or_else(|| mgd_common::util::read_process_cgroup_path(d.pid));
+            if let Some(cgroup_path) = cgroup_path {
+                recently_killed_cgroups.insert(cgroup_path, std::time::Instant::now());
+            }
+        }
+    }
+    destructive_count
 }
 
 /// Pure: given current effective pressure + swap stats + sustained-start timer,
@@ -796,6 +957,7 @@ fn compact_zram(level: &PressureLevel, log: &Logger) {
                 );
                 log.log(LogAction::Zram, 0, &device, reclaimed as f64,
                     &format!("compacted {before_mb}MB->{after_mb}MB"));
+                LAST_ZRAM_COMPACT.store(unix_timestamp_secs(), Ordering::Relaxed);
             }
             Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
                 ZRAM_COMPACT_DISABLED.store(true, Ordering::Relaxed);
@@ -1047,7 +1209,7 @@ fn check_early_process_reclaim(
                 && Some(p.pid) != active_pid
                 && {
                     let prio = get_priority(&p.name, p.exe_basename.as_deref());
-                    prio >= 50 && prio < 60
+                    (50..60).contains(&prio)
                 }
         })
         .copied()
@@ -1157,6 +1319,7 @@ fn check_idle_process_reclaim(
                 }
                 // Reset timer → serves as per-process cooldown
                 pid_tracker.insert(*pid, std::time::Instant::now());
+                LAST_IDLE_RECLAIM.store(unix_timestamp_secs(), Ordering::Relaxed);
             }
             Ok(false) => {}
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -1245,6 +1408,145 @@ mod tests {
         let mut m = HashMap::new();
         m.insert(pid, Instant::now() - Duration::from_secs(secs_ago));
         m
+    }
+
+    // ── target_state_for / StateMachine ──────────────────────────────────────
+
+    #[test]
+    fn target_state_thresholds() {
+        assert_eq!(target_state_for(0.0, 0.0), ControlState::Calm);
+        assert_eq!(target_state_for(0.15, 0.0), ControlState::Warning);
+        assert_eq!(target_state_for(0.30, 0.0), ControlState::Evicting);
+        assert_eq!(target_state_for(0.50, 0.0), ControlState::Critical);
+        assert_eq!(target_state_for(0.70, 0.0), ControlState::Emergency);
+    }
+
+    #[test]
+    fn target_state_rising_trend_lowers_bar() {
+        assert_eq!(target_state_for(0.21, 0.03), ControlState::Evicting);
+        assert_eq!(target_state_for(0.36, 0.04), ControlState::Critical);
+        assert_eq!(target_state_for(0.56, 0.06), ControlState::Emergency);
+        // Same scores without the trend stay one tier lower
+        assert_eq!(target_state_for(0.21, 0.0), ControlState::Warning);
+        assert_eq!(target_state_for(0.36, 0.0), ControlState::Evicting);
+        assert_eq!(target_state_for(0.56, 0.0), ControlState::Critical);
+    }
+
+    #[test]
+    fn escalation_needs_two_ticks() {
+        let mut sm = StateMachine::new();
+        assert!(!sm.advance(ControlState::Evicting, 0.0));
+        assert_eq!(sm.current, ControlState::Calm);
+        assert!(!sm.advance(ControlState::Evicting, 0.0));
+        assert_eq!(sm.current, ControlState::Evicting);
+    }
+
+    #[test]
+    fn instant_escalation_on_sharp_spike() {
+        let mut sm = StateMachine::new();
+        assert!(sm.advance(ControlState::Emergency, 0.09));
+        assert_eq!(sm.current, ControlState::Emergency);
+    }
+
+    #[test]
+    fn no_instant_escalation_below_critical() {
+        let mut sm = StateMachine::new();
+        // Sharp trend but target only Evicting — still needs 2 ticks.
+        assert!(!sm.advance(ControlState::Evicting, 0.09));
+        assert_eq!(sm.current, ControlState::Calm);
+    }
+
+    #[test]
+    fn escalation_target_change_resets_ticks() {
+        let mut sm = StateMachine::new();
+        sm.advance(ControlState::Warning, 0.0);
+        sm.advance(ControlState::Evicting, 0.0); // pending switches — tick count restarts
+        assert_eq!(sm.current, ControlState::Calm);
+        sm.advance(ControlState::Evicting, 0.0);
+        assert_eq!(sm.current, ControlState::Evicting);
+    }
+
+    #[test]
+    fn recovery_to_calm_needs_twelve_ticks() {
+        let mut sm = StateMachine::new();
+        sm.advance(ControlState::Critical, 0.09); // instant escalate
+        assert_eq!(sm.current, ControlState::Critical);
+        for _ in 0..11 {
+            sm.advance(ControlState::Calm, 0.0);
+            assert_eq!(sm.current, ControlState::Critical);
+        }
+        sm.advance(ControlState::Calm, 0.0);
+        assert_eq!(sm.current, ControlState::Calm);
+    }
+
+    #[test]
+    fn matching_target_resets_pending() {
+        let mut sm = StateMachine::new();
+        sm.advance(ControlState::Warning, 0.0); // pending=Warning, 1 tick
+        sm.advance(ControlState::Calm, 0.0);    // target==current → pending reset
+        sm.advance(ControlState::Warning, 0.0); // must start over
+        assert_eq!(sm.current, ControlState::Calm);
+        sm.advance(ControlState::Warning, 0.0);
+        assert_eq!(sm.current, ControlState::Warning);
+    }
+
+    // ── ScoreTracker ─────────────────────────────────────────────────────────
+
+    fn make_meminfo(total_kb: u64, swap_total_kb: u64, swap_free_kb: u64) -> MemInfo {
+        MemInfo { available_kb: total_kb / 2, total_kb, swap_free_kb, swap_total_kb }
+    }
+
+    fn fresh_tracker(now: Instant) -> ScoreTracker {
+        ScoreTracker { last_score: 0.0, last_time: now, last_pswpin: 0, last_pswpout: 0 }
+    }
+
+    #[test]
+    fn score_psi_only() {
+        let t0 = Instant::now();
+        let mut st = fresh_tracker(t0);
+        let mi = make_meminfo(16_000_000, 0, 0);
+        let s = st.update_with(50.0, &mi, 0, 0, 0, t0 + Duration::from_secs(5));
+        // 55% weight on PSI 0.5, everything else zero
+        assert!((s.p_score - 0.275).abs() < 1e-9);
+        assert_eq!(s.gpu_val, 0.0);
+        assert_eq!(s.swap_io_kbs, 0.0);
+    }
+
+    #[test]
+    fn score_all_components_maxed_hits_one() {
+        let t0 = Instant::now();
+        let mut st = fresh_tracker(t0);
+        let mi = make_meminfo(16_000_000, 12_000_000, 0); // swap 100% used
+        // GPU = total RAM, swap I/O far over 50 MB/s → every component clamps to 1.0
+        let s = st.update_with(200.0, &mi, 10_000_000, 10_000_000, 16_000_000, t0 + Duration::from_secs(5));
+        assert!((s.p_score - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn swap_io_rate_and_trend() {
+        let t0 = Instant::now();
+        let mut st = fresh_tracker(t0);
+        let mi = make_meminfo(16_000_000, 0, 0);
+        // 12800 pages × 4KB / 5s = 10240 KB/s → io_val 0.2 → score 0.02
+        let s = st.update_with(0.0, &mi, 12800, 0, 0, t0 + Duration::from_secs(5));
+        assert!((s.swap_io_kbs - 10240.0).abs() < 1e-6);
+        assert!((s.p_score - 0.02).abs() < 1e-9);
+        assert!((s.trend - 0.02 / 5.0).abs() < 1e-9);
+        // Next cycle, no new I/O: score falls back to 0, trend goes negative
+        let s2 = st.update_with(0.0, &mi, 12800, 0, 0, t0 + Duration::from_secs(10));
+        assert_eq!(s2.p_score, 0.0);
+        assert!(s2.trend < 0.0);
+    }
+
+    #[test]
+    fn tiny_dt_yields_zero_trend_and_io() {
+        let t0 = Instant::now();
+        let mut st = fresh_tracker(t0);
+        let mi = make_meminfo(16_000_000, 0, 0);
+        // dt below the 0.1s floor: swap I/O rate and trend are suppressed
+        let s = st.update_with(80.0, &mi, 99999, 99999, 0, t0);
+        assert_eq!(s.swap_io_kbs, 0.0);
+        assert_eq!(s.trend, 0.0);
     }
 
     // ── apply_swap_overrides ─────────────────────────────────────────────────

@@ -56,7 +56,7 @@ fn read_process(pid: u32, path: &Path) -> Result<Process, MgdError> {
 
     let cgroup_content = fs::read_to_string(path.join("cgroup"))?;
     if !mgd_common::process::is_cgroup_in_user_slice(&cgroup_content) {
-        return Err(std::io::Error::new(std::io::ErrorKind::Other, "not in user cgroup").into());
+        return Err(std::io::Error::other("not in user cgroup").into());
     }
 
     let mut cgroup_path = None;

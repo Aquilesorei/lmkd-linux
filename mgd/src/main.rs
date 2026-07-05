@@ -200,11 +200,10 @@ fn cleanup_orphaned_snapshots(checkpointed: &Arc<Mutex<CheckpointRegistry>>) {
     for entry in entries.flatten() {
         if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
             let path = entry.path();
-            if !active_dirs.contains(&path) {
-                if std::fs::remove_dir_all(&path).is_ok() {
+            if !active_dirs.contains(&path)
+                && std::fs::remove_dir_all(&path).is_ok() {
                     mgd_common::sync_print!("[startup] Removed orphaned snapshot: {:?}", path);
                 }
-            }
         }
     }
 }
@@ -243,9 +242,9 @@ extern "C" fn handle_sighup(_: libc::c_int) {
 
 fn try_elevate_scheduler_priority() {
     unsafe {
-        let mut param = libc::sched_param { sched_priority: 20 };
+        let param = libc::sched_param { sched_priority: 20 };
         // Set policy to SCHED_RR (Real-Time Round Robin) with priority 20
-        if libc::sched_setscheduler(0, libc::SCHED_RR, &mut param) == 0 {
+        if libc::sched_setscheduler(0, libc::SCHED_RR, &param) == 0 {
             locked_print("[core] Successfully set scheduler policy to SCHED_RR (priority 20)");
         } else {
             let err = std::io::Error::last_os_error();

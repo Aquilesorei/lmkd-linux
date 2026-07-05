@@ -1,30 +1,31 @@
-/// mgctl — control client for the mgd daemon.
+//! mgctl — control client for the mgd daemon.
+//!
+//! Talks to the running mgd daemon via its Unix domain socket for live
+//! introspection, and shells out to `systemctl --user` for lifecycle control
+//! (which can't go over the socket — start/stop/restart must work when the
+//! daemon is down, or must outlive the daemon process itself).
+//!
+//! Usage:
+//!   mgctl status              — pressure, avail RAM, swap, managed counts  (socket)
+//!   mgctl list                — frozen, checkpointed, and throttled procs  (socket)
+//!   mgctl ps                  — all live monitored processes with CPU/RSS   (socket)
+//!   mgctl info <pid|name>     — per-process detail: RSS, swap, priority    (socket)
+//!   mgctl events              — recent daemon actions (ring buffer)         (socket)
+//!   mgctl watch               — live refreshing dashboard                  (socket)
+//!   mgctl freeze <pid|name>   — manually freeze by PID or name             (socket)
+//!   mgctl unfreeze <pid|name> — manually unfreeze by PID or name           (socket)
+//!   mgctl restore <pid|name>  — restore a checkpointed process             (socket)
+//!   mgctl kill <pid|name>     — manually SIGKILL by PID or name            (socket)
+//!   mgctl reload              — hot-reload daemon config without restart    (socket)
+//!   mgctl restart             — restart the mgd service                 (systemctl)
+//!   mgctl start               — start the mgd service                   (systemctl)
+//!   mgctl stop                — stop the mgd service                    (systemctl)
+//!   mgctl service             — show systemd unit state                (systemctl)
+//!   mgctl logs [-f]           — show daemon logs (-f to follow)         (journalctl)
+
 mod calibrate;
 mod doctor;
 mod watch;
-///
-/// Talks to the running mgd daemon via its Unix domain socket for live
-/// introspection, and shells out to `systemctl --user` for lifecycle control
-/// (which can't go over the socket — start/stop/restart must work when the
-/// daemon is down, or must outlive the daemon process itself).
-///
-/// Usage:
-///   mgctl status              — pressure, avail RAM, swap, managed counts  (socket)
-///   mgctl list                — frozen, checkpointed, and throttled procs  (socket)
-///   mgctl ps                  — all live monitored processes with CPU/RSS   (socket)
-///   mgctl info <pid|name>     — per-process detail: RSS, swap, priority    (socket)
-///   mgctl events              — recent daemon actions (ring buffer)         (socket)
-///   mgctl watch               — live refreshing dashboard                  (socket)
-///   mgctl freeze <pid|name>   — manually freeze by PID or name             (socket)
-///   mgctl unfreeze <pid|name> — manually unfreeze by PID or name           (socket)
-///   mgctl restore <pid|name>  — restore a checkpointed process             (socket)
-///   mgctl kill <pid|name>     — manually SIGKILL by PID or name            (socket)
-///   mgctl reload              — hot-reload daemon config without restart    (socket)
-///   mgctl restart             — restart the mgd service                 (systemctl)
-///   mgctl start               — start the mgd service                   (systemctl)
-///   mgctl stop                — stop the mgd service                    (systemctl)
-///   mgctl service             — show systemd unit state                (systemctl)
-///   mgctl logs [-f]           — show daemon logs (-f to follow)         (journalctl)
 
 use std::io::{BufReader, Read, Write};
 use std::os::unix::net::UnixStream;

@@ -75,8 +75,8 @@ fn main() {
                     CoreMessage::ActionResponse { action, approved, reason } => {
                         if !approved {
                             mgd_common::sync_print!("[mgd-kde] action denied: {:?}", reason);
-                        } else if let PluginAction::RestartProcess { name } = action {
-                            if name == "plasmashell" {
+                        } else if let PluginAction::RestartProcess { name } = action
+                            && name == "plasmashell" {
                                 let now = unix_timestamp_secs();
                                 LAST_PLASMA_RESTART.store(now, Ordering::SeqCst);
                                 let _ = std::process::Command::new("systemctl")
@@ -85,7 +85,6 @@ fn main() {
                                     .arg("plasma-plasmashell.service")
                                     .spawn();
                             }
-                        }
                     }
                     CoreMessage::ConfigReload => {
                         *PLUGIN_CONFIG.lock().unwrap() = None;
@@ -189,11 +188,10 @@ fn load_plugin_config_from_disk() -> PluginConfig {
         std::path::PathBuf::from("/etc/mgd/priorities.toml"),
     ];
     for path in &paths {
-        if let Ok(content) = std::fs::read_to_string(path) {
-            if let Ok(cfg) = toml::from_str(&content) {
+        if let Ok(content) = std::fs::read_to_string(path)
+            && let Ok(cfg) = toml::from_str(&content) {
                 return cfg;
             }
-        }
     }
     PluginConfig::default()
 }
@@ -301,12 +299,12 @@ fn load_kwin_script() -> Option<i32> {
 
     // Unload first
     let _ = std::process::Command::new("busctl")
-        .args(&["--user", "call", "org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting", "unloadScript", "s", "mgd-active-window"])
+        .args(["--user", "call", "org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting", "unloadScript", "s", "mgd-active-window"])
         .output();
 
     // Load
     let out = std::process::Command::new("busctl")
-        .args(&["--user", "call", "org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting", "loadScript", "ss", &script_path, "mgd-active-window"])
+        .args(["--user", "call", "org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting", "loadScript", "ss", &script_path, "mgd-active-window"])
         .output()
         .ok()?;
     if !out.status.success() {
@@ -314,25 +312,24 @@ fn load_kwin_script() -> Option<i32> {
     }
     let stdout = String::from_utf8_lossy(&out.stdout);
     // Parse "i <id>"
-    let id_str = stdout.trim().split_whitespace().nth(1)?;
+    let id_str = stdout.split_whitespace().nth(1)?;
     let id: i32 = id_str.parse().ok()?;
     
     // Run
     let script_obj_path = format!("/Scripting/Script{}", id);
     let run_out = std::process::Command::new("busctl")
-        .args(&["--user", "call", "org.kde.KWin", &script_obj_path, "org.kde.kwin.Script", "run"])
+        .args(["--user", "call", "org.kde.KWin", &script_obj_path, "org.kde.kwin.Script", "run"])
         .output();
-    if let Ok(o) = run_out {
-        if o.status.success() {
+    if let Ok(o) = run_out
+        && o.status.success() {
             return Some(id);
         }
-    }
     None
 }
 
 fn watch_active_window(writer: std::os::unix::net::UnixStream) {
     let mut child = match std::process::Command::new("journalctl")
-        .args(&["--user", "-f", "-o", "cat", "-n", "0"])
+        .args(["--user", "-f", "-o", "cat", "-n", "0"])
         .stdout(std::process::Stdio::piped())
         .spawn() 
     {
@@ -350,18 +347,15 @@ fn watch_active_window(writer: std::os::unix::net::UnixStream) {
     std::thread::spawn(move || {
         let mut line = String::new();
         for line_res in reader.lines() {
-            if let Ok(l) = line_res {
-                if let Some(pid_str) = l.trim().strip_prefix("ACTIVE_WINDOW_PID:") {
-                    if let Ok(pid) = pid_str.trim().parse::<u32>() {
+            if let Ok(l) = line_res
+                && let Some(pid_str) = l.trim().strip_prefix("ACTIVE_WINDOW_PID:")
+                    && let Ok(pid) = pid_str.trim().parse::<u32>() {
                         let msg = PluginMessage::ActiveWindow { pid: Some(pid) };
-                        if let Ok(json) = serde_json::to_string(&msg) {
-                            if writeln!(writer_clone, "{}", json).is_err() {
+                        if let Ok(json) = serde_json::to_string(&msg)
+                            && writeln!(writer_clone, "{}", json).is_err() {
                                 break;
                             }
-                        }
                     }
-                }
-            }
             line.clear();
         }
         let _ = child.kill();

@@ -232,27 +232,25 @@ fn process_running(name: &str) -> bool {
 
 fn report_gpu_cache(daemon_running: bool, gpu_applicable: bool) {
     if !gpu_applicable || !daemon_running { return; }
-    match crate::query_socket("gpu-info", 3) {
-        Ok(resp) => {
-            // Parse "gpu_pids=<n> total_kb=<n> newest_obs=<s>"
-            let mut pids: Option<u64> = None;
-            let mut total_kb: Option<u64> = None;
-            let mut newest: Option<String> = None;
-            for part in resp.split_whitespace() {
-                if let Some(v) = part.strip_prefix("gpu_pids=")   { pids     = v.parse().ok(); }
-                if let Some(v) = part.strip_prefix("total_kb=")   { total_kb = v.parse().ok(); }
-                if let Some(v) = part.strip_prefix("newest_obs=") { newest   = Some(v.to_string()); }
-            }
-            let pids     = pids.unwrap_or(0);
-            let total_mb = total_kb.unwrap_or(0) / 1024;
-            let age      = newest.as_deref().unwrap_or("none");
-            if pids == 0 {
-                println!("  {}", warn("GPU cache empty — plugin connected but no observations yet"));
-            } else {
-                println!("  {}", ok(&format!("GPU cache: {pids} PID(s), {total_mb} MB resident, last obs {age}")));
-            }
+    // Err = daemon not reachable — already reported above.
+    if let Ok(resp) = crate::query_socket("gpu-info", 3) {
+        // Parse "gpu_pids=<n> total_kb=<n> newest_obs=<s>"
+        let mut pids: Option<u64> = None;
+        let mut total_kb: Option<u64> = None;
+        let mut newest: Option<String> = None;
+        for part in resp.split_whitespace() {
+            if let Some(v) = part.strip_prefix("gpu_pids=")   { pids     = v.parse().ok(); }
+            if let Some(v) = part.strip_prefix("total_kb=")   { total_kb = v.parse().ok(); }
+            if let Some(v) = part.strip_prefix("newest_obs=") { newest   = Some(v.to_string()); }
         }
-        Err(_) => {} // daemon not reachable — already reported above
+        let pids     = pids.unwrap_or(0);
+        let total_mb = total_kb.unwrap_or(0) / 1024;
+        let age      = newest.as_deref().unwrap_or("none");
+        if pids == 0 {
+            println!("  {}", warn("GPU cache empty — plugin connected but no observations yet"));
+        } else {
+            println!("  {}", ok(&format!("GPU cache: {pids} PID(s), {total_mb} MB resident, last obs {age}")));
+        }
     }
 }
 
@@ -279,25 +277,23 @@ fn read_calibration() -> CalibrationInfo {
     };
 
     // Read machine data from JSON
-    if let Ok(data) = fs::read_to_string(&json_path) {
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) {
+    if let Ok(data) = fs::read_to_string(&json_path)
+        && let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) {
             info.calibrated_at    = v["calibrated_at"].as_str().map(|s| s.to_string());
             info.swap_onset_mb    = v["swap_onset_mb"].as_u64();
             info.psi_recovery_secs= v["psi_recovery_secs"].as_u64();
         }
-    }
 
     // Read derived threshold from TOML suggestion
     if let Ok(data) = fs::read_to_string(&toml_path) {
         for line in data.lines() {
-            if let Some(rest) = line.trim().strip_prefix("target_available_pct") {
-                if let Some(val) = rest.split('=').nth(1) {
+            if let Some(rest) = line.trim().strip_prefix("target_available_pct")
+                && let Some(val) = rest.split('=').nth(1) {
                     let num: String = val.chars()
                         .take_while(|c| c.is_ascii_digit() || *c == ' ')
                         .collect();
                     info.target_available_pct = num.trim().parse().ok();
                 }
-            }
         }
     }
 

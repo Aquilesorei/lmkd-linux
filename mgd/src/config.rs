@@ -255,6 +255,7 @@ fn default_idle_reclaim_important_pct() -> u64 { 10 }
 
 /// `[emergency]` — last-resort actions when pressure stays at Emergency level.
 #[derive(Deserialize)]
+#[derive(Default)]
 struct EmergencyConfig {
     /// Seconds of sustained Emergency before triggering `systemctl hibernate`.
     /// 0 (default) = disabled. Requires working hibernate (swap partition ≥ RAM).
@@ -262,11 +263,6 @@ struct EmergencyConfig {
     hibernate_after_sec: u64,
 }
 
-impl Default for EmergencyConfig {
-    fn default() -> Self {
-        EmergencyConfig { hibernate_after_sec: 0 }
-    }
-}
 
 #[derive(Deserialize)]
 struct SpikeMode {
@@ -456,11 +452,10 @@ impl CompiledConfig {
                 return *prio;
             }
         }
-        if let Some(exe) = exe_basename {
-            if let Some(&prio) = self.desktop_index.get(exe) {
+        if let Some(exe) = exe_basename
+            && let Some(&prio) = self.desktop_index.get(exe) {
                 return prio;
             }
-        }
         self.default_priority
     }
 
@@ -607,8 +602,8 @@ fn load_calibrated_target_pct() -> Option<f64> {
 
 fn parse_calibrated_target_pct(content: &str) -> Option<f64> {
     for line in content.lines() {
-        if let Some(rest) = line.trim().strip_prefix("target_available_pct") {
-            if let Some(val) = rest.split('=').nth(1) {
+        if let Some(rest) = line.trim().strip_prefix("target_available_pct")
+            && let Some(val) = rest.split('=').nth(1) {
                 let num: String = val.trim().chars()
                     .take_while(|c| c.is_ascii_digit() || *c == '.')
                     .collect();
@@ -616,7 +611,6 @@ fn parse_calibrated_target_pct(content: &str) -> Option<f64> {
                     return Some(pct.clamp(5.0, 50.0));
                 }
             }
-        }
     }
     None
 }
@@ -773,7 +767,7 @@ fn scan_desktop_files(category_priorities: &HashMap<String, u8>) -> HashMap<Stri
     index
 }
 
-fn parse_desktop_file<'a>(path: &Path, category_priorities: &HashMap<String, u8>) -> Option<(String, u8)> {
+fn parse_desktop_file(path: &Path, category_priorities: &HashMap<String, u8>) -> Option<(String, u8)> {
     let content = std::fs::read_to_string(path).ok()?;
     let mut exe_basename: Option<String> = None;
     // Borrow slices directly from content — no String allocation per category.
@@ -795,8 +789,8 @@ fn parse_desktop_file<'a>(path: &Path, category_priorities: &HashMap<String, u8>
             let Some(binary) = rest.split_whitespace().next() else { continue };
             let Some(name) = Path::new(binary).file_name() else { continue };
             exe_basename = Some(name.to_string_lossy().into_owned());
-        } else if line.starts_with("Categories=") {
-            categories = line["Categories=".len()..]
+        } else if let Some(rest) = line.strip_prefix("Categories=") {
+            categories = rest
                 .split(';')
                 .filter(|s| !s.is_empty())
                 .collect();
