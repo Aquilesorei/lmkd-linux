@@ -1,13 +1,14 @@
 //! Unit newtypes shared across the daemon, plugins, and wire protocol.
 //!
 //! `#[serde(transparent)]` keeps both the plugin JSON wire format and the
-//! persisted registry files byte-identical to the raw-integer encoding —
+//! persisted registry files wire-compatible with the raw-integer encoding —
 //! no migration of `~/.local/share/mgd/state/` is needed (proven by the
-//! round-trip tests below).
+//! round-trip tests below; map key order is not guaranteed, parsing is
+//! order-insensitive).
 
 use std::fmt;
 use std::iter::Sum;
-use std::ops::{Add, Sub};
+use std::ops::Add;
 
 use serde::{Deserialize, Serialize};
 
@@ -30,12 +31,13 @@ impl fmt::Display for Pid {
 pub struct Kb(pub u64);
 
 impl Kb {
+    /// Binary megabytes (MiB), matching /proc and the rest of the log output.
     pub fn mb(self) -> f64 {
         self.0 as f64 / 1024.0
     }
 
     pub fn bytes(self) -> u64 {
-        self.0 * 1024
+        self.0.saturating_mul(1024)
     }
 
     pub fn saturating_add(self, rhs: Kb) -> Kb {
@@ -54,12 +56,10 @@ impl Add for Kb {
     }
 }
 
-impl Sub for Kb {
-    type Output = Kb;
-    fn sub(self, rhs: Kb) -> Kb {
-        Kb(self.0 - rhs.0)
-    }
-}
+// No `Sub` on purpose: these values come from sampled counters (/proc,
+// fdinfo), so a momentary b > a is normal, and release-mode wrapping would
+// turn it into a ~u64::MAX pressure figure. Every subtraction site must
+// choose saturating_sub (or checked_sub) explicitly.
 
 impl Sum for Kb {
     fn sum<I: Iterator<Item = Kb>>(iter: I) -> Kb {
@@ -162,8 +162,8 @@ mod tests {
         assert_eq!(Kb(2048).mb(), 2.0);
         assert_eq!(Kb(2).bytes(), 2048);
         assert_eq!(Kb(1) + Kb(2), Kb(3));
-        assert_eq!(Kb(3) - Kb(1), Kb(2));
         assert_eq!(Kb(u64::MAX).saturating_add(Kb(1)), Kb(u64::MAX));
+        assert_eq!(Kb(u64::MAX).bytes(), u64::MAX);
         assert_eq!(Kb(1).saturating_sub(Kb(2)), Kb(0));
         assert_eq!([Kb(1), Kb(2), Kb(3)].into_iter().sum::<Kb>(), Kb(6));
     }

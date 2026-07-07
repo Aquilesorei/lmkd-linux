@@ -295,7 +295,7 @@ impl SpikeTracker {
             let required = Kb((sum_rss_max.0 as f64 * p.headroom_factor) as u64);
             if available < required {
                 decisions.push(SpikeDecision::FreezeForHeadroom {
-                    needed: required - available,
+                    needed: required.saturating_sub(available),
                 });
             }
         }
@@ -756,7 +756,7 @@ mod tests {
         let SpikeDecision::FreezeForHeadroom { needed } = d.into_iter().next().unwrap() else {
             panic!("expected FreezeForHeadroom");
         };
-        assert_eq!(needed, required - available);
+        assert_eq!(needed, required.saturating_sub(available));
     }
 
     // T17 ─ majflt_delta computed from prev cache, not instantaneous value
