@@ -1,23 +1,24 @@
 use mgd_common::meminfo::parse_kb;
+use mgd_common::types::Kb;
 
 pub struct MemInfo {
-    pub available_kb: u64,
-    pub total_kb: u64,
-    pub swap_free_kb: u64,
-    pub swap_total_kb: u64,
+    pub available_kb: Kb,
+    pub total_kb: Kb,
+    pub swap_free_kb: Kb,
+    pub swap_total_kb: Kb,
 }
 
 impl MemInfo {
     pub fn swap_used_pct(&self) -> f64 {
-        if self.swap_total_kb == 0 { return 0.0; }
-        (self.swap_total_kb - self.swap_free_kb) as f64 / self.swap_total_kb as f64 * 100.0
+        if self.swap_total_kb.0 == 0 { return 0.0; }
+        (self.swap_total_kb.0 - self.swap_free_kb.0) as f64 / self.swap_total_kb.0 as f64 * 100.0
     }
 }
 
 /// Returns memory info from /proc/meminfo.
 pub fn read_meminfo() -> MemInfo {
     let Ok(content) = std::fs::read_to_string("/proc/meminfo") else {
-        return MemInfo { available_kb: 0, total_kb: 0, swap_free_kb: 0, swap_total_kb: 0 };
+        return MemInfo { available_kb: Kb(0), total_kb: Kb(0), swap_free_kb: Kb(0), swap_total_kb: Kb(0) };
     };
     let mut total = 0u64;
     let mut available = 0u64;
@@ -34,7 +35,7 @@ pub fn read_meminfo() -> MemInfo {
             swap_free = parse_kb(v);
         }
     }
-    MemInfo { available_kb: available, total_kb: total, swap_free_kb: swap_free, swap_total_kb: swap_total }
+    MemInfo { available_kb: Kb(available), total_kb: Kb(total), swap_free_kb: Kb(swap_free), swap_total_kb: Kb(swap_total) }
 }
 
 /// Cumulative swap I/O page counters from /proc/vmstat.

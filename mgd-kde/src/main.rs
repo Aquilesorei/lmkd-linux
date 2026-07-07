@@ -8,6 +8,7 @@ use std::thread;
 use std::time::Duration;
 use mgd_common::util::unix_timestamp_secs;
 use mgd_common::protocol::{CoreMessage, PluginAction, PluginMessage};
+use mgd_common::types::Pid;
 
 const PLUGIN_NAME: &str = "mgd-kde";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -70,7 +71,7 @@ fn main() {
                         *level_clone.lock().unwrap() = level;
                     }
                     CoreMessage::GpuObservation { kb, .. } => {
-                        *gpu_kb_clone.lock().unwrap() = kb;
+                        *gpu_kb_clone.lock().unwrap() = kb.0;
                     }
                     CoreMessage::ActionResponse { action, approved, reason } => {
                         if !approved {
@@ -207,7 +208,7 @@ fn check_plasma_gpu(writer: &mut UnixStream, cache: &Arc<Mutex<u64>>, pid_cache:
     let Some(pid) = resolve_pid("plasmashell", pid_cache) else { return };
 
     // Request latest GPU stats for this PID
-    let req = PluginMessage::QueryGpu { pid };
+    let req = PluginMessage::QueryGpu { pid: Pid(pid) };
     if writeln!(writer, "{}", serde_json::to_string(&req).unwrap()).is_err() {
         std::process::exit(1);
     }
@@ -273,7 +274,7 @@ fn check_plasma_discover(writer: &mut UnixStream, tracker: &mut DiscoverTracker,
         if rss_kb / 1024 > cfg.plasma_discover.rss_threshold_mb {
             let req = PluginMessage::ActionRequest {
                 plugin: PLUGIN_NAME.to_string(),
-                action: PluginAction::KillPid { pid },
+                action: PluginAction::KillPid { pid: Pid(pid) },
                 reason: format!("RSS {}MB > {}MB and idle for {}s", rss_kb / 1024, cfg.plasma_discover.rss_threshold_mb, cfg.plasma_discover.idle_check_secs),
             };
             if writeln!(writer, "{}", serde_json::to_string(&req).unwrap()).is_err() {
@@ -350,7 +351,7 @@ fn watch_active_window(writer: std::os::unix::net::UnixStream) {
             if let Ok(l) = line_res
                 && let Some(pid_str) = l.trim().strip_prefix("ACTIVE_WINDOW_PID:")
                     && let Ok(pid) = pid_str.trim().parse::<u32>() {
-                        let msg = PluginMessage::ActiveWindow { pid: Some(pid) };
+                        let msg = PluginMessage::ActiveWindow { pid: Some(Pid(pid)) };
                         if let Ok(json) = serde_json::to_string(&msg)
                             && writeln!(writer_clone, "{}", json).is_err() {
                                 break;

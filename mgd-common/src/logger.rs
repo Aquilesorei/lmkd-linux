@@ -78,8 +78,14 @@ impl Logger {
         Logger { log_path }
     }
 
+    /// Logger that discards everything — for unit tests exercising code paths
+    /// that take a `&Logger` without touching `~/memlogs`.
+    pub fn null() -> Self {
+        Logger { log_path: PathBuf::from("/dev/null") }
+    }
+
     /// Append a structured action entry to the session log.
-    pub fn log(&self, action: LogAction, pid: u32, name: &str, rss_mb: f64, result: &str) {
+    pub fn log(&self, action: LogAction, pid: crate::types::Pid, name: &str, rss_mb: f64, result: &str) {
         self.write_line(&format!(
             "[{}] {} pid={} name={} rss={:.0}MB result={}",
             timestamp_now(), action.as_str(), pid, name, rss_mb, result,

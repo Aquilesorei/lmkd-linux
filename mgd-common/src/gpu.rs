@@ -104,7 +104,7 @@ pub fn get_process_gpu_stats(pid: u32) -> Option<SingleProcessGpuMemory> {
 
 /// Write resident/total/purgeable observations for `pid` to `writer`.
 /// Shared by mgd-gpu-intel and mgd-gpu-amd — same wire format, same metrics.
-pub fn send_gpu_stats(writer: &mut impl std::io::Write, plugin: &str, pid: u32, stats: &SingleProcessGpuMemory) {
+pub fn send_gpu_stats(writer: &mut impl std::io::Write, plugin: &str, pid: crate::types::Pid, stats: &SingleProcessGpuMemory) {
     use crate::protocol::{Metric, PluginMessage};
     for (metric, kb) in [
         (Metric::GpuResidentKb,  stats.resident_kb),

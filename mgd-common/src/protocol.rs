@@ -6,6 +6,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::types::{Kb, Pid};
+
 // ── Plugin → Core ─────────────────────────────────────────────────────────────
 
 /// Messages that a plugin sends to the core daemon.
@@ -23,7 +25,7 @@ pub enum PluginMessage {
     Observation {
         plugin: String,
         metric: Metric,
-        pid: Option<u32>,
+        pid: Option<Pid>,
         value: f64,
     },
 
@@ -36,12 +38,12 @@ pub enum PluginMessage {
 
     /// Request the latest cached GPU footprint for a specific PID.
     QueryGpu {
-        pid: u32,
+        pid: Pid,
     },
 
     /// Active window change reported by a desktop watcher plugin.
     ActiveWindow {
-        pid: Option<u32>,
+        pid: Option<Pid>,
     },
 }
 
@@ -70,9 +72,9 @@ pub enum PluginAction {
     /// Restart a named DE process (e.g. plasmashell).
     RestartProcess { name: String },
     /// Suggest freezing a specific PID.
-    FreezePid { pid: u32 },
+    FreezePid { pid: Pid },
     /// Suggest killing a specific PID.
-    KillPid { pid: u32 },
+    KillPid { pid: Pid },
 }
 
 // ── Core → Plugin ─────────────────────────────────────────────────────────────
@@ -99,15 +101,15 @@ pub enum CoreMessage {
 
     /// Response to `QueryGpu`.
     GpuObservation {
-        pid: u32,
+        pid: Pid,
         /// GPU resident KB (includes shared).
-        kb: u64,
+        kb: Kb,
         /// Shared/imported dma-buf KB (double-counted in resident).
-        shared_kb: u64,
+        shared_kb: Kb,
         /// Total allocated KB (diagnostic only).
-        total_kb: u64,
+        total_kb: Kb,
         /// Purgeable KB (shrinker free path).
-        purgeable_kb: u64,
+        purgeable_kb: Kb,
     },
 
     /// Sent by core immediately before it exits. Plugins should disconnect.

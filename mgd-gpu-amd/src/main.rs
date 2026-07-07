@@ -30,7 +30,7 @@ fn main() {
                 if meta.uid() != own_uid { continue; }
 
                 if let Some(stats) = mgd_common::gpu::get_process_gpu_stats(pid) {
-                    mgd_common::gpu::send_gpu_stats(&mut writer, PLUGIN_NAME, pid, &stats);
+                    mgd_common::gpu::send_gpu_stats(&mut writer, PLUGIN_NAME, mgd_common::types::Pid(pid), &stats);
                 }
             }
         }

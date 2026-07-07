@@ -4,6 +4,7 @@ pub mod meminfo;
 pub mod output;
 pub mod protocol;
 pub mod socket;
+pub mod types;
 pub mod util;
 pub mod plugin;
 pub mod process;

@@ -594,7 +594,7 @@ fn try_system_config() -> Option<(String, Option<PathBuf>)> {
 ///   > 32 GB  → 10%   (server/high-RAM — proportional guard is still ample)
 fn ram_scaled_target_pct() -> f64 {
     let total_kb = crate::monitor::meminfo::read_meminfo().total_kb;
-    let total_gb = total_kb as f64 / (1024.0 * 1024.0);
+    let total_gb = total_kb.0 as f64 / (1024.0 * 1024.0);
     if      total_gb < 8.0  { 20.0 }
     else if total_gb < 16.0 { 15.0 }
     else if total_gb < 32.0 { 12.0 }

@@ -5,15 +5,16 @@ use std::path::Path;
 use std::sync::{LazyLock, Mutex};
 
 use mgd_common::error::MgdError;
+use mgd_common::types::{Kb, Pid};
 
 #[derive(Debug, Clone)]
 pub struct Process {
-    pub pid: u32,
+    pub pid: Pid,
     pub name: String,
     /// Basename of /proc/PID/exe — untruncated, used for .desktop category lookup.
     pub exe_basename: Option<String>,
-    pub rss_kb: u64,
-    pub swap_kb: u64,
+    pub rss_kb: Kb,
+    pub swap_kb: Kb,
     pub oom_score: i32,
     /// Unified cgroup v2 path (e.g. `/user.slice/user-1000.slice/…`), cached to
     /// avoid re-reading `/proc/PID/cgroup` multiple times per evictor cycle.
@@ -24,7 +25,7 @@ pub struct Process {
 }
 
 /// pid → (total_ticks, unix_timestamp_secs) from previous list_processes() call.
-static CPU_CACHE: LazyLock<Mutex<HashMap<u32, (u64, u64)>>> =
+static CPU_CACHE: LazyLock<Mutex<HashMap<Pid, (u64, u64)>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 static CLK_TCK: LazyLock<u64> =
@@ -41,13 +42,13 @@ pub fn list_processes() -> Vec<Process> {
         .filter_map(|e| e.ok())
         .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok().map(|pid| (pid, e.path())))
         .filter(|(pid, _)| *pid != own_pid)
-        .filter_map(|(pid, path)| read_process(pid, &path).ok())
+        .filter_map(|(pid, path)| read_process(Pid(pid), &path).ok())
         .collect();
     prune_cpu_cache(&procs);
     procs
 }
 
-fn read_process(pid: u32, path: &Path) -> Result<Process, MgdError> {
+fn read_process(pid: Pid, path: &Path) -> Result<Process, MgdError> {
     let our_uid = mgd_common::util::current_uid();
     let meta = fs::metadata(path)?;
     if meta.uid() != our_uid {
@@ -75,11 +76,9 @@ fn read_process(pid: u32, path: &Path) -> Result<Process, MgdError> {
     let name = parse_status_field(&status, "Name:")
         .unwrap_or_else(|| "unknown".to_string());
 
-    let rss_kb = parse_status_kb(&status, "VmRSS:")
-        .unwrap_or(0);
+    let rss_kb = Kb(parse_status_kb(&status, "VmRSS:").unwrap_or(0));
 
-    let swap_kb = parse_status_kb(&status, "VmSwap:")
-        .unwrap_or(0);
+    let swap_kb = Kb(parse_status_kb(&status, "VmSwap:").unwrap_or(0));
 
     let oom_score = fs::read_to_string(path.join("oom_score"))
         .ok()
@@ -90,14 +89,14 @@ fn read_process(pid: u32, path: &Path) -> Result<Process, MgdError> {
         .ok()
         .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()));
 
-    let (ticks, majflt) = mgd_common::process::read_proc_stat(pid);
+    let (ticks, majflt) = mgd_common::process::read_proc_stat(pid.0);
     let cpu_pct = compute_cpu_pct(pid, ticks);
 
     Ok(Process { pid, name, exe_basename, rss_kb, swap_kb, oom_score, cgroup_path, cpu_pct, majflt })
 }
 
 
-fn compute_cpu_pct(pid: u32, ticks: Option<u64>) -> f32 {
+fn compute_cpu_pct(pid: Pid, ticks: Option<u64>) -> f32 {
     let ticks = match ticks {
         Some(t) => t,
         None => return 0.0,

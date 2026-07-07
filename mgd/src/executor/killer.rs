@@ -2,13 +2,15 @@ use std::io;
 use std::time::Duration;
 use std::thread;
 
+use mgd_common::types::Pid;
+
 use super::{read_start_time, OpResult};
 
 /// SIGTERM → 5s wait → SIGKILL.
-pub fn sigterm(pid: u32) -> OpResult {
+pub fn sigterm(pid: Pid) -> OpResult {
     let original_start = read_start_time(pid);
 
-    let result = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+    let result = unsafe { libc::kill(pid.0 as libc::pid_t, libc::SIGTERM) };
     if result != 0 {
         return OpResult::fail(format!("SIGTERM failed: {}", io::Error::last_os_error()));
     }
@@ -28,8 +30,8 @@ pub fn sigterm(pid: u32) -> OpResult {
     sigkill(pid)
 }
 
-pub fn sigkill(pid: u32) -> OpResult {
-    let result = unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+pub fn sigkill(pid: Pid) -> OpResult {
+    let result = unsafe { libc::kill(pid.0 as libc::pid_t, libc::SIGKILL) };
     if result == 0 {
         OpResult::success()
     } else {
@@ -37,6 +39,6 @@ pub fn sigkill(pid: u32) -> OpResult {
     }
 }
 
-fn process_exists(pid: u32) -> bool {
-    unsafe { libc::kill(pid as i32, 0) == 0 }
+fn process_exists(pid: Pid) -> bool {
+    unsafe { libc::kill(pid.0 as libc::pid_t, 0) == 0 }
 }

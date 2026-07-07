@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
+use mgd_common::types::Pid;
 use mgd_common::util::unix_timestamp_secs;
 
 const MAX_EVENTS: usize = 100;
@@ -7,7 +8,7 @@ const MAX_EVENTS: usize = 100;
 pub struct ActionEvent {
     pub timestamp: u64,
     pub action: mgd_common::logger::LogAction,
-    pub pid: u32,
+    pub pid: Pid,
     pub name: String,
     pub detail: String,
 }
@@ -18,7 +19,7 @@ pub fn new_log() -> EventLog {
     Arc::new(Mutex::new(VecDeque::with_capacity(MAX_EVENTS)))
 }
 
-pub fn push(log: &EventLog, action: mgd_common::logger::LogAction, pid: u32, name: &str, detail: &str) {
+pub fn push(log: &EventLog, action: mgd_common::logger::LogAction, pid: Pid, name: &str, detail: &str) {
     let event = ActionEvent {
         timestamp: unix_timestamp_secs(),
         action,

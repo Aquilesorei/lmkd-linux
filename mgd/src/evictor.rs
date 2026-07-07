@@ -4,11 +4,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
+use mgd_common::types::{Kb, Pid};
 use mgd_common::util::unix_timestamp_secs;
 
 
 use crate::config::CompiledConfig;
 use crate::engine::decision::{Action, Decision, plan, get_priority};
+use crate::executor::ActionSink;
 use crate::executor::registry::{FrozenRegistry, CheckpointRegistry};
 use mgd_common::logger::{LogAction, Logger};
 use crate::monitor;
@@ -154,7 +156,7 @@ impl ScoreTracker {
         meminfo: &MemInfo,
         cur_pswpin: u64,
         cur_pswpout: u64,
-        total_gpu_kb: u64,
+        total_gpu: Kb,
         now: std::time::Instant,
     ) -> CycleScore {
         let dt = now.duration_since(self.last_time).as_secs_f64();
@@ -167,13 +169,13 @@ impl ScoreTracker {
         let swap_io_val = (swap_io_kbs / 51200.0).clamp(0.0, 1.0);
 
         let psi_val = (some_avg10 / 100.0).clamp(0.0, 1.0);
-        let swap_val = if meminfo.swap_total_kb > 0 {
+        let swap_val = if meminfo.swap_total_kb.0 > 0 {
             (meminfo.swap_used_pct() / 100.0).clamp(0.0, 1.0)
         } else {
             0.0
         };
-        let gpu_val = if meminfo.total_kb > 0 {
-            (total_gpu_kb as f64 / meminfo.total_kb as f64).clamp(0.0, 1.0)
+        let gpu_val = if meminfo.total_kb.0 > 0 {
+            (total_gpu.0 as f64 / meminfo.total_kb.0 as f64).clamp(0.0, 1.0)
         } else {
             0.0
         };
@@ -263,8 +265,8 @@ pub fn run(
     let mut score_tracker = ScoreTracker::new();
     let mut state_machine = StateMachine::new();
     let mut throttle = crate::throttle::ThrottleManager::new();
-    let mut idle_reclaim_pid_tracker: HashMap<u32, std::time::Instant> = HashMap::new();
-    let mut idle_freeze_pid_tracker: HashMap<u32, std::time::Instant> = HashMap::new();
+    let mut idle_reclaim_pid_tracker: HashMap<Pid, std::time::Instant> = HashMap::new();
+    let mut idle_freeze_pid_tracker: HashMap<Pid, std::time::Instant> = HashMap::new();
     let mut last_idle_reclaim_check = std::time::Instant::now();
     let mut last_active_pid = None;
     let mut recently_killed_cgroups: HashMap<String, std::time::Instant> = HashMap::new();
@@ -381,7 +383,7 @@ pub fn run(
         // swap_exhausted (≥95%) is forwarded to plan() as a per-process Kill escalator for
         // prio ≥80 (expendable tier). Distinct from apply_swap_overrides() which raises the
         // *pressure level* — both run every cycle.
-        let swap_exhausted = meminfo.swap_total_kb > 0 && swap_used_pct >= 95.0;
+        let swap_exhausted = meminfo.swap_total_kb.0 > 0 && swap_used_pct >= 95.0;
 
         let prev_effective = effective_level.clone();
         let prev_sustained = sustained_critical_swap_start;
@@ -482,7 +484,7 @@ pub fn run(
                 }
 
             let procs = monitor::process::list_processes();
-            let frozen_set: HashSet<u32> = frozen.lock().unwrap().frozen_pids().into_iter()
+            let frozen_set: HashSet<Pid> = frozen.lock().unwrap().frozen_pids().into_iter()
                 .chain(spike_tracker.victim_pids())
                 .collect();
             let plan_procs: Vec<&Process> = procs.iter()
@@ -535,7 +537,7 @@ pub fn run(
         // them mid-build corrupts the output and defeats the whole point of spike mode.
         let spike_pids_active = spike_tracker.spike_pids();
         let spike_victim_pids = spike_tracker.victim_pids();
-        let frozen_set: HashSet<u32> = frozen.lock().unwrap().frozen_pids().into_iter()
+        let frozen_set: HashSet<Pid> = frozen.lock().unwrap().frozen_pids().into_iter()
             .chain(spike_pids_active)
             .chain(spike_victim_pids)
             .collect();
@@ -561,6 +563,7 @@ pub fn run(
             let destructive_count = execute_plan(
                 &decisions, &plan_procs, &frozen, &checkpointed,
                 &log, &event_log, &mut recently_killed_cgroups,
+                &mut crate::executor::RealSink,
             );
             // Ring the doorbell — recovery thread may have new work.
             let (lock, cvar) = &*recovery_wake;
@@ -594,8 +597,8 @@ pub fn run(
                 decisions.len(),
             );
             mgd_common::sync_print!("[cycle] {attribution}");
-            log.log(LogAction::Cycle, 0, "cycle",
-                meminfo.available_kb as f64 / 1024.0, &attribution);
+            log.log(LogAction::Cycle, Pid(0), "cycle",
+                meminfo.available_kb.mb(), &attribution);
         }
     }
 }
@@ -608,8 +611,8 @@ fn idle_timeout_reclaim(
     frozen: &Arc<Mutex<FrozenRegistry>>,
     spike_tracker: &crate::spike_mode::SpikeTracker,
     log: &Logger,
-    idle_reclaim_pid_tracker: &mut HashMap<u32, std::time::Instant>,
-    idle_freeze_pid_tracker: &mut HashMap<u32, std::time::Instant>,
+    idle_reclaim_pid_tracker: &mut HashMap<Pid, std::time::Instant>,
+    idle_freeze_pid_tracker: &mut HashMap<Pid, std::time::Instant>,
     last_idle_reclaim_check: &mut std::time::Instant,
 ) {
     if !cfg.idle_reclaim_enabled {
@@ -623,7 +626,7 @@ fn idle_timeout_reclaim(
     }
     *last_idle_reclaim_check = now_inst;
     let procs = monitor::process::list_processes();
-    let frozen_set: HashSet<u32> =
+    let frozen_set: HashSet<Pid> =
         frozen.lock().unwrap().frozen_pids().into_iter()
             .chain(spike_tracker.victim_pids())
             .collect();
@@ -646,14 +649,14 @@ fn run_spike_cycle(
     spike_tracker: &mut crate::spike_mode::SpikeTracker,
     frozen: &Arc<Mutex<FrozenRegistry>>,
     log: &Logger,
-    available_kb: u64,
+    available: Kb,
     spike_snapshot: &Arc<Mutex<crate::spike_mode::SpikeSnapshot>>,
 ) {
     let spike_procs = monitor::process::list_processes();
-    let live_pids: HashSet<u32> = spike_procs.iter().map(|p| p.pid).collect();
+    let live_pids: HashSet<Pid> = spike_procs.iter().map(|p| p.pid).collect();
 
     // Unfreeze victims when their spike process exits
-    let exited: Vec<u32> = spike_tracker.spike_pids()
+    let exited: Vec<Pid> = spike_tracker.spike_pids()
         .into_iter().filter(|pid| !live_pids.contains(pid)).collect();
     let mut total_released = 0usize;
     let mut last_spike_name: Option<String> = None;
@@ -714,16 +717,16 @@ fn run_spike_cycle(
 
     // Update tracker and execute decisions
     let spike_decisions = if cfg.spike_mode_enabled {
-        spike_tracker.update(&spike_procs, available_kb, &crate::spike_mode::Params::from_config(cfg))
+        spike_tracker.update(&spike_procs, available, &crate::spike_mode::Params::from_config(cfg))
     } else {
         vec![]
     };
     for decision in spike_decisions {
         match decision {
-            crate::spike_mode::SpikeDecision::FreezeForHeadroom { needed_kb } => {
+            crate::spike_mode::SpikeDecision::FreezeForHeadroom { needed } => {
                 let spike_pids  = spike_tracker.spike_pids();
                 let victim_pids = spike_tracker.victim_pids();
-                let exclude: HashSet<u32> = frozen.lock().unwrap().frozen_pids()
+                let exclude: HashSet<Pid> = frozen.lock().unwrap().frozen_pids()
                     .into_iter()
                     .chain(spike_pids.iter().copied())
                     .chain(victim_pids.iter().copied())
@@ -739,28 +742,28 @@ fn run_spike_cycle(
                     let pb = get_priority(&b.name, b.exe_basename.as_deref(), cfg);
                     pb.cmp(&pa).then(b.rss_kb.cmp(&a.rss_kb))
                 });
-                let mut needed = needed_kb;
+                let mut needed = needed;
                 for proc in candidates {
-                    if needed == 0 { break; }
+                    if needed.0 == 0 { break; }
                     let Some(st) = crate::executor::read_start_time(proc.pid) else { continue };
                     let r = crate::executor::freezer::freeze_checked(proc.pid, st);
                     if r.success {
                         mgd_common::sync_print!(
                             "[spike] Froze {} (PID {}, {:.0}MB) for headroom",
-                            proc.name, proc.pid, proc.rss_kb as f64 / 1024.0
+                            proc.name, proc.pid, proc.rss_kb.mb()
                         );
                         log.log(LogAction::SpikeFreeze, proc.pid, &proc.name,
-                            proc.rss_kb as f64 / 1024.0, "proactive headroom");
+                            proc.rss_kb.mb(), "proactive headroom");
                         spike_tracker.record_victim_frozen(crate::spike_mode::SpikeVictim {
                             pid: proc.pid,
                             name: proc.name.clone(),
                             start_time: st,
-                            frozen_for_spike_pid: spike_pids.iter().next().copied().unwrap_or(0),
+                            frozen_for_spike_pid: spike_pids.iter().next().copied().unwrap_or(Pid(0)),
                             frozen_at: std::time::Instant::now(),
                         });
                         // Push victim RSS to zram; SIGSTOP means no re-faults so 100% is safe.
                         if let Some(cg) = proc.cgroup_path.as_deref() {
-                            let _ = reclaim_cgroup(cg, proc.rss_kb * 1024);
+                            let _ = reclaim_cgroup(cg, proc.rss_kb.bytes());
                         }
                         needed = needed.saturating_sub(proc.rss_kb);
                     }
@@ -783,6 +786,7 @@ fn run_spike_cycle(
 /// Execute the planned decisions. Returns the number of synchronous destructive
 /// actions (Kill, Checkpoint) — Terminate is async (SIGTERM→5s→SIGKILL), its RAM
 /// isn't freed yet when the caller signals maintenance, so it doesn't count.
+#[allow(clippy::too_many_arguments)] // the sink is the 8th; bundling shared registries into a struct adds no clarity
 fn execute_plan(
     decisions: &[Decision],
     plan_procs: &[&Process],
@@ -791,14 +795,15 @@ fn execute_plan(
     log: &Logger,
     event_log: &crate::events::EventLog,
     recently_killed_cgroups: &mut HashMap<String, std::time::Instant>,
+    sink: &mut impl ActionSink,
 ) -> u32 {
     mgd_common::sync_print!("⚡ EXECUTING:");
     let mut destructive_count = 0u32;
     for d in decisions {
         if frozen.lock().unwrap().is_frozen(d.pid) { continue; }
 
-        let result_str = execute_decision(d, frozen, checkpointed, log, event_log);
-        mgd_common::sync_print!("  {:<10} {:<8} {:<22} {:>6.1}MB  {}", d.action, d.pid, d.name, d.rss_mb, result_str);
+        let result_str = execute_decision(d, frozen, checkpointed, log, event_log, sink);
+        mgd_common::sync_print!("  {:<10} {:<8} {:<22} {:>6.1}MB  {}", d.action, d.pid, d.name, d.rss.mb(), result_str);
 
         // Post-freeze reclaim: push full RSS to zram while the process is immobile.
         // SIGSTOP guarantees no re-faults, so 100% is safe (unlike active-process
@@ -808,15 +813,15 @@ fn execute_plan(
                 .find(|p| p.pid == d.pid)
                 .and_then(|p| p.cgroup_path.as_deref())
             {
-                let reclaim_bytes = (d.rss_mb * 1024.0 * 1024.0) as u64;
-                match reclaim_cgroup(cgroup_path, reclaim_bytes) {
+                let reclaim_bytes = d.rss.bytes();
+                match sink.reclaim(cgroup_path, reclaim_bytes) {
                     Ok(true) => {
                         mgd_common::sync_print!(
                             "[reclaim] Post-freeze: pushed ~{:.0}MB from PID {} ({}) to zram",
-                            d.rss_mb, d.pid, d.name
+                            d.rss.mb(), d.pid, d.name
                         );
                         log.log(LogAction::FreezeReclaim, d.pid, &d.name,
-                            d.rss_mb, "pushed to zram after pressure freeze");
+                            d.rss.mb(), "pushed to zram after pressure freeze");
                     }
                     Ok(false) => {}
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
@@ -835,7 +840,7 @@ fn execute_plan(
             let cgroup_path = plan_procs.iter()
                 .find(|p| p.pid == d.pid)
                 .and_then(|p| p.cgroup_path.clone())
-                .or_else(|| mgd_common::util::read_process_cgroup_path(d.pid));
+                .or_else(|| mgd_common::util::read_process_cgroup_path(d.pid.0));
             if let Some(cgroup_path) = cgroup_path {
                 recently_killed_cgroups.insert(cgroup_path, std::time::Instant::now());
             }
@@ -850,16 +855,16 @@ fn execute_plan(
 pub(crate) fn apply_swap_overrides(
     mut effective: PressureLevel,
     swap_used_pct: f64,
-    swap_total_kb: u64,
+    swap_total: Kb,
     sustained_start: Option<std::time::Instant>,
     now: std::time::Instant,
 ) -> (PressureLevel, Option<std::time::Instant>) {
-    let swap_exhausted = swap_total_kb > 0 && swap_used_pct >= 95.0;
+    let swap_exhausted = swap_total.0 > 0 && swap_used_pct >= 95.0;
     if swap_exhausted && effective < PressureLevel::Critical {
         effective = PressureLevel::Critical;
     }
 
-    let swap_near_full = swap_total_kb > 0 && swap_used_pct >= 98.0;
+    let swap_near_full = swap_total.0 > 0 && swap_used_pct >= 98.0;
     let new_sustained = if swap_near_full && effective >= PressureLevel::Critical {
         sustained_start.or(Some(now))
     } else if effective >= PressureLevel::Emergency {
@@ -895,12 +900,12 @@ pub(crate) struct IdleReclaimConfig {
 /// Keyed by PID in background_tracker. No cgroup writes — caller handles I/O.
 pub(crate) fn select_idle_candidates(
     procs: &[&crate::monitor::process::Process],
-    active_pid: Option<u32>,
-    background_tracker: &std::collections::HashMap<u32, std::time::Instant>,
+    active_pid: Option<Pid>,
+    background_tracker: &std::collections::HashMap<Pid, std::time::Instant>,
     swap_used_pct: f64,
     cfg: &IdleReclaimConfig,
     config: &CompiledConfig,
-) -> Vec<(u32, u64)> {
+) -> Vec<(Pid, u64)> {
     if swap_used_pct > cfg.max_swap_occupancy_pct {
         return vec![];
     }
@@ -916,14 +921,14 @@ pub(crate) fn select_idle_candidates(
             .unwrap_or(0);
 
         if prio >= 50 {
-            if p.rss_kb < cfg.rss_min_mb * 1024 { continue; }
+            if p.rss_kb < Kb(cfg.rss_min_mb * 1024) { continue; }
             if duration < cfg.idle_sec { continue; }
-            let reclaim_bytes = (p.rss_kb * cfg.reclaim_pct / 100) * 1024;
+            let reclaim_bytes = Kb(p.rss_kb.0 * cfg.reclaim_pct / 100).bytes();
             candidates.push((p.pid, reclaim_bytes));
         } else if cfg.important_enabled && prio >= cfg.important_min_priority {
-            if p.rss_kb < cfg.rss_min_mb * 1024 { continue; }
+            if p.rss_kb < Kb(cfg.rss_min_mb * 1024) { continue; }
             if duration < cfg.important_idle_sec { continue; }
-            let reclaim_bytes = (p.rss_kb * cfg.important_pct / 100) * 1024;
+            let reclaim_bytes = Kb(p.rss_kb.0 * cfg.important_pct / 100).bytes();
             candidates.push((p.pid, reclaim_bytes));
         }
     }
@@ -960,7 +965,7 @@ fn compact_zram(level: &PressureLevel, log: &Logger, cfg: &CompiledConfig) {
                 mgd_common::sync_print!(
                     "[zram] compacted {device} — {before_mb}MB→{after_mb}MB used ({reclaimed}MB reclaimed)"
                 );
-                log.log(LogAction::Zram, 0, &device, reclaimed as f64,
+                log.log(LogAction::Zram, Pid(0), &device, reclaimed as f64,
                     &format!("compacted {before_mb}MB->{after_mb}MB"));
                 LAST_ZRAM_COMPACT.store(unix_timestamp_secs(), Ordering::Relaxed);
             }
@@ -970,7 +975,7 @@ fn compact_zram(level: &PressureLevel, log: &Logger, cfg: &CompiledConfig) {
                     "[zram] compact unavailable ({device}): sysfs grant absent — disabling for \
                      session. See docs/PRIVILEGE_DESIGN.md §1."
                 );
-                log.log(LogAction::Zram, 0, &device, 0.0, "unavailable: EACCES (grant absent)");
+                log.log(LogAction::Zram, Pid(0), &device, 0.0, "unavailable: EACCES (grant absent)");
                 return;
             }
             Err(e) => {
@@ -1002,7 +1007,7 @@ fn check_cache_drop(level: &PressureLevel, log: &Logger, cfg: &CompiledConfig) {
     let mut total_bytes = 0u64;
     for r in crate::monitor::cache::drop_caches(&cfg.cache_drop_paths) {
         if r.files_advised > 0 {
-            log.log(LogAction::Cache, 0, &r.pattern,
+            log.log(LogAction::Cache, Pid(0), &r.pattern,
                 (r.bytes_advised / (1024 * 1024)) as f64,
                 &format!("advised {} files", r.files_advised));
         }
@@ -1025,16 +1030,16 @@ fn print_status(
     cfg: &CompiledConfig,
 ) {
     let (total_rss, _) = procs.iter()
-        .fold((0u64, 0u64), |(r, s), p| (r.saturating_add(p.rss_kb), s.saturating_add(p.swap_kb)));
+        .fold((Kb(0), Kb(0)), |(r, s), p| (r.saturating_add(p.rss_kb), s.saturating_add(p.swap_kb)));
     let frozen_count = frozen.lock().unwrap().count();
 
     mgd_common::sync_print!(
         "\n[responder] [{effective_level}] some avg10={:.2}% | RAM {:.0}/{:.0}MB | Swap {:.0}% | Avail {:.0}MB | Procs {} | Frozen {}",
         pressure.some_avg10,
-        total_rss as f64 / 1024.0,
-        meminfo.total_kb as f64 / 1024.0,
+        total_rss.mb(),
+        meminfo.total_kb.mb(),
         meminfo.swap_used_pct(),
-        meminfo.available_kb as f64 / 1024.0,
+        meminfo.available_kb.mb(),
         procs.len(),
         frozen_count,
     );
@@ -1046,8 +1051,8 @@ fn print_status(
         let marker = if reg.is_frozen(p.pid) { " ❄" } else { "" };
         mgd_common::sync_print!("{:<8} {:<22} {:>8.1} {:>8.1} {:>5}  {}{}",
             p.pid, p.name,
-            p.rss_kb as f64 / 1024.0,
-            p.swap_kb as f64 / 1024.0,
+            p.rss_kb.mb(),
+            p.swap_kb.mb(),
             p.oom_score,
             get_priority(&p.name, p.exe_basename.as_deref(), cfg),
             marker,
@@ -1061,32 +1066,29 @@ fn execute_decision(
     checkpointed: &Arc<Mutex<CheckpointRegistry>>,
     log: &Logger,
     event_log: &crate::events::EventLog,
+    sink: &mut impl ActionSink,
 ) -> String {
     let (action, s) = match d.action {
-        Action::Freeze => (LogAction::Freeze, freeze_process(d, frozen)),
-        Action::Terminate => (LogAction::Terminate, terminate_process(d)),
-        Action::Kill => (LogAction::Kill, kill_process(d)),
-        Action::Checkpoint => execute_checkpoint(d, checkpointed),
+        Action::Freeze => (LogAction::Freeze, freeze_process(d, frozen, sink)),
+        Action::Terminate => (LogAction::Terminate, terminate_process(d, sink)),
+        Action::Kill => (LogAction::Kill, kill_process(d, sink)),
+        Action::Checkpoint => execute_checkpoint(d, checkpointed, sink),
         Action::None => return String::new(),
     };
     let detail = format!("{s} [{}]", d.reason);
-    log.log(action, d.pid, &d.name, d.rss_mb, &detail);
+    log.log(action, d.pid, &d.name, d.rss.mb(), &detail);
     crate::events::push(event_log, action, d.pid, &d.name, &detail);
     s
 }
 
-fn freeze_process(d: &Decision, frozen: &Arc<Mutex<FrozenRegistry>>) -> String {
-    // Abort if start_time is gone rather than freeze a recycled PID.
-    let st = match crate::executor::read_start_time(d.pid) {
-        Some(t) => t,
-        None => return "aborted: process vanished before freeze".into(),
-    };
-    let r = crate::executor::freezer::freeze_checked(d.pid, st);
+fn freeze_process(d: &Decision, frozen: &Arc<Mutex<FrozenRegistry>>, sink: &mut impl ActionSink) -> String {
+    // Sink aborts if start_time is gone rather than freeze a recycled PID.
+    let r = sink.freeze(d.pid);
     if r.success {
         if frozen.lock().unwrap().add(d.pid, &d.name) {
             "frozen".into()
         } else {
-            crate::executor::freezer::unfreeze(d.pid);
+            sink.unfreeze(d.pid);
             "aborted: process vanished before fingerprint".into()
         }
     } else {
@@ -1094,16 +1096,13 @@ fn freeze_process(d: &Decision, frozen: &Arc<Mutex<FrozenRegistry>>) -> String {
     }
 }
 
-fn terminate_process(d: &Decision) -> String {
-    // SIGTERM→wait→SIGKILL blocks up to 5s; run it off-thread so the responder
-    // isn't stalled per process at Critical.
-    let pid = d.pid;
-    std::thread::spawn(move || { crate::executor::killer::sigterm(pid); });
+fn terminate_process(d: &Decision, sink: &mut impl ActionSink) -> String {
+    sink.terminate(d.pid);
     "terminating (async SIGTERM→SIGKILL)".into()
 }
 
-fn kill_process(d: &Decision) -> String {
-    let r = crate::executor::killer::sigkill(d.pid);
+fn kill_process(d: &Decision, sink: &mut impl ActionSink) -> String {
+    let r = sink.kill(d.pid);
 
     match r.error {
         None => "killed".to_string(),
@@ -1111,12 +1110,12 @@ fn kill_process(d: &Decision) -> String {
     }
 }
 
-fn execute_checkpoint(d: &Decision, checkpointed: &Arc<Mutex<CheckpointRegistry>>) -> (LogAction, String) {
-    let r = crate::executor::checkpoint::checkpoint(d.pid, &d.name);
+fn execute_checkpoint(d: &Decision, checkpointed: &Arc<Mutex<CheckpointRegistry>>, sink: &mut impl ActionSink) -> (LogAction, String) {
+    let r = sink.checkpoint(d.pid, &d.name);
     if r.success {
         let dir = r.snapshot_dir.unwrap();
         checkpointed.lock().unwrap()
-            .add(d.pid, &d.name, dir.clone(), d.rss_mb as u64 * 1024);
+            .add(d.pid, &d.name, dir.clone(), d.rss);
         (LogAction::Checkpoint, format!("checkpointed → {dir:?}"))
     } else {
         // Dump failed — this binary is not safely checkpointable; record it so
@@ -1126,10 +1125,10 @@ fn execute_checkpoint(d: &Decision, checkpointed: &Arc<Mutex<CheckpointRegistry>
         // prio >= 60 → Terminate (async, graceful); prio < 60 → Kill (protected process,
         // dump likely failed due to complex state, don't wait for SIGTERM).
         if d.prio >= 60 {
-            terminate_process(d);
+            terminate_process(d, sink);
             (LogAction::Terminate, format!("terminating (CRIU failed: {})", r.error.unwrap_or_default()))
         } else {
-            let kr = crate::executor::killer::sigkill(d.pid);
+            let kr = sink.kill(d.pid);
             if kr.success {
                 (LogAction::Kill, format!("killed (CRIU failed: {})", r.error.unwrap_or_default()))
             } else {
@@ -1150,7 +1149,7 @@ fn is_cgroup_leaf(cgroup_path: &str) -> bool {
         .unwrap_or(true) // fail open: can't read → assume leaf, attempt reclaim
 }
 
-fn reclaim_cgroup(cgroup_path: &str, bytes_size: u64) -> Result<bool, std::io::Error> {
+pub(crate) fn reclaim_cgroup(cgroup_path: &str, bytes_size: u64) -> Result<bool, std::io::Error> {
 
     if bytes_size == 0 {
         return Ok(false);
@@ -1179,7 +1178,7 @@ fn reclaim_cgroup(cgroup_path: &str, bytes_size: u64) -> Result<bool, std::io::E
 fn check_early_process_reclaim(
     level: &PressureLevel,
     plan_procs: &[&Process],
-    active_pid: Option<u32>,
+    active_pid: Option<Pid>,
     log: &Logger,
     cfg: &CompiledConfig,
 ) {
@@ -1207,7 +1206,7 @@ fn check_early_process_reclaim(
     let mut targets: Vec<&Process> = plan_procs
         .iter()
         .filter(|p| {
-            p.rss_kb > 20_000
+            p.rss_kb > Kb(20_000)
                 && Some(p.pid) != active_pid
                 && {
                     let prio = get_priority(&p.name, p.exe_basename.as_deref(), cfg);
@@ -1221,7 +1220,7 @@ fn check_early_process_reclaim(
     targets.sort_by_key(|p| std::cmp::Reverse(p.rss_kb));
 
     for p in targets.iter().take(3) {
-        let reclaim_bytes_size = (p.rss_kb / 2) * 1024; // reclaim 50% of RSS
+        let reclaim_bytes_size = Kb(p.rss_kb.0 / 2).bytes(); // reclaim 50% of RSS
         let Some(cgroup) = p.cgroup_path.as_deref() else { continue };
         match reclaim_cgroup(cgroup, reclaim_bytes_size) {
             Ok(true) => {
@@ -1251,18 +1250,18 @@ fn check_early_process_reclaim(
 fn check_idle_process_reclaim(
     cfg: &CompiledConfig,
     plan_procs: &[&Process],
-    active_pid: Option<u32>,
-    pid_tracker: &mut HashMap<u32, std::time::Instant>,
-    freeze_pid_tracker: &mut HashMap<u32, std::time::Instant>,
+    active_pid: Option<Pid>,
+    pid_tracker: &mut HashMap<Pid, std::time::Instant>,
+    freeze_pid_tracker: &mut HashMap<Pid, std::time::Instant>,
     frozen: &Arc<Mutex<FrozenRegistry>>,
     log: &Logger,
 ) {
     let meminfo = crate::monitor::meminfo::read_meminfo();
 
-    let swap_used_pct = if meminfo.swap_total_kb > 0 {
+    let swap_used_pct = if meminfo.swap_total_kb.0 > 0 {
         let pct = meminfo.swap_used_pct();
         // Hard gate: less than 1.5 GB swap free is too risky to push more
-        if meminfo.swap_free_kb / 1024 < 1500 {
+        if meminfo.swap_free_kb.0 / 1024 < 1500 {
             return;
         }
         pct
@@ -1271,7 +1270,7 @@ fn check_idle_process_reclaim(
     };
 
     // Prune entries for processes no longer alive (shared by both reclaim and freeze trackers)
-    let live_pids: HashSet<u32> = plan_procs.iter().map(|p| p.pid).collect();
+    let live_pids: HashSet<Pid> = plan_procs.iter().map(|p| p.pid).collect();
     pid_tracker.retain(|pid, _| live_pids.contains(pid));
 
     // Delegate candidate selection to the pure helper
@@ -1347,7 +1346,7 @@ fn check_idle_process_reclaim(
         for p in plan_procs {
             if freeze_count >= 2 { break; }
             if Some(p.pid) == active_pid { continue; }
-            if p.rss_kb < cfg.idle_reclaim_rss_min_mb * 1024 { continue; }
+            if p.rss_kb < Kb(cfg.idle_reclaim_rss_min_mb * 1024) { continue; }
 
             let elapsed = freeze_pid_tracker
                 .entry(p.pid)
@@ -1368,7 +1367,7 @@ fn check_idle_process_reclaim(
                         p.name, p.pid, elapsed
                     );
                     log.log(LogAction::IdleFreeze, p.pid, &p.name,
-                        p.rss_kb as f64 / 1024.0, "proactively froze idle background process");
+                        p.rss_kb.mb(), "proactively froze idle background process");
                     freeze_pid_tracker.remove(&p.pid);
                     freeze_count += 1;
                 } else {
@@ -1394,11 +1393,11 @@ mod tests {
 
     fn make_process(pid: u32, name: &str, rss_kb: u64) -> Process {
         Process {
-            pid,
+            pid: Pid(pid),
             name: name.to_string(),
             exe_basename: None,
-            rss_kb,
-            swap_kb: 0,
+            rss_kb: Kb(rss_kb),
+            swap_kb: Kb(0),
             oom_score: 0,
             cgroup_path: None,
             cpu_pct: 0.0,
@@ -1410,9 +1409,9 @@ mod tests {
         IdleReclaimConfig { max_swap_occupancy_pct: 60.0, idle_sec: 180, rss_min_mb: 50, reclaim_pct: 20, important_enabled: false, important_min_priority: 20, important_idle_sec: 300, important_pct: 10 }
     }
 
-    fn make_pid_tracker(pid: u32, secs_ago: u64) -> HashMap<u32, Instant> {
+    fn make_pid_tracker(pid: u32, secs_ago: u64) -> HashMap<Pid, Instant> {
         let mut m = HashMap::new();
-        m.insert(pid, Instant::now() - Duration::from_secs(secs_ago));
+        m.insert(Pid(pid), Instant::now() - Duration::from_secs(secs_ago));
         m
     }
 
@@ -1499,7 +1498,7 @@ mod tests {
     // ── ScoreTracker ─────────────────────────────────────────────────────────
 
     fn make_meminfo(total_kb: u64, swap_total_kb: u64, swap_free_kb: u64) -> MemInfo {
-        MemInfo { available_kb: total_kb / 2, total_kb, swap_free_kb, swap_total_kb }
+        MemInfo { available_kb: Kb(total_kb / 2), total_kb: Kb(total_kb), swap_free_kb: Kb(swap_free_kb), swap_total_kb: Kb(swap_total_kb) }
     }
 
     fn fresh_tracker(now: Instant) -> ScoreTracker {
@@ -1511,7 +1510,7 @@ mod tests {
         let t0 = Instant::now();
         let mut st = fresh_tracker(t0);
         let mi = make_meminfo(16_000_000, 0, 0);
-        let s = st.update_with(50.0, &mi, 0, 0, 0, t0 + Duration::from_secs(5));
+        let s = st.update_with(50.0, &mi, 0, 0, Kb(0), t0 + Duration::from_secs(5));
         // 55% weight on PSI 0.5, everything else zero
         assert!((s.p_score - 0.275).abs() < 1e-9);
         assert_eq!(s.gpu_val, 0.0);
@@ -1524,7 +1523,7 @@ mod tests {
         let mut st = fresh_tracker(t0);
         let mi = make_meminfo(16_000_000, 12_000_000, 0); // swap 100% used
         // GPU = total RAM, swap I/O far over 50 MB/s → every component clamps to 1.0
-        let s = st.update_with(200.0, &mi, 10_000_000, 10_000_000, 16_000_000, t0 + Duration::from_secs(5));
+        let s = st.update_with(200.0, &mi, 10_000_000, 10_000_000, Kb(16_000_000), t0 + Duration::from_secs(5));
         assert!((s.p_score - 1.0).abs() < 1e-9);
     }
 
@@ -1534,12 +1533,12 @@ mod tests {
         let mut st = fresh_tracker(t0);
         let mi = make_meminfo(16_000_000, 0, 0);
         // 12800 pages × 4KB / 5s = 10240 KB/s → io_val 0.2 → score 0.02
-        let s = st.update_with(0.0, &mi, 12800, 0, 0, t0 + Duration::from_secs(5));
+        let s = st.update_with(0.0, &mi, 12800, 0, Kb(0), t0 + Duration::from_secs(5));
         assert!((s.swap_io_kbs - 10240.0).abs() < 1e-6);
         assert!((s.p_score - 0.02).abs() < 1e-9);
         assert!((s.trend - 0.02 / 5.0).abs() < 1e-9);
         // Next cycle, no new I/O: score falls back to 0, trend goes negative
-        let s2 = st.update_with(0.0, &mi, 12800, 0, 0, t0 + Duration::from_secs(10));
+        let s2 = st.update_with(0.0, &mi, 12800, 0, Kb(0), t0 + Duration::from_secs(10));
         assert_eq!(s2.p_score, 0.0);
         assert!(s2.trend < 0.0);
     }
@@ -1550,7 +1549,7 @@ mod tests {
         let mut st = fresh_tracker(t0);
         let mi = make_meminfo(16_000_000, 0, 0);
         // dt below the 0.1s floor: swap I/O rate and trend are suppressed
-        let s = st.update_with(80.0, &mi, 99999, 99999, 0, t0);
+        let s = st.update_with(80.0, &mi, 99999, 99999, Kb(0), t0);
         assert_eq!(s.swap_io_kbs, 0.0);
         assert_eq!(s.trend, 0.0);
     }
@@ -1560,7 +1559,7 @@ mod tests {
     #[test]
     fn swap_below_95_no_override() {
         let now = Instant::now();
-        let (level, sustained) = apply_swap_overrides(PressureLevel::Elevated, 94.9, 10_000_000, None, now);
+        let (level, sustained) = apply_swap_overrides(PressureLevel::Elevated, 94.9, Kb(10_000_000), None, now);
         assert_eq!(level, PressureLevel::Elevated);
         assert!(sustained.is_none());
     }
@@ -1568,21 +1567,21 @@ mod tests {
     #[test]
     fn swap_95_forces_critical() {
         let now = Instant::now();
-        let (level, _) = apply_swap_overrides(PressureLevel::Elevated, 95.0, 10_000_000, None, now);
+        let (level, _) = apply_swap_overrides(PressureLevel::Elevated, 95.0, Kb(10_000_000), None, now);
         assert_eq!(level, PressureLevel::Critical);
     }
 
     #[test]
     fn swap_95_no_override_when_already_critical() {
         let now = Instant::now();
-        let (level, _) = apply_swap_overrides(PressureLevel::Critical, 95.0, 10_000_000, None, now);
+        let (level, _) = apply_swap_overrides(PressureLevel::Critical, 95.0, Kb(10_000_000), None, now);
         assert_eq!(level, PressureLevel::Critical);
     }
 
     #[test]
     fn swap_no_device_no_override() {
         let now = Instant::now();
-        let (level, _) = apply_swap_overrides(PressureLevel::Elevated, 99.0, 0, None, now);
+        let (level, _) = apply_swap_overrides(PressureLevel::Elevated, 99.0, Kb(0), None, now);
         assert_eq!(level, PressureLevel::Elevated);
     }
 
@@ -1590,7 +1589,7 @@ mod tests {
     fn sustained_critical_swap_escalates_emergency() {
         let start = Instant::now() - Duration::from_secs(46);
         let now = Instant::now();
-        let (level, _) = apply_swap_overrides(PressureLevel::Critical, 98.5, 10_000_000, Some(start), now);
+        let (level, _) = apply_swap_overrides(PressureLevel::Critical, 98.5, Kb(10_000_000), Some(start), now);
         assert_eq!(level, PressureLevel::Emergency);
     }
 
@@ -1598,7 +1597,7 @@ mod tests {
     fn sustained_critical_swap_not_yet_45s() {
         let start = Instant::now() - Duration::from_secs(44);
         let now = Instant::now();
-        let (level, _) = apply_swap_overrides(PressureLevel::Critical, 98.5, 10_000_000, Some(start), now);
+        let (level, _) = apply_swap_overrides(PressureLevel::Critical, 98.5, Kb(10_000_000), Some(start), now);
         assert_eq!(level, PressureLevel::Critical);
     }
 
@@ -1606,14 +1605,14 @@ mod tests {
     fn sustained_critical_swap_resets_when_swap_drops() {
         let start = Instant::now() - Duration::from_secs(50);
         let now = Instant::now();
-        let (_, sustained) = apply_swap_overrides(PressureLevel::Critical, 97.9, 10_000_000, Some(start), now);
+        let (_, sustained) = apply_swap_overrides(PressureLevel::Critical, 97.9, Kb(10_000_000), Some(start), now);
         assert!(sustained.is_none(), "timer must reset when swap < 98%");
     }
 
     #[test]
     fn swap_98_starts_sustained_timer() {
         let now = Instant::now();
-        let (_, sustained) = apply_swap_overrides(PressureLevel::Critical, 98.0, 10_000_000, None, now);
+        let (_, sustained) = apply_swap_overrides(PressureLevel::Critical, 98.0, Kb(10_000_000), None, now);
         assert!(sustained.is_some(), "timer must start at >=98% swap + Critical");
     }
 
@@ -1621,7 +1620,7 @@ mod tests {
     fn swap_98_preserves_existing_timer() {
         let start = Instant::now() - Duration::from_secs(10);
         let now = Instant::now();
-        let (_, sustained) = apply_swap_overrides(PressureLevel::Critical, 98.0, 10_000_000, Some(start), now);
+        let (_, sustained) = apply_swap_overrides(PressureLevel::Critical, 98.0, Kb(10_000_000), Some(start), now);
         assert!(sustained.unwrap().elapsed().as_secs() >= 10, "existing timer must not be reset");
     }
 
@@ -1630,7 +1629,7 @@ mod tests {
     #[test]
     fn idle_reclaim_skips_foreground_pid() {
         let p = make_process(1234, "firefox", 200_000);
-        let r = select_idle_candidates(&[&p], Some(1234), &make_pid_tracker(1234, 300), 10.0, &default_idle_cfg(), &CFG);
+        let r = select_idle_candidates(&[&p], Some(Pid(1234)), &make_pid_tracker(1234, 300), 10.0, &default_idle_cfg(), &CFG);
         assert!(r.is_empty());
     }
 
@@ -1658,7 +1657,7 @@ mod tests {
     #[test]
     fn idle_reclaim_skips_not_in_tracker() {
         let p = make_process(5678, "app", 200_000);
-        let r = select_idle_candidates(&[&p], None, &HashMap::<u32, Instant>::new(), 10.0, &default_idle_cfg(), &CFG);
+        let r = select_idle_candidates(&[&p], None, &HashMap::<Pid, Instant>::new(), 10.0, &default_idle_cfg(), &CFG);
         assert!(r.is_empty());
     }
 
@@ -1667,7 +1666,7 @@ mod tests {
         let p = make_process(5678, "app", 200_000);
         let r = select_idle_candidates(&[&p], None, &make_pid_tracker(5678, 300), 10.0, &default_idle_cfg(), &CFG);
         assert_eq!(r.len(), 1);
-        assert_eq!(r[0].0, 5678);
+        assert_eq!(r[0].0, Pid(5678));
         assert_eq!(r[0].1, 40_000 * 1024); // 20% of 200_000 KB * 1024
     }
 
@@ -1676,12 +1675,12 @@ mod tests {
         let p1 = make_process(100, "app_a", 100_000);
         let p2 = make_process(200, "app_b", 150_000);
         let mut tracker = make_pid_tracker(100, 300);
-        tracker.insert(200, Instant::now() - Duration::from_secs(250));
+        tracker.insert(Pid(200), Instant::now() - Duration::from_secs(250));
         let r = select_idle_candidates(&[&p1, &p2], None, &tracker, 10.0, &IdleReclaimConfig { max_swap_occupancy_pct: 60.0, idle_sec: 180, rss_min_mb: 50, reclaim_pct: 10, important_enabled: false, important_min_priority: 20, important_idle_sec: 300, important_pct: 10 }, &CFG);
         assert_eq!(r.len(), 2);
-        let pids: Vec<u32> = r.iter().map(|(pid, _)| *pid).collect();
-        assert!(pids.contains(&100));
-        assert!(pids.contains(&200));
+        let pids: Vec<Pid> = r.iter().map(|(pid, _)| *pid).collect();
+        assert!(pids.contains(&Pid(100)));
+        assert!(pids.contains(&Pid(200)));
     }
 
     // ── ThrottledState ───────────────────────────────────────────────────────
@@ -1692,5 +1691,250 @@ mod tests {
         assert_eq!(ThrottledState::None, ThrottledState::None);
         assert_ne!(ThrottledState::None, ThrottledState::WeightOnly);
         assert_ne!(ThrottledState::WeightOnly, ThrottledState::Full);
+    }
+
+    // ── execute_plan / execute_decision (MockSink) ───────────────────────────
+
+    use crate::executor::OpResult;
+    use crate::executor::checkpoint::CheckpointResult;
+
+    #[derive(Clone, Copy)]
+    enum ReclaimScript { OkTrue, OkFalse, WouldBlock }
+
+    /// Records every sink call in order; return values are scriptable per test.
+    struct MockSink {
+        calls: Vec<(&'static str, Pid)>,
+        reclaims: Vec<(String, u64)>,
+        freeze_ok: bool,
+        checkpoint_ok: bool,
+        reclaim_script: ReclaimScript,
+    }
+
+    impl MockSink {
+        fn new() -> Self {
+            Self {
+                calls: Vec::new(),
+                reclaims: Vec::new(),
+                freeze_ok: true,
+                checkpoint_ok: true,
+                reclaim_script: ReclaimScript::OkTrue,
+            }
+        }
+
+        fn names(&self) -> Vec<&'static str> {
+            self.calls.iter().map(|(n, _)| *n).collect()
+        }
+    }
+
+    impl ActionSink for MockSink {
+        fn freeze(&mut self, pid: Pid) -> OpResult {
+            self.calls.push(("freeze", pid));
+            if self.freeze_ok { OpResult::success() } else { OpResult::fail("scripted freeze failure") }
+        }
+
+        fn unfreeze(&mut self, pid: Pid) -> OpResult {
+            self.calls.push(("unfreeze", pid));
+            OpResult::success()
+        }
+
+        fn terminate(&mut self, pid: Pid) -> OpResult {
+            self.calls.push(("terminate", pid));
+            OpResult::success()
+        }
+
+        fn kill(&mut self, pid: Pid) -> OpResult {
+            self.calls.push(("kill", pid));
+            OpResult::success()
+        }
+
+        fn checkpoint(&mut self, pid: Pid, _name: &str) -> CheckpointResult {
+            self.calls.push(("checkpoint", pid));
+            if self.checkpoint_ok {
+                CheckpointResult::ok(pid, std::path::PathBuf::from("/tmp/mock-snap"))
+            } else {
+                CheckpointResult::err(pid, "scripted CRIU failure")
+            }
+        }
+
+        fn reclaim(&mut self, cgroup: &str, bytes: u64) -> std::io::Result<bool> {
+            self.reclaims.push((cgroup.to_string(), bytes));
+            match self.reclaim_script {
+                ReclaimScript::OkTrue => Ok(true),
+                ReclaimScript::OkFalse => Ok(false),
+                ReclaimScript::WouldBlock =>
+                    Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, "cgroup busy")),
+            }
+        }
+    }
+
+    fn decision(pid: u32, name: &str, action: Action, prio: u8) -> Decision {
+        Decision {
+            pid: Pid(pid),
+            name: name.to_string(),
+            action,
+            rss: Kb(200 * 1024),
+            swap: Kb(0),
+            reason: "test".into(),
+            prio,
+        }
+    }
+
+    fn exec_fixture() -> (Arc<Mutex<FrozenRegistry>>, Arc<Mutex<CheckpointRegistry>>, Logger, crate::events::EventLog) {
+        (
+            Arc::new(Mutex::new(FrozenRegistry::new())),
+            Arc::new(Mutex::new(CheckpointRegistry::new())),
+            Logger::null(),
+            crate::events::new_log(),
+        )
+    }
+
+    #[test]
+    fn execute_plan_skips_already_frozen_pid() {
+        let (frozen, checkpointed, log, events) = exec_fixture();
+        // Deserialize a fixture entry — add() would need a live /proc entry.
+        *frozen.lock().unwrap() =
+            serde_json::from_str(r#"{"frozen":{"4242":["stale",0,1]}}"#).unwrap();
+        let decisions = vec![decision(4242, "stale", Action::Kill, 80)];
+        let mut sink = MockSink::new();
+        let n = execute_plan(&decisions, &[], &frozen, &checkpointed, &log, &events,
+            &mut HashMap::new(), &mut sink);
+        assert_eq!(n, 0);
+        assert!(sink.calls.is_empty(), "sink must never be called for a frozen PID");
+    }
+
+    #[test]
+    fn destructive_count_counts_kill_and_checkpoint_not_freeze_or_terminate() {
+        let (frozen, checkpointed, log, events) = exec_fixture();
+        let decisions = vec![
+            decision(900_001, "a", Action::Kill, 80),
+            decision(900_002, "b", Action::Terminate, 80),
+            decision(900_003, "c", Action::Checkpoint, 80),
+            decision(900_004, "d", Action::Freeze, 80),
+        ];
+        let mut sink = MockSink::new();
+        let n = execute_plan(&decisions, &[], &frozen, &checkpointed, &log, &events,
+            &mut HashMap::new(), &mut sink);
+        // Kill + Checkpoint are synchronous frees; Terminate is async (RAM not
+        // freed yet), Freeze frees nothing.
+        assert_eq!(n, 2);
+        assert_eq!(checkpointed.lock().unwrap().count(), 1);
+    }
+
+    #[test]
+    fn post_freeze_reclaim_fires_on_frozen_result_with_cgroup() {
+        let (frozen, checkpointed, log, events) = exec_fixture();
+        // Own PID: registry fingerprint (start_time re-read) succeeds, so the
+        // result string is "frozen" — the only path that arms post-freeze reclaim.
+        let me = std::process::id();
+        let mut p = make_process(me, "self", 200 * 1024);
+        p.cgroup_path = Some("/user.slice/test.scope".to_string());
+        let procs = [&p];
+        let decisions = vec![decision(me, "self", Action::Freeze, 80)];
+        let mut sink = MockSink::new();
+        execute_plan(&decisions, &procs, &frozen, &checkpointed, &log, &events,
+            &mut HashMap::new(), &mut sink);
+        assert_eq!(sink.names(), vec!["freeze"]);
+        assert_eq!(sink.reclaims, vec![("/user.slice/test.scope".to_string(), Kb(200 * 1024).bytes())]);
+        assert!(frozen.lock().unwrap().is_frozen(Pid(me)));
+    }
+
+    #[test]
+    fn post_freeze_reclaim_skipped_without_frozen_result_or_cgroup() {
+        // Failed freeze → no reclaim, even with a cgroup present.
+        let (frozen, checkpointed, log, events) = exec_fixture();
+        let me = std::process::id();
+        let mut p = make_process(me, "self", 200 * 1024);
+        p.cgroup_path = Some("/user.slice/test.scope".to_string());
+        let mut sink = MockSink::new();
+        sink.freeze_ok = false;
+        execute_plan(&[decision(me, "self", Action::Freeze, 80)], &[&p], &frozen,
+            &checkpointed, &log, &events, &mut HashMap::new(), &mut sink);
+        assert!(sink.reclaims.is_empty(), "no reclaim after a failed freeze");
+        assert!(!frozen.lock().unwrap().is_frozen(Pid(me)));
+
+        // Successful freeze but no cgroup known → no reclaim.
+        let (frozen, checkpointed, log, events) = exec_fixture();
+        let p = make_process(me, "self", 200 * 1024); // cgroup_path: None
+        let mut sink = MockSink::new();
+        execute_plan(&[decision(me, "self", Action::Freeze, 80)], &[&p], &frozen,
+            &checkpointed, &log, &events, &mut HashMap::new(), &mut sink);
+        assert!(sink.reclaims.is_empty(), "no reclaim without a cgroup path");
+        assert!(frozen.lock().unwrap().is_frozen(Pid(me)));
+    }
+
+    #[test]
+    fn post_freeze_reclaim_ok_false_and_wouldblock_are_silent() {
+        // Ok(false) and WouldBlock must not disturb execution: freeze stays
+        // registered, no fallback action fires, destructive count stays 0.
+        for script in [ReclaimScript::OkFalse, ReclaimScript::WouldBlock] {
+            let (frozen, checkpointed, log, events) = exec_fixture();
+            let me = std::process::id();
+            let mut p = make_process(me, "self", 200 * 1024);
+            p.cgroup_path = Some("/user.slice/test.scope".to_string());
+            let mut sink = MockSink::new();
+            sink.reclaim_script = script;
+            let n = execute_plan(&[decision(me, "self", Action::Freeze, 80)], &[&p],
+                &frozen, &checkpointed, &log, &events, &mut HashMap::new(), &mut sink);
+            assert_eq!(n, 0);
+            assert_eq!(sink.names(), vec!["freeze"]);
+            assert_eq!(sink.reclaims.len(), 1);
+            assert!(frozen.lock().unwrap().is_frozen(Pid(me)));
+        }
+    }
+
+    #[test]
+    fn freeze_rolls_back_when_registry_fingerprint_fails() {
+        // Nonexistent PID: sink freeze succeeds (scripted) but the registry
+        // start_time re-read fails → unfreeze rollback, nothing registered.
+        let (frozen, checkpointed, log, events) = exec_fixture();
+        let decisions = vec![decision(900_005, "ghost", Action::Freeze, 80)];
+        let mut sink = MockSink::new();
+        execute_plan(&decisions, &[], &frozen, &checkpointed, &log, &events,
+            &mut HashMap::new(), &mut sink);
+        assert_eq!(sink.names(), vec!["freeze", "unfreeze"]);
+        assert!(sink.reclaims.is_empty());
+        assert_eq!(frozen.lock().unwrap().count(), 0);
+    }
+
+    #[test]
+    fn checkpoint_failure_falls_back_by_priority() {
+        let (frozen, checkpointed, log, events) = exec_fixture();
+        let decisions = vec![
+            // prio >= 60 → async terminate (graceful); prio < 60 → immediate kill.
+            decision(900_006, "cp-fail-expendable-t", Action::Checkpoint, 60),
+            decision(900_007, "cp-fail-protected-t", Action::Checkpoint, 30),
+        ];
+        let mut sink = MockSink::new();
+        sink.checkpoint_ok = false;
+        let n = execute_plan(&decisions, &[], &frozen, &checkpointed, &log, &events,
+            &mut HashMap::new(), &mut sink);
+        assert_eq!(sink.names(), vec!["checkpoint", "terminate", "checkpoint", "kill"]);
+        assert_eq!(checkpointed.lock().unwrap().count(), 0, "failed dumps must not be registered");
+        assert_eq!(n, 2); // Checkpoint decisions count destructive even via fallback
+    }
+
+    #[test]
+    fn recently_killed_cgroups_tracks_kill_and_terminate_only() {
+        let (frozen, checkpointed, log, events) = exec_fixture();
+        let mut a = make_process(900_008, "kill-me", 100 * 1024);
+        a.cgroup_path = Some("/u/kill.scope".to_string());
+        let mut b = make_process(900_009, "term-me", 100 * 1024);
+        b.cgroup_path = Some("/u/term.scope".to_string());
+        let mut c = make_process(900_010, "freeze-me", 100 * 1024);
+        c.cgroup_path = Some("/u/freeze.scope".to_string());
+        let procs = [&a, &b, &c];
+        let decisions = vec![
+            decision(900_008, "kill-me", Action::Kill, 80),
+            decision(900_009, "term-me", Action::Terminate, 80),
+            decision(900_010, "freeze-me", Action::Freeze, 80),
+        ];
+        let mut recently = HashMap::new();
+        let mut sink = MockSink::new();
+        execute_plan(&decisions, &procs, &frozen, &checkpointed, &log, &events,
+            &mut recently, &mut sink);
+        assert!(recently.contains_key("/u/kill.scope"));
+        assert!(recently.contains_key("/u/term.scope"));
+        assert!(!recently.contains_key("/u/freeze.scope"), "freeze must not arm the kill cooldown");
+        assert_eq!(recently.len(), 2);
     }
 }

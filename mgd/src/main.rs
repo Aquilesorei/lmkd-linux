@@ -17,6 +17,7 @@ use std::thread;
 use executor::registry::{FrozenRegistry, CheckpointRegistry};
 use mgd_common::logger::Logger;
 use mgd_common::output::locked_print;
+use mgd_common::types::Pid;
 
 static SHUTDOWN:      AtomicBool = AtomicBool::new(false);
 static RELOAD_CONFIG: AtomicBool = AtomicBool::new(false);
@@ -137,8 +138,8 @@ fn handle_legacy_cli(args: &[String]) -> bool {
     }
     match args[1].as_str() {
         "freeze" if args.len() == 3 => {
-            let pid: u32 = match args[2].parse() {
-                Ok(p) => p,
+            let pid: Pid = match args[2].parse() {
+                Ok(p) => Pid(p),
                 Err(_) => { eprintln!("Error: PID must be a number"); return true; }
             };
             let r = executor::freezer::freeze(pid);
@@ -147,8 +148,8 @@ fn handle_legacy_cli(args: &[String]) -> bool {
             true
         }
         "unfreeze" if args.len() == 3 => {
-            let pid: u32 = match args[2].parse() {
-                Ok(p) => p,
+            let pid: Pid = match args[2].parse() {
+                Ok(p) => Pid(p),
                 Err(_) => { eprintln!("Error: PID must be a number"); return true; }
             };
             let r = executor::freezer::unfreeze(pid);
@@ -211,7 +212,7 @@ fn cleanup_orphaned_snapshots(checkpointed: &Arc<Mutex<CheckpointRegistry>>) {
 /// Unfreeze all processes still in the registry after both actors have stopped.
 fn shutdown_unfreeze(frozen: &Arc<Mutex<FrozenRegistry>>) {
     let reg = frozen.lock().unwrap();
-    let entries: Vec<(u32, u64)> = reg.frozen_pids().into_iter()
+    let entries: Vec<(Pid, u64)> = reg.frozen_pids().into_iter()
         .map(|pid| (pid, reg.start_time(pid)))
         .collect();
     drop(reg); // release lock before I/O
