@@ -130,26 +130,26 @@ fn restore_pass(
 
     if attempts >= MAX_RESTORE_ATTEMPTS {
         mgd_common::sync_print!("  ✗ {name} exceeded {MAX_RESTORE_ATTEMPTS} restore attempts — abandoning");
-        log.log(LogAction::RestoreAbandon, pid, &name, rss.mb(), "max attempts");
+        log.log(LogAction::RestoreAbandon, pid, &name, rss.mib(), "max attempts");
         let _ = std::fs::remove_dir_all(&snapshot_dir);
         cp_reg.remove(pid);
     } else if baseline.safe_to_restore(meminfo.available_kb, meminfo.total_kb, rss) {
         let result = crate::executor::checkpoint::restore(&snapshot_dir);
         if result.success {
-            mgd_common::sync_print!("  ✓ Restored {name} (was PID {pid}, {:.0}MB)", rss.mb());
-            log.log(LogAction::Restore, pid, &name, rss.mb(), "restored");
+            mgd_common::sync_print!("  ✓ Restored {name} (was PID {pid}, {:.0}MB)", rss.mib());
+            log.log(LogAction::Restore, pid, &name, rss.mib(), "restored");
             let _ = std::fs::remove_dir_all(&snapshot_dir);
             cp_reg.remove(pid);
         } else {
             let err = result.error.unwrap_or_default();
             mgd_common::sync_print!("  ✗ Restore failed for {name} (attempt {}/{MAX_RESTORE_ATTEMPTS}): {err}", attempts + 1);
-            log.log(LogAction::RestoreFail, pid, &name, rss.mb(), &err);
+            log.log(LogAction::RestoreFail, pid, &name, rss.mib(), &err);
             cp_reg.increment_attempts(pid);
         }
     } else {
         mgd_common::sync_print!(
             "  ⏸ Skip {name} ({:.0}MB) — RAM tight ({:.0}MB free)",
-            rss.mb(), meminfo.available_kb.mb(),
+            rss.mib(), meminfo.available_kb.mib(),
         );
     }
 }

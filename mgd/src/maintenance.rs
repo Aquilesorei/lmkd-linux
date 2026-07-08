@@ -181,7 +181,7 @@ pub fn flush_calibration(
                 "[calibrate] [psi] suggestion ready ({:.0}h observed, {} stalls) → {}",
                 s.observed_hours, s.stall_events, sug_path.display()
             );
-            log.log(LogAction::Calibrate, Pid(0), "psi", s.elevated_pct,
+            log.log_system(LogAction::Calibrate, "psi", s.elevated_pct,
                 &format!("suggested elevated_pct={:.1} full_critical_pct={:.1}",
                     s.elevated_pct, s.full_critical_pct));
         }
@@ -230,7 +230,7 @@ fn check_auto_kill_idle(
                 "[auto-kill] {} (pid {}) idle {}s >= {}s threshold — SIGTERM",
                 p.name, p.pid, elapsed, idle_secs
             );
-            log.log(LogAction::Kill, p.pid, &p.name, p.rss_kb.mb(), "auto-kill-idle");
+            log.log(LogAction::Kill, p.pid, &p.name, p.rss_kb.mib(), "auto-kill-idle");
             last_active.remove(&key);
         }
     }
@@ -323,7 +323,7 @@ fn check_proactive_reclaim(
             "[reclaim] swap reclaim unavailable: mgd-zram-reclaim not found in \
              /usr/local/bin or /usr/bin — disabling for session. See docs/PRIVILEGE_DESIGN.md §2."
         );
-        log.log(LogAction::Reclaim, Pid(0), "zram", 0.0, "unavailable: helper absent");
+        log.log_system(LogAction::Reclaim, "zram", 0.0, "unavailable: helper absent");
         return;
     };
 
@@ -339,7 +339,7 @@ fn check_proactive_reclaim(
     };
 
     if let Err(reason) = reclaim_gates_pass(&gates) {
-        log.log(LogAction::Reclaim, Pid(0), "zram", 0.0, &format!("skipped: {reason}"));
+        log.log_system(LogAction::Reclaim, "zram", 0.0, &format!("skipped: {reason}"));
         return;
     }
 
@@ -354,7 +354,7 @@ fn check_proactive_reclaim(
         Ok(()) => {
             LAST_RECLAIM.store(now, Ordering::Relaxed);
             let after = monitor::meminfo::read_meminfo();
-            log.log(LogAction::Reclaim, Pid(0), "zram", gates.zram_orig_mb as f64,
+            log.log_system(LogAction::Reclaim, "zram", gates.zram_orig_mb as f64,
                 &format!("reclaimed: swap {:.0}%→{:.0}%, avail {}MB→{}MB",
                     gates.swap_used_pct, after.swap_used_pct(),
                     gates.mem_available_mb, after.available_kb.0 / 1024));
@@ -362,7 +362,7 @@ fn check_proactive_reclaim(
         Err((code, e)) => {
             // Don't arm the cooldown on failure.
             mgd_common::sync_print!("[reclaim] helper failed (exit {code:?}): {e}");
-            log.log(LogAction::Reclaim, Pid(0), "zram", 0.0, &format!("failed: {e}"));
+            log.log_system(LogAction::Reclaim, "zram", 0.0, &format!("failed: {e}"));
             // Exit 2 = uncapped binary (persistent); other codes are transient.
             if code == Some(2) {
                 RECLAIM_DISABLED.store(true, Ordering::Relaxed);

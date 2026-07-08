@@ -158,8 +158,8 @@ pub fn plan(
         }
         let reason = format!(
             "priority={prio} rss={:.0}MB swap={:.0}MB swap_ratio={:.0}% deficit={:.0}MB",
-            proc.rss_kb.mb(),
-            proc.swap_kb.mb(),
+            proc.rss_kb.mib(),
+            proc.swap_kb.mib(),
             swap_ratio * 100.0,
             deficit as f64 / 1024.0,
         );
@@ -351,7 +351,7 @@ mod tests {
         let decisions = plan(&PressureLevel::High, &procs.iter().collect::<Vec<_>>(), Kb(1_000_000), Kb(16_000_000), false, &CFG);
         assert_eq!(decisions.len(), 1);
         assert_eq!(decisions[0].action, Action::Terminate);
-        assert_eq!(decisions[0].rss.mb() as u64, 1953); // 2_000_000 KB / 1024
+        assert_eq!(decisions[0].rss.mib() as u64, 1953); // 2_000_000 KB / 1024
     }
 
     #[test]

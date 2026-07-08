@@ -9,6 +9,7 @@
 use std::fmt;
 use std::iter::Sum;
 use std::ops::Add;
+use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
@@ -24,6 +25,13 @@ impl fmt::Display for Pid {
     }
 }
 
+impl FromStr for Pid {
+    type Err = std::num::ParseIntError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        s.parse().map(Pid)
+    }
+}
+
 /// Memory size in kibibytes — the only stored unit. MB/bytes exist solely as
 /// conversion methods, never as fields.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -32,7 +40,7 @@ pub struct Kb(pub u64);
 
 impl Kb {
     /// Binary megabytes (MiB), matching /proc and the rest of the log output.
-    pub fn mb(self) -> f64 {
+    pub fn mib(self) -> f64 {
         self.0 as f64 / 1024.0
     }
 
@@ -47,12 +55,22 @@ impl Kb {
     pub fn saturating_sub(self, rhs: Kb) -> Kb {
         Kb(self.0.saturating_sub(rhs.0))
     }
+
+    /// `self * pct / 100`, saturating — for "reclaim N% of this RSS" math on
+    /// values sourced from config, which isn't range-validated against RSS.
+    pub fn percent_of(self, pct: u64) -> Kb {
+        Kb(self.0.saturating_mul(pct) / 100)
+    }
 }
 
+// `+`/`Sum` saturate rather than panicking/wrapping, same reasoning as the
+// missing `Sub`: rss+swap sums come from /proc, and GPU totals are summed
+// from plugin-reported values over IPC — untrusted enough that a corrupted
+// or adversarial input shouldn't be able to wrap a pressure figure.
 impl Add for Kb {
     type Output = Kb;
     fn add(self, rhs: Kb) -> Kb {
-        Kb(self.0 + rhs.0)
+        self.saturating_add(rhs)
     }
 }
 
@@ -63,7 +81,7 @@ impl Add for Kb {
 
 impl Sum for Kb {
     fn sum<I: Iterator<Item = Kb>>(iter: I) -> Kb {
-        Kb(iter.map(|k| k.0).sum())
+        iter.fold(Kb(0), Kb::saturating_add)
     }
 }
 
@@ -159,12 +177,25 @@ mod tests {
 
     #[test]
     fn kb_conversions() {
-        assert_eq!(Kb(2048).mb(), 2.0);
+        assert_eq!(Kb(2048).mib(), 2.0);
         assert_eq!(Kb(2).bytes(), 2048);
         assert_eq!(Kb(1) + Kb(2), Kb(3));
         assert_eq!(Kb(u64::MAX).saturating_add(Kb(1)), Kb(u64::MAX));
         assert_eq!(Kb(u64::MAX).bytes(), u64::MAX);
         assert_eq!(Kb(1).saturating_sub(Kb(2)), Kb(0));
         assert_eq!([Kb(1), Kb(2), Kb(3)].into_iter().sum::<Kb>(), Kb(6));
+        assert_eq!(Kb(u64::MAX).saturating_add(Kb(1)) + Kb(1), Kb(u64::MAX)); // + saturates too
+        assert_eq!([Kb(u64::MAX), Kb(1)].into_iter().sum::<Kb>(), Kb(u64::MAX)); // Sum saturates too
+    }
+
+    #[test]
+    fn kb_percent_of() {
+        assert_eq!(Kb(1000).percent_of(50), Kb(500));
+        assert_eq!(Kb(3).percent_of(50), Kb(1)); // integer truncation, not rounding
+        assert_eq!(Kb(0).percent_of(50), Kb(0));
+        assert_eq!(Kb(100).percent_of(0), Kb(0));
+        // mul overflow before the /100 must saturate, not wrap, for a hostile
+        // or misconfigured pct value (e.g. reclaim_pct read from priorities.toml).
+        assert_eq!(Kb(u64::MAX).percent_of(200), Kb(u64::MAX / 100));
     }
 }

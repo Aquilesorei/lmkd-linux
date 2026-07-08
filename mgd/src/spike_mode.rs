@@ -188,7 +188,7 @@ impl SpikeTracker {
             if force_included || is_behavioral {
                 mgd_common::sync_print!(
                     "[spike] tracking new candidate: {} (PID {}, rss={:.0}MB, force={})",
-                    proc.name, proc.pid, proc.rss_kb.mb(), force_included
+                    proc.name, proc.pid, proc.rss_kb.mib(), force_included
                 );
                 // Use prev_rss as baseline so a process detected at its peak
                 // (large delta triggers registration) can still satisfy has_peaked.
@@ -239,7 +239,7 @@ impl SpikeTracker {
                 state.has_peaked = true;
                 mgd_common::sync_print!(
                     "[spike] {} (PID {}) peaked at {:.0}MB",
-                    state.name, state.pid, state.rss_max.mb()
+                    state.name, state.pid, state.rss_max.mib()
                 );
             }
 
@@ -251,8 +251,8 @@ impl SpikeTracker {
                     mgd_common::sync_print!(
                         "[spike] {} (PID {}) oscillated: peak={:.0}MB valley={:.0}MB",
                         state.name, state.pid,
-                        state.rss_max.mb(),
-                        proc.rss_kb.mb()
+                        state.rss_max.mib(),
+                        proc.rss_kb.mib()
                     );
                 }
             }
@@ -267,7 +267,7 @@ impl SpikeTracker {
                 mgd_common::sync_print!(
                     "[spike] {} (PID {}) → Tracking (rss_max={:.0}MB, {} samples)",
                     state.name, state.pid,
-                    state.rss_max.mb(),
+                    state.rss_max.mib(),
                     state.samples.len()
                 );
             }

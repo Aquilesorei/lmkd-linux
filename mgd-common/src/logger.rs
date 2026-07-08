@@ -92,6 +92,12 @@ impl Logger {
         ));
     }
 
+    /// Like `log()`, for entries with no associated process (zram, cache,
+    /// calibration, per-cycle summaries).
+    pub fn log_system(&self, action: LogAction, name: &str, rss_mb: f64, result: &str) {
+        self.log(action, crate::types::Pid(0), name, rss_mb, result);
+    }
+
     /// Append a pressure snapshot entry to the session log.
     #[allow(dead_code)]
     pub fn log_pressure(&self, level: &str, avg10: f64, available_mb: f64) {

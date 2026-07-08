@@ -169,13 +169,11 @@ fn dispatch(
     let cmd = parts[0];
     let arg = parts.get(1).copied().unwrap_or("").trim();
 
-    // Request-scoped config snapshot — commands below borrow it.
-    let cfg = crate::config::get();
-
     match cmd {
-        "status"   => cmd_status(frozen, checkpointed, throttle_snapshot, spike_snapshot, &cfg),
+        // Config snapshot fetched per-arm, not up front — most commands don't need it.
+        "status"   => cmd_status(frozen, checkpointed, throttle_snapshot, spike_snapshot, &crate::config::get()),
         "list"     => cmd_list(frozen, checkpointed, throttle_snapshot),
-        "ps"       => cmd_ps(frozen, throttle_snapshot, &cfg),
+        "ps"       => cmd_ps(frozen, throttle_snapshot, &crate::config::get()),
         "events"   => cmd_events(event_log),
         "reload"   => cmd_reload(),
         "unfreeze" => {
@@ -210,7 +208,7 @@ fn dispatch(
             if arg.is_empty() {
                 err("usage: info <pid|name>")
             } else {
-                cmd_info(arg, frozen, checkpointed, throttle_snapshot, &cfg)
+                cmd_info(arg, frozen, checkpointed, throttle_snapshot, &crate::config::get())
             }
         }
         "gpu-info"      => cmd_gpu_info(),
@@ -251,8 +249,8 @@ fn cmd_status(
 
     let mut out = format!(
         "pressure={pressure} | avail={:.0}MB/{:.0}MB{swap_str} | frozen={frozen_count} | checkpointed={cp_count} | throttled={throttle_count}",
-        mem.available_kb.mb(),
-        mem.total_kb.mb(),
+        mem.available_kb.mib(),
+        mem.total_kb.mib(),
     );
 
     // Per-feature gate state: enabled? last fired? blocked by what?
@@ -331,7 +329,7 @@ fn cmd_list(
     for (pid, name, _, rss, attempts) in &cp_entries {
         lines.push(format!(
             "  pid={pid:<8} name={name:<24} rss_at_cp={:.0}MB restore_attempts={attempts} [CHECKPOINTED]",
-            rss.mb(),
+            rss.mib(),
         ));
     }
 
@@ -368,7 +366,7 @@ fn cmd_reload() -> String {
 }
 
 fn cmd_unfreeze(arg: &str, frozen: &Arc<Mutex<FrozenRegistry>>) -> String {
-    let target_pid: Option<Pid> = arg.parse().ok().map(Pid);
+    let target_pid: Option<Pid> = arg.parse::<Pid>().ok();
     let arg_lower = arg.to_lowercase();
 
     let pids_to_unfreeze: Vec<(Pid, u64)> = {
@@ -407,7 +405,7 @@ fn cmd_unfreeze(arg: &str, frozen: &Arc<Mutex<FrozenRegistry>>) -> String {
 }
 
 fn cmd_freeze(arg: &str, frozen: &Arc<Mutex<FrozenRegistry>>) -> String {
-    let target_pid: Option<Pid> = arg.parse().ok().map(Pid);
+    let target_pid: Option<Pid> = arg.parse::<Pid>().ok();
     let arg_lower = arg.to_lowercase();
 
     let procs = monitor::process::list_processes();
@@ -441,7 +439,7 @@ fn cmd_freeze(arg: &str, frozen: &Arc<Mutex<FrozenRegistry>>) -> String {
 }
 
 fn cmd_restore(arg: &str, checkpointed: &Arc<Mutex<CheckpointRegistry>>) -> String {
-    let target_pid: Option<Pid> = arg.parse().ok().map(Pid);
+    let target_pid: Option<Pid> = arg.parse::<Pid>().ok();
     let arg_lower = arg.to_lowercase();
 
     let entries: Vec<_> = {
@@ -480,7 +478,7 @@ fn cmd_info(
     throttle_snapshot: &ThrottleSnapshot,
     cfg: &crate::config::CompiledConfig,
 ) -> String {
-    let target_pid: Option<Pid> = arg.parse().ok().map(Pid);
+    let target_pid: Option<Pid> = arg.parse::<Pid>().ok();
     let arg_lower = arg.to_lowercase();
 
     let procs = monitor::process::list_processes();
@@ -523,8 +521,8 @@ fn cmd_info(
         lines.push(format!(
             "pid={:<8} name={:<24} state={:<16} rss={:.0}MB swap={:.0}MB oom={} priority={} cgroup={}",
             p.pid, p.name, state,
-            p.rss_kb.mb(),
-            p.swap_kb.mb(),
+            p.rss_kb.mib(),
+            p.swap_kb.mib(),
             p.oom_score, priority,
             p.cgroup_path.as_deref().unwrap_or("none"),
         ));
@@ -533,7 +531,7 @@ fn cmd_info(
     for (pid, name, _, rss, attempts) in cp_entries {
         lines.push(format!(
             "pid={:<8} name={:<24} state=CHECKPOINTED      rss_at_cp={:.0}MB restore_attempts={attempts}",
-            pid, name, rss.mb(),
+            pid, name, rss.mib(),
         ));
     }
 
@@ -571,8 +569,8 @@ fn cmd_ps(
         lines.push(format!(
             "  pid={:<7} name={:<22} rss={:>6.0}MB swap={:>5.0}MB cpu={:>5.1}% prio={:<3} state={}",
             p.pid, p.name,
-            p.rss_kb.mb(),
-            p.swap_kb.mb(),
+            p.rss_kb.mib(),
+            p.swap_kb.mib(),
             p.cpu_pct,
             priority,
             state,
@@ -582,7 +580,7 @@ fn cmd_ps(
 }
 
 fn cmd_kill(arg: &str, event_log: &crate::events::EventLog) -> String {
-    let target_pid: Option<Pid> = arg.parse().ok().map(Pid);
+    let target_pid: Option<Pid> = arg.parse::<Pid>().ok();
     let arg_lower = arg.to_lowercase();
 
     let procs = monitor::process::list_processes();
@@ -628,7 +626,7 @@ fn cmd_spike_status(spike_snapshot: &Arc<Mutex<crate::spike_mode::SpikeSnapshot>
         let phase_str = if *phase == SpikePhase::Tracking { "tracking" } else { "observing" };
         lines.push(format!(
             "  pid={:<7} name={:<22} phase={:<10} rss_max={:.0}MB samples={} cpu_throttled={}",
-            pid, name, phase_str, rss_max.mb(), samples, cpu_throttled
+            pid, name, phase_str, rss_max.mib(), samples, cpu_throttled
         ));
     }
     if !snap.victims.is_empty() {

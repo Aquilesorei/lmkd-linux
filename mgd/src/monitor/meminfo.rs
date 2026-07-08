@@ -11,7 +11,7 @@ pub struct MemInfo {
 impl MemInfo {
     pub fn swap_used_pct(&self) -> f64 {
         if self.swap_total_kb.0 == 0 { return 0.0; }
-        (self.swap_total_kb.0 - self.swap_free_kb.0) as f64 / self.swap_total_kb.0 as f64 * 100.0
+        self.swap_total_kb.saturating_sub(self.swap_free_kb).0 as f64 / self.swap_total_kb.0 as f64 * 100.0
     }
 }
 

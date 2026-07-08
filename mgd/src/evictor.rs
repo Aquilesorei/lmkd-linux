@@ -597,8 +597,8 @@ pub fn run(
                 decisions.len(),
             );
             mgd_common::sync_print!("[cycle] {attribution}");
-            log.log(LogAction::Cycle, Pid(0), "cycle",
-                meminfo.available_kb.mb(), &attribution);
+            log.log_system(LogAction::Cycle, "cycle",
+                           meminfo.available_kb.mib(), &attribution);
         }
     }
 }
@@ -750,14 +750,18 @@ fn run_spike_cycle(
                     if r.success {
                         mgd_common::sync_print!(
                             "[spike] Froze {} (PID {}, {:.0}MB) for headroom",
-                            proc.name, proc.pid, proc.rss_kb.mb()
+                            proc.name, proc.pid, proc.rss_kb.mib()
                         );
                         log.log(LogAction::SpikeFreeze, proc.pid, &proc.name,
-                            proc.rss_kb.mb(), "proactive headroom");
+                                proc.rss_kb.mib(), "proactive headroom");
                         spike_tracker.record_victim_frozen(crate::spike_mode::SpikeVictim {
                             pid: proc.pid,
                             name: proc.name.clone(),
                             start_time: st,
+                            // unwrap_or(Pid(0)) is unreachable in practice: this arm only
+                            // runs for FreezeForHeadroom, which spike_mode only emits when
+                            // sum_rss_max > 0, i.e. at least one Tracking-phase spike exists
+                            // — so spike_pids is never empty here.
                             frozen_for_spike_pid: spike_pids.iter().next().copied().unwrap_or(Pid(0)),
                             frozen_at: std::time::Instant::now(),
                         });
@@ -803,7 +807,7 @@ fn execute_plan(
         if frozen.lock().unwrap().is_frozen(d.pid) { continue; }
 
         let result_str = execute_decision(d, frozen, checkpointed, log, event_log, sink);
-        mgd_common::sync_print!("  {:<10} {:<8} {:<22} {:>6.1}MB  {}", d.action, d.pid, d.name, d.rss.mb(), result_str);
+        mgd_common::sync_print!("  {:<10} {:<8} {:<22} {:>6.1}MB  {}", d.action, d.pid, d.name, d.rss.mib(), result_str);
 
         // Post-freeze reclaim: push full RSS to zram while the process is immobile.
         // SIGSTOP guarantees no re-faults, so 100% is safe (unlike active-process
@@ -818,10 +822,10 @@ fn execute_plan(
                     Ok(true) => {
                         mgd_common::sync_print!(
                             "[reclaim] Post-freeze: pushed ~{:.0}MB from PID {} ({}) to zram",
-                            d.rss.mb(), d.pid, d.name
+                            d.rss.mib(), d.pid, d.name
                         );
                         log.log(LogAction::FreezeReclaim, d.pid, &d.name,
-                            d.rss.mb(), "pushed to zram after pressure freeze");
+                                d.rss.mib(), "pushed to zram after pressure freeze");
                     }
                     Ok(false) => {}
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
@@ -903,10 +907,10 @@ pub(crate) fn select_idle_candidates(
     active_pid: Option<Pid>,
     background_tracker: &std::collections::HashMap<Pid, std::time::Instant>,
     swap_used_pct: f64,
-    cfg: &IdleReclaimConfig,
-    config: &CompiledConfig,
+    idle_cfg: &IdleReclaimConfig,
+    cfg: &CompiledConfig,
 ) -> Vec<(Pid, u64)> {
-    if swap_used_pct > cfg.max_swap_occupancy_pct {
+    if swap_used_pct > idle_cfg.max_swap_occupancy_pct {
         return vec![];
     }
     let mut candidates = vec![];
@@ -914,21 +918,21 @@ pub(crate) fn select_idle_candidates(
         if Some(p.pid) == active_pid {
             continue;
         }
-        let prio = crate::engine::decision::get_priority(&p.name, p.exe_basename.as_deref(), config);
+        let prio = crate::engine::decision::get_priority(&p.name, p.exe_basename.as_deref(), cfg);
         let duration = background_tracker
             .get(&p.pid)
             .map(|t| t.elapsed().as_secs())
             .unwrap_or(0);
 
         if prio >= 50 {
-            if p.rss_kb < Kb(cfg.rss_min_mb * 1024) { continue; }
-            if duration < cfg.idle_sec { continue; }
-            let reclaim_bytes = Kb(p.rss_kb.0 * cfg.reclaim_pct / 100).bytes();
+            if p.rss_kb < Kb(idle_cfg.rss_min_mb * 1024) { continue; }
+            if duration < idle_cfg.idle_sec { continue; }
+            let reclaim_bytes = p.rss_kb.percent_of(idle_cfg.reclaim_pct).bytes();
             candidates.push((p.pid, reclaim_bytes));
-        } else if cfg.important_enabled && prio >= cfg.important_min_priority {
-            if p.rss_kb < Kb(cfg.rss_min_mb * 1024) { continue; }
-            if duration < cfg.important_idle_sec { continue; }
-            let reclaim_bytes = Kb(p.rss_kb.0 * cfg.important_pct / 100).bytes();
+        } else if idle_cfg.important_enabled && prio >= idle_cfg.important_min_priority {
+            if p.rss_kb < Kb(idle_cfg.rss_min_mb * 1024) { continue; }
+            if duration < idle_cfg.important_idle_sec { continue; }
+            let reclaim_bytes = p.rss_kb.percent_of(idle_cfg.important_pct).bytes();
             candidates.push((p.pid, reclaim_bytes));
         }
     }
@@ -965,7 +969,7 @@ fn compact_zram(level: &PressureLevel, log: &Logger, cfg: &CompiledConfig) {
                 mgd_common::sync_print!(
                     "[zram] compacted {device} — {before_mb}MB→{after_mb}MB used ({reclaimed}MB reclaimed)"
                 );
-                log.log(LogAction::Zram, Pid(0), &device, reclaimed as f64,
+                log.log_system(LogAction::Zram, &device, reclaimed as f64,
                     &format!("compacted {before_mb}MB->{after_mb}MB"));
                 LAST_ZRAM_COMPACT.store(unix_timestamp_secs(), Ordering::Relaxed);
             }
@@ -975,7 +979,7 @@ fn compact_zram(level: &PressureLevel, log: &Logger, cfg: &CompiledConfig) {
                     "[zram] compact unavailable ({device}): sysfs grant absent — disabling for \
                      session. See docs/PRIVILEGE_DESIGN.md §1."
                 );
-                log.log(LogAction::Zram, Pid(0), &device, 0.0, "unavailable: EACCES (grant absent)");
+                log.log_system(LogAction::Zram, &device, 0.0, "unavailable: EACCES (grant absent)");
                 return;
             }
             Err(e) => {
@@ -1007,7 +1011,7 @@ fn check_cache_drop(level: &PressureLevel, log: &Logger, cfg: &CompiledConfig) {
     let mut total_bytes = 0u64;
     for r in crate::monitor::cache::drop_caches(&cfg.cache_drop_paths) {
         if r.files_advised > 0 {
-            log.log(LogAction::Cache, Pid(0), &r.pattern,
+            log.log_system(LogAction::Cache, &r.pattern,
                 (r.bytes_advised / (1024 * 1024)) as f64,
                 &format!("advised {} files", r.files_advised));
         }
@@ -1036,10 +1040,10 @@ fn print_status(
     mgd_common::sync_print!(
         "\n[responder] [{effective_level}] some avg10={:.2}% | RAM {:.0}/{:.0}MB | Swap {:.0}% | Avail {:.0}MB | Procs {} | Frozen {}",
         pressure.some_avg10,
-        total_rss.mb(),
-        meminfo.total_kb.mb(),
+        total_rss.mib(),
+        meminfo.total_kb.mib(),
         meminfo.swap_used_pct(),
-        meminfo.available_kb.mb(),
+        meminfo.available_kb.mib(),
         procs.len(),
         frozen_count,
     );
@@ -1051,8 +1055,8 @@ fn print_status(
         let marker = if reg.is_frozen(p.pid) { " ❄" } else { "" };
         mgd_common::sync_print!("{:<8} {:<22} {:>8.1} {:>8.1} {:>5}  {}{}",
             p.pid, p.name,
-            p.rss_kb.mb(),
-            p.swap_kb.mb(),
+            p.rss_kb.mib(),
+            p.swap_kb.mib(),
             p.oom_score,
             get_priority(&p.name, p.exe_basename.as_deref(), cfg),
             marker,
@@ -1076,7 +1080,7 @@ fn execute_decision(
         Action::None => return String::new(),
     };
     let detail = format!("{s} [{}]", d.reason);
-    log.log(action, d.pid, &d.name, d.rss.mb(), &detail);
+    log.log(action, d.pid, &d.name, d.rss.mib(), &detail);
     crate::events::push(event_log, action, d.pid, &d.name, &detail);
     s
 }
@@ -1092,7 +1096,16 @@ fn freeze_process(d: &Decision, frozen: &Arc<Mutex<FrozenRegistry>>, sink: &mut 
             "aborted: process vanished before fingerprint".into()
         }
     } else {
-        format!("fail: {}", r.error.unwrap_or_default())
+        // "process vanished" is the benign PID-recycle race (not a real
+        // freeze failure) — keep it in the same "aborted:" bucket as the
+        // fingerprint-mismatch case above so log/event greps for "aborted:"
+        // vs "fail:" keep distinguishing races from real failures.
+        let msg = r.error.unwrap_or_default();
+        if msg.starts_with("process vanished") {
+            format!("aborted: {msg}")
+        } else {
+            format!("fail: {msg}")
+        }
     }
 }
 
@@ -1220,7 +1233,7 @@ fn check_early_process_reclaim(
     targets.sort_by_key(|p| std::cmp::Reverse(p.rss_kb));
 
     for p in targets.iter().take(3) {
-        let reclaim_bytes_size = Kb(p.rss_kb.0 / 2).bytes(); // reclaim 50% of RSS
+        let reclaim_bytes_size = p.rss_kb.percent_of(50).bytes(); // reclaim 50% of RSS
         let Some(cgroup) = p.cgroup_path.as_deref() else { continue };
         match reclaim_cgroup(cgroup, reclaim_bytes_size) {
             Ok(true) => {
@@ -1367,7 +1380,7 @@ fn check_idle_process_reclaim(
                         p.name, p.pid, elapsed
                     );
                     log.log(LogAction::IdleFreeze, p.pid, &p.name,
-                        p.rss_kb.mb(), "proactively froze idle background process");
+                            p.rss_kb.mib(), "proactively froze idle background process");
                     freeze_pid_tracker.remove(&p.pid);
                     freeze_count += 1;
                 } else {
