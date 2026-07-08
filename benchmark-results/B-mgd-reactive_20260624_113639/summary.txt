@@ -1,0 +1,51 @@
+=== mgd benchmark ===
+Scenario : B-mgd-reactive
+Build dir: /home/aquiles/WebstormProjects/project-feedack-tool/honestly
+Command  : docker compose build app
+Date     : Wed Jun 24 11:36:39 AM GMT 2026
+
+--- mgd status ---
+pressure=NORMAL    (some_avg10=0.00%) | avail=7436MB/15671MB | swap=35% | frozen=0 | checkpointed=0 | throttled=0
+
+--- /proc/meminfo (pre) ---
+MemTotal:       16046868 kB
+MemAvailable:    7614312 kB
+SwapTotal:      12582908 kB
+SwapFree:        8212792 kB
+
+--- /proc/pressure/memory (pre) ---
+some avg10=0.28 avg60=0.48 avg300=0.14 total=28627183
+full avg10=0.27 avg60=0.45 avg300=0.13 total=26567666
+
+--- mgd daemon RSS ---
+VmRSS:	    7624 kB
+
+=== RESULTS ===
+Build exit code : 0
+Build time      : 69s
+
+--- Memory ---
+MemAvailable pre  : 7435 MB
+MemAvailable post : 7538 MB
+MemAvailable min  : 5455 MB
+Delta             : +102 MB
+
+--- PSI stall (accumulated during build) ---
+some_total delta : 196 ms
+full_total delta : 175 ms
+
+--- mgd actions ---
+Max frozen       : 0
+
+--- /proc/meminfo (post) ---
+MemTotal:       16046868 kB
+MemAvailable:    7718196 kB
+SwapTotal:      12582908 kB
+SwapFree:        8139100 kB
+
+--- /proc/pressure/memory (post) ---
+some avg10=0.26 avg60=0.36 avg300=0.16 total=28824124
+full avg10=0.20 avg60=0.30 avg300=0.14 total=26742759
+
+Full samples: /home/aquiles/RustroverProjects/lmkd-linux/benchmark-results/B-mgd-reactive_20260624_113639/samples.csv
+Build log   : /home/aquiles/RustroverProjects/lmkd-linux/benchmark-results/B-mgd-reactive_20260624_113639/build.log

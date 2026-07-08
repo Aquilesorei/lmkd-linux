@@ -1,0 +1,231 @@
+ Image honestly-app Building 
+#1 [internal] load local bake definitions
+#1 reading from stdin 562B done
+#1 DONE 0.0s
+
+#2 [internal] load build definition from Dockerfile
+#2 transferring dockerfile: 3.48kB done
+#2 DONE 0.0s
+
+#3 [internal] load metadata for docker.io/library/node:20-alpine
+#3 DONE 1.0s
+
+#4 [internal] load .dockerignore
+#4 transferring context: 186B done
+#4 DONE 0.0s
+
+#5 [internal] load build context
+#5 DONE 0.0s
+
+#6 [deps 1/5] FROM docker.io/library/node:20-alpine@sha256:fb4cd12c85ee03686f6af5362a0b0d56d50c58a04632e6c0fb8363f609372293
+#6 resolve docker.io/library/node:20-alpine@sha256:fb4cd12c85ee03686f6af5362a0b0d56d50c58a04632e6c0fb8363f609372293 0.1s done
+#6 DONE 0.1s
+
+#5 [internal] load build context
+#5 transferring context: 44.69kB 0.0s done
+#5 DONE 0.1s
+
+#7 [deps 3/5] WORKDIR /app
+#7 CACHED
+
+#8 [deps 4/5] COPY package.json pnpm-lock.yaml ./
+#8 CACHED
+
+#9 [deps 5/5] RUN pnpm install --frozen-lockfile
+#9 CACHED
+
+#10 [deps 2/5] RUN corepack enable && corepack prepare pnpm@10.30.3 --activate
+#10 CACHED
+
+#11 [builder 4/7] COPY --from=deps /app/node_modules ./node_modules
+#11 CACHED
+
+#12 [builder 5/7] COPY . .
+#12 DONE 1.0s
+
+#13 [builder 6/7] RUN pnpm prisma generate
+#13 2.223 Loaded Prisma config from prisma.config.ts.
+#13 2.223 
+#13 2.318 Prisma config detected, skipping environment variable loading.
+#13 2.319 Prisma schema loaded from prisma/schema.prisma
+#13 6.025 
+#13 6.025 ✔ Generated Prisma Client (v6.16.2) to ./node_modules/.pnpm/@prisma+client@6.16.2_prisma@6.16.2_typescript@5.9.3__typescript@5.9.3/node_modules/@prisma/client in 209ms
+#13 6.025 
+#13 6.025 Start by importing your Prisma Client (See: https://pris.ly/d/importing-client)
+#13 6.025 
+#13 6.025 Tip: Need your database queries to be 1000x faster? Accelerate offers you that and more: https://pris.ly/tip-2-accelerate
+#13 6.025 
+#13 DONE 6.2s
+
+#14 [builder 7/7] RUN pnpm build
+#14 0.783 
+#14 0.783 > honestly@0.1.0 build /app
+#14 0.783 > next build
+#14 0.783 
+#14 2.063 Attention: Next.js now collects completely anonymous telemetry regarding usage.
+#14 2.064 This information is used to shape Next.js' roadmap and prioritize features.
+#14 2.064 You can learn more, including how to opt-out if you'd not like to participate in this anonymous program, by visiting the following URL:
+#14 2.064 https://nextjs.org/telemetry
+#14 2.064 
+#14 2.085 ▲ Next.js 16.1.6 (Turbopack)
+#14 2.085 - Experiments (use with caution):
+#14 2.085   ✓ webpackMemoryOptimizations
+#14 2.085 
+#14 2.222   Creating an optimized production build ...
+#14 15.45 ✓ Compiled successfully in 12.5s
+#14 15.46   Running TypeScript ...
+#14 30.02   Collecting page data using 19 workers ...
+#14 33.62   Generating static pages using 19 workers (0/48) ...
+#14 33.85   Generating static pages using 19 workers (12/48) 
+#14 34.09   Generating static pages using 19 workers (24/48) 
+#14 34.18   Generating static pages using 19 workers (36/48) 
+#14 34.29 prisma:error 
+#14 34.29 Invalid `prisma.surveyTemplate.findFirst()` invocation:
+#14 34.29 
+#14 34.29 
+#14 34.29 Can't reach database server at `localhost:5432`
+#14 34.29 
+#14 34.29 Please make sure your database server is running at `localhost:5432`.
+#14 34.50 ✓ Generating static pages using 19 workers (48/48) in 887.0ms
+#14 34.51   Finalizing page optimization ...
+#14 35.08 
+#14 35.09 Route (app)
+#14 35.09 ┌ ○ /
+#14 35.09 ├ ○ /_not-found
+#14 35.09 ├ ƒ /api/admin/audit-logs
+#14 35.09 ├ ƒ /api/admin/dashboard
+#14 35.09 ├ ƒ /api/admin/dashboard/compare
+#14 35.09 ├ ƒ /api/admin/dashboard/compare/questions
+#14 35.09 ├ ƒ /api/admin/employees
+#14 35.09 ├ ƒ /api/admin/employees/[id]
+#14 35.09 ├ ƒ /api/admin/employees/departments
+#14 35.09 ├ ƒ /api/admin/employees/preview
+#14 35.09 ├ ƒ /api/admin/export
+#14 35.09 ├ ƒ /api/admin/export/[instanceId]
+#14 35.09 ├ ƒ /api/admin/export/pdf/[projectId]
+#14 35.09 ├ ƒ /api/admin/import
+#14 35.09 ├ ƒ /api/admin/metrics
+#14 35.09 ├ ƒ /api/admin/profile
+#14 35.09 ├ ƒ /api/admin/projects
+#14 35.09 ├ ƒ /api/admin/projects/[id]
+#14 35.09 ├ ƒ /api/admin/projects/[id]/scores
+#14 35.09 ├ ƒ /api/admin/projects/[id]/staffing
+#14 35.09 ├ ƒ /api/admin/projects/[id]/staffing/[employeeId]/lead
+#14 35.09 ├ ƒ /api/admin/staffing/[id]
+#14 35.09 ├ ƒ /api/admin/surveys/calculate-scores
+#14 35.09 ├ ƒ /api/admin/surveys/instances
+#14 35.09 ├ ƒ /api/admin/surveys/instances/[id]
+#14 35.09 ├ ƒ /api/admin/surveys/instances/[id]/ai-summarize
+#14 35.09 ├ ƒ /api/admin/surveys/instances/[id]/close
+#14 35.09 ├ ƒ /api/admin/surveys/instances/[id]/distribute
+#14 35.09 ├ ƒ /api/admin/surveys/instances/[id]/results
+#14 35.09 ├ ƒ /api/admin/surveys/instances/[id]/send-emails
+#14 35.09 ├ ƒ /api/admin/surveys/templates
+#14 35.09 ├ ƒ /api/admin/surveys/templates/[id]
+#14 35.09 ├ ƒ /api/admin/users
+#14 35.09 ├ ƒ /api/admin/users/[id]
+#14 35.09 ├ ƒ /api/auth/[...all]
+#14 35.09 ├ ƒ /api/cron/admin-recap
+#14 35.09 ├ ƒ /api/cron/auto-close
+#14 35.09 ├ ƒ /api/cron/send-reminders
+#14 35.09 ├ ƒ /api/cron/weekly-survey
+#14 35.09 ├ ƒ /api/pm/benchmark
+#14 35.09 ├ ƒ /api/pm/projects
+#14 35.09 ├ ƒ /api/pm/projects/[id]/scores
+#14 35.09 ├ ƒ /api/pm/surveys
+#14 35.09 ├ ƒ /api/pm/surveys/[id]/results
+#14 35.09 ├ ƒ /api/projects/export
+#14 35.09 ├ ƒ /api/projects/import
+#14 35.09 ├ ƒ /api/surveys/ai-followup
+#14 35.09 ├ ƒ /api/surveys/submit
+#14 35.09 ├ ƒ /dashboard
+#14 35.09 ├ ƒ /dashboard/audit
+#14 35.09 ├ ƒ /dashboard/employees
+#14 35.09 ├ ƒ /dashboard/employees/[id]
+#14 35.09 ├ ƒ /dashboard/projects
+#14 35.09 ├ ƒ /dashboard/projects/[id]
+#14 35.09 ├ ƒ /dashboard/projects/compare
+#14 35.09 ├ ƒ /dashboard/settings
+#14 35.09 ├ ƒ /dashboard/settings/admins
+#14 35.09 ├ ƒ /dashboard/settings/profile
+#14 35.09 ├ ƒ /dashboard/surveys
+#14 35.09 ├ ƒ /dashboard/surveys/[id]
+#14 35.09 ├ ƒ /dashboard/surveys/templates/[id]
+#14 35.09 ├ ƒ /dashboard/surveys/templates/new
+#14 35.09 ├ ○ /forgot-password
+#14 35.09 ├ ƒ /login
+#14 35.09 ├ ƒ /pm
+#14 35.09 ├ ƒ /pm/compare
+#14 35.09 ├ ƒ /pm/projects/[id]
+#14 35.09 ├ ƒ /pm/settings/profile
+#14 35.09 ├ ƒ /pm/surveys
+#14 35.09 ├ ƒ /pm/surveys/[id]
+#14 35.09 ├ ○ /reset-password
+#14 35.09 └ ƒ /s/[token]
+#14 35.09 
+#14 35.09 
+#14 35.09 ƒ Proxy (Middleware)
+#14 35.09 
+#14 35.09 ○  (Static)   prerendered as static content
+#14 35.09 ƒ  (Dynamic)  server-rendered on demand
+#14 35.09 
+#14 DONE 35.6s
+
+#15 [runner  2/15] WORKDIR /app
+#15 CACHED
+
+#16 [runner  3/15] RUN corepack enable && corepack prepare pnpm@10.30.3 --activate
+#16 CACHED
+
+#17 [runner  4/15] RUN apk update && apk add --no-cache postgresql-client dos2unix
+#17 CACHED
+
+#18 [runner  5/15] RUN pnpm add -g prisma@6.16.2
+#18 CACHED
+
+#19 [runner  6/15] COPY --from=builder /app/public ./public
+#19 CACHED
+
+#20 [runner  7/15] COPY --from=builder /app/.next/standalone ./
+#20 DONE 0.6s
+
+#21 [runner  8/15] COPY --from=builder /app/.next/static ./.next/static
+#21 DONE 0.2s
+
+#22 [runner  9/15] COPY --from=builder /app/prisma ./prisma
+#22 DONE 0.1s
+
+#23 [runner 10/15] COPY --from=builder /app/prisma.config.ts ./prisma.config.ts
+#23 DONE 0.1s
+
+#24 [runner 11/15] COPY --from=builder /app/node_modules/@prisma ./node_modules/@prisma
+#24 DONE 0.1s
+
+#25 [runner 12/15] COPY --from=builder /app/node_modules/bcryptjs ./node_modules/bcryptjs
+#25 DONE 0.1s
+
+#26 [runner 13/15] COPY --from=builder /app/node_modules/dotenv ./node_modules/dotenv
+#26 DONE 0.1s
+
+#27 [runner 14/15] COPY ./entrypoint.sh .
+#27 DONE 0.1s
+
+#28 [runner 15/15] RUN dos2unix entrypoint.sh && chmod +x entrypoint.sh
+#28 0.241 dos2unix: converting file entrypoint.sh to Unix format...
+#28 DONE 0.3s
+
+#29 exporting to image
+#29 exporting layers
+#29 exporting layers 9.1s done
+#29 exporting manifest sha256:330d87a05de390aa9d249fac86af423850fd7c89402cfc61b453b132c7e8ec2e done
+#29 exporting config sha256:b77da66d8f6be2be8eb7bde8b6c9da03cda7681bc34633f9368581df1b12f32e 0.0s done
+#29 exporting attestation manifest sha256:6414dc93b1d437ff56a278acc9bc5313be6da3298305d38aa56202eb77b0f797 0.0s done
+#29 exporting manifest list sha256:158f2daf10564d3b6398c5da65e6c400dee2ff612d9edc8d481878cbb42845f3 0.0s done
+#29 naming to docker.io/library/honestly-app:latest done
+#29 unpacking to docker.io/library/honestly-app:latest
+#29 unpacking to docker.io/library/honestly-app:latest 2.1s done
+#29 DONE 11.4s
+
+#30 resolving provenance for metadata file
+#30 DONE 0.0s
+ Image honestly-app Built 
