@@ -6,6 +6,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::types::{Kb, Pid};
+
 // ── Plugin → Core ─────────────────────────────────────────────────────────────
 
 /// Messages that a plugin sends to the core daemon.
@@ -14,44 +16,34 @@ use serde::{Deserialize, Serialize};
 pub enum PluginMessage {
     /// First message after connect: plugin introduces itself.
     Identify {
-        /// Human-readable plugin name, e.g. `"mgd-gpu-intel"`.
         name: String,
-        /// Semver string matching the plugin binary's own version.
         version: String,
-        /// Capability tokens the plugin supports, e.g. `["gpu_residency"]`.
         capabilities: Vec<String>,
     },
 
     /// A new measurement the plugin wants core to factor into decisions.
     Observation {
-        /// Plugin name (matches the `name` in `Identify`).
         plugin: String,
-        /// What was measured.
         metric: Metric,
-        /// The PID this measurement is scoped to, if any.
-        pid: Option<u32>,
-        /// Measured value in the unit implied by `metric`.
+        pid: Option<Pid>,
         value: f64,
     },
 
     /// Plugin requests that core take an action (core decides whether to approve).
     ActionRequest {
-        /// Plugin name.
         plugin: String,
-        /// The action being requested.
         action: PluginAction,
-        /// Human-readable rationale for logging.
         reason: String,
     },
 
     /// Request the latest cached GPU footprint for a specific PID.
     QueryGpu {
-        pid: u32,
+        pid: Pid,
     },
 
     /// Active window change reported by a desktop watcher plugin.
     ActiveWindow {
-        pid: Option<u32>,
+        pid: Option<Pid>,
     },
 }
 
@@ -80,9 +72,9 @@ pub enum PluginAction {
     /// Restart a named DE process (e.g. plasmashell).
     RestartProcess { name: String },
     /// Suggest freezing a specific PID.
-    FreezePid { pid: u32 },
+    FreezePid { pid: Pid },
     /// Suggest killing a specific PID.
-    KillPid { pid: u32 },
+    KillPid { pid: Pid },
 }
 
 // ── Core → Plugin ─────────────────────────────────────────────────────────────
@@ -109,17 +101,21 @@ pub enum CoreMessage {
 
     /// Response to `QueryGpu`.
     GpuObservation {
-        pid: u32,
+        pid: Pid,
         /// GPU resident KB (includes shared).
-        kb: u64,
+        kb: Kb,
         /// Shared/imported dma-buf KB (double-counted in resident).
-        shared_kb: u64,
+        shared_kb: Kb,
         /// Total allocated KB (diagnostic only).
-        total_kb: u64,
+        total_kb: Kb,
         /// Purgeable KB (shrinker free path).
-        purgeable_kb: u64,
+        purgeable_kb: Kb,
     },
 
     /// Sent by core immediately before it exits. Plugins should disconnect.
     Shutdown,
+
+    /// Sent after the daemon reloads its config (SIGHUP or `mgctl reload`).
+    /// Plugins should discard cached config and re-read from disk.
+    ConfigReload,
 }

@@ -5,7 +5,6 @@ use std::os::unix::fs::MetadataExt;
 use std::io::Write;
 use std::thread;
 use std::time::{Duration, Instant};
-use mgd_common::protocol::{Metric, PluginMessage};
 
 const PLUGIN_NAME: &str = "mgd-gpu-intel";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -13,7 +12,7 @@ const FULL_SCAN_INTERVAL: Duration = Duration::from_secs(30);
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 fn send_obs(writer: &mut impl Write, pid: u32, stats: &mgd_common::gpu::SingleProcessGpuMemory) {
-    mgd_common::gpu::send_gpu_stats(writer, PLUGIN_NAME, pid, stats);
+    mgd_common::gpu::send_gpu_stats(writer, PLUGIN_NAME, mgd_common::types::Pid(pid), stats);
 }
 
 fn main() {

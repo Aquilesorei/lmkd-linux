@@ -8,12 +8,39 @@ use std::thread;
 use std::time::Duration;
 use mgd_common::util::unix_timestamp_secs;
 use mgd_common::protocol::{CoreMessage, PluginAction, PluginMessage};
+use mgd_common::types::Pid;
 
 const PLUGIN_NAME: &str = "mgd-kde";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 static LAST_PLASMA_RESTART: AtomicU64 = AtomicU64::new(0);
 static LAST_PD_REAP: AtomicU64 = AtomicU64::new(0);
+
+struct PidCache {
+    pid: u32,
+    start_time: u64,
+}
+
+fn read_start_time(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // Field 2 (comm) is wrapped in parens and may contain spaces or ')'.
+    // rsplit_once finds the *last* ") " so it is safe regardless of the name.
+    // After that, field 22 (starttime) is at index 19 of the remaining tokens.
+    let after_comm = stat.rsplit_once(") ")?.1;
+    after_comm.split_whitespace().nth(19)?.parse().ok()
+}
+
+fn resolve_pid(name: &str, cache: &mut Option<PidCache>) -> Option<u32> {
+    if let Some(c) = cache.as_ref() {
+        if read_start_time(c.pid) == Some(c.start_time) {
+            return Some(c.pid);
+        }
+        *cache = None;
+    }
+    let pid = mgd_common::process::find_pid_by_name(name)?;
+    *cache = Some(PidCache { pid, start_time: read_start_time(pid)? });
+    Some(pid)
+}
 
 struct DiscoverTracker {
     pid: u32,
@@ -48,13 +75,13 @@ fn main() {
                         *level_clone.lock().unwrap() = level;
                     }
                     CoreMessage::GpuObservation { kb, .. } => {
-                        *gpu_kb_clone.lock().unwrap() = kb;
+                        *gpu_kb_clone.lock().unwrap() = kb.0;
                     }
                     CoreMessage::ActionResponse { action, approved, reason } => {
                         if !approved {
                             mgd_common::sync_print!("[mgd-kde] action denied: {:?}", reason);
-                        } else if let PluginAction::RestartProcess { name } = action {
-                            if name == "plasmashell" {
+                        } else if let PluginAction::RestartProcess { name } = action
+                            && name == "plasmashell" {
                                 let now = unix_timestamp_secs();
                                 LAST_PLASMA_RESTART.store(now, Ordering::SeqCst);
                                 let _ = std::process::Command::new("systemctl")
@@ -63,7 +90,9 @@ fn main() {
                                     .arg("plasma-plasmashell.service")
                                     .spawn();
                             }
-                        }
+                    }
+                    CoreMessage::ConfigReload => {
+                        *PLUGIN_CONFIG.lock().unwrap() = None;
                     }
                     CoreMessage::Shutdown => {
                         std::process::exit(0);
@@ -79,13 +108,16 @@ fn main() {
         idle_since: 0,
     };
 
+    let mut plasmashell_pid_cache: Option<PidCache> = None;
+    let mut discover_pid_cache: Option<PidCache> = None;
+
     loop {
         let level = current_level.lock().unwrap().clone();
         if level == "normal" {
-            check_plasma_discover(&mut writer, &mut pd_tracker);
+            check_plasma_discover(&mut writer, &mut pd_tracker, &mut discover_pid_cache);
         }
-        
-        check_plasma_gpu(&mut writer, &gpu_kb_cache);
+
+        check_plasma_gpu(&mut writer, &gpu_kb_cache, &mut plasmashell_pid_cache);
 
         thread::sleep(Duration::from_secs(10));
     }
@@ -97,7 +129,7 @@ fn default_discover_cooldown_min() -> u64 { 30 }
 fn default_discover_idle_check_secs() -> u64 { 60 }
 fn default_discover_rss_threshold_mb() -> u64 { 400 }
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, Clone)]
 struct PlasmaConfig {
     #[serde(default = "default_plasma_cooldown_min")]
     min_restart_interval_min: u64,
@@ -114,7 +146,7 @@ impl Default for PlasmaConfig {
     }
 }
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, Clone)]
 struct PlasmaDiscoverConfig {
     #[serde(default = "default_discover_cooldown_min")]
     cooldown_min: u64,
@@ -134,7 +166,7 @@ impl Default for PlasmaDiscoverConfig {
     }
 }
 
-#[derive(serde::Deserialize, Default)]
+#[derive(serde::Deserialize, Default, Clone)]
 struct PluginConfig {
     #[serde(default)]
     plasma: PlasmaConfig,
@@ -142,27 +174,34 @@ struct PluginConfig {
     plasma_discover: PlasmaDiscoverConfig,
 }
 
-static PLUGIN_CONFIG: std::sync::OnceLock<PluginConfig> = std::sync::OnceLock::new();
+static PLUGIN_CONFIG: std::sync::Mutex<Option<PluginConfig>> = std::sync::Mutex::new(None);
 
-fn load_plugin_config() -> &'static PluginConfig {
-    PLUGIN_CONFIG.get_or_init(|| {
-        let home = std::env::var("HOME").unwrap_or_default();
-        let paths = [
-            std::path::PathBuf::from(&home).join(".config/mgd/priorities.toml"),
-            std::path::PathBuf::from("/etc/mgd/priorities.toml"),
-        ];
-        for path in &paths {
-            if let Ok(content) = std::fs::read_to_string(path) {
-                if let Ok(cfg) = toml::from_str(&content) {
-                    return cfg;
-                }
-            }
-        }
-        PluginConfig::default()
-    })
+fn load_plugin_config() -> PluginConfig {
+    let mut guard = PLUGIN_CONFIG.lock().unwrap();
+    if let Some(ref cfg) = *guard {
+        return cfg.clone();
+    }
+    let cfg = load_plugin_config_from_disk();
+    *guard = Some(cfg.clone());
+    cfg
 }
 
-fn check_plasma_gpu(writer: &mut UnixStream, cache: &Arc<Mutex<u64>>) {
+fn load_plugin_config_from_disk() -> PluginConfig {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let paths = [
+        std::path::PathBuf::from(&home).join(".config/mgd/priorities.toml"),
+        std::path::PathBuf::from("/etc/mgd/priorities.toml"),
+    ];
+    for path in &paths {
+        if let Ok(content) = std::fs::read_to_string(path)
+            && let Ok(cfg) = toml::from_str(&content) {
+                return cfg;
+            }
+    }
+    PluginConfig::default()
+}
+
+fn check_plasma_gpu(writer: &mut UnixStream, cache: &Arc<Mutex<u64>>, pid_cache: &mut Option<PidCache>) {
     let now = unix_timestamp_secs();
     let last_restart = LAST_PLASMA_RESTART.load(Ordering::SeqCst);
     let cfg = load_plugin_config();
@@ -170,11 +209,13 @@ fn check_plasma_gpu(writer: &mut UnixStream, cache: &Arc<Mutex<u64>>) {
         return; // cooldown
     }
 
-    let Some(pid) = mgd_common::process::find_pid_by_name("plasmashell") else { return };
+    let Some(pid) = resolve_pid("plasmashell", pid_cache) else { return };
 
     // Request latest GPU stats for this PID
-    let req = PluginMessage::QueryGpu { pid };
-    let _ = writeln!(writer, "{}", serde_json::to_string(&req).unwrap());
+    let req = PluginMessage::QueryGpu { pid: Pid(pid) };
+    if writeln!(writer, "{}", serde_json::to_string(&req).unwrap()).is_err() {
+        std::process::exit(1);
+    }
 
     // Use the currently cached value
     let gpu_kb = *cache.lock().unwrap();
@@ -185,13 +226,15 @@ fn check_plasma_gpu(writer: &mut UnixStream, cache: &Arc<Mutex<u64>>) {
             action: PluginAction::RestartProcess { name: "plasmashell".to_string() },
             reason: format!("gpu memory {}MB > {}MB", gpu_kb / 1024, cfg.plasma.gpu_leak_threshold_mb),
         };
-        let _ = writeln!(writer, "{}", serde_json::to_string(&act).unwrap());
+        if writeln!(writer, "{}", serde_json::to_string(&act).unwrap()).is_err() {
+            std::process::exit(1);
+        }
         // Reset cache so we don't spam requests while waiting for core response
         *cache.lock().unwrap() = 0;
     }
 }
 
-fn check_plasma_discover(writer: &mut UnixStream, tracker: &mut DiscoverTracker) {
+fn check_plasma_discover(writer: &mut UnixStream, tracker: &mut DiscoverTracker, pid_cache: &mut Option<PidCache>) {
     let now = unix_timestamp_secs();
     let cfg = load_plugin_config();
 
@@ -201,9 +244,9 @@ fn check_plasma_discover(writer: &mut UnixStream, tracker: &mut DiscoverTracker)
         return; // cooldown between reap attempts
     }
 
-    let Some(pid) = mgd_common::process::find_pid_by_name("plasma-discover") else { 
+    let Some(pid) = resolve_pid("plasma-discover", pid_cache) else {
         tracker.pid = 0;
-        return; 
+        return;
     };
 
     if tracker.pid != pid {
@@ -235,10 +278,12 @@ fn check_plasma_discover(writer: &mut UnixStream, tracker: &mut DiscoverTracker)
         if rss_kb / 1024 > cfg.plasma_discover.rss_threshold_mb {
             let req = PluginMessage::ActionRequest {
                 plugin: PLUGIN_NAME.to_string(),
-                action: PluginAction::KillPid { pid },
+                action: PluginAction::KillPid { pid: Pid(pid) },
                 reason: format!("RSS {}MB > {}MB and idle for {}s", rss_kb / 1024, cfg.plasma_discover.rss_threshold_mb, cfg.plasma_discover.idle_check_secs),
             };
-            let _ = writeln!(writer, "{}", serde_json::to_string(&req).unwrap());
+            if writeln!(writer, "{}", serde_json::to_string(&req).unwrap()).is_err() {
+                std::process::exit(1);
+            }
             LAST_PD_REAP.store(now, Ordering::SeqCst);
         }
     }
@@ -259,12 +304,12 @@ fn load_kwin_script() -> Option<i32> {
 
     // Unload first
     let _ = std::process::Command::new("busctl")
-        .args(&["--user", "call", "org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting", "unloadScript", "s", "mgd-active-window"])
+        .args(["--user", "call", "org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting", "unloadScript", "s", "mgd-active-window"])
         .output();
 
     // Load
     let out = std::process::Command::new("busctl")
-        .args(&["--user", "call", "org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting", "loadScript", "ss", &script_path, "mgd-active-window"])
+        .args(["--user", "call", "org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting", "loadScript", "ss", &script_path, "mgd-active-window"])
         .output()
         .ok()?;
     if !out.status.success() {
@@ -272,25 +317,24 @@ fn load_kwin_script() -> Option<i32> {
     }
     let stdout = String::from_utf8_lossy(&out.stdout);
     // Parse "i <id>"
-    let id_str = stdout.trim().split_whitespace().nth(1)?;
+    let id_str = stdout.split_whitespace().nth(1)?;
     let id: i32 = id_str.parse().ok()?;
     
     // Run
     let script_obj_path = format!("/Scripting/Script{}", id);
     let run_out = std::process::Command::new("busctl")
-        .args(&["--user", "call", "org.kde.KWin", &script_obj_path, "org.kde.kwin.Script", "run"])
+        .args(["--user", "call", "org.kde.KWin", &script_obj_path, "org.kde.kwin.Script", "run"])
         .output();
-    if let Ok(o) = run_out {
-        if o.status.success() {
+    if let Ok(o) = run_out
+        && o.status.success() {
             return Some(id);
         }
-    }
     None
 }
 
 fn watch_active_window(writer: std::os::unix::net::UnixStream) {
     let mut child = match std::process::Command::new("journalctl")
-        .args(&["--user", "-f", "-o", "cat", "-n", "0"])
+        .args(["--user", "-f", "-o", "cat", "-n", "0"])
         .stdout(std::process::Stdio::piped())
         .spawn() 
     {
@@ -308,18 +352,15 @@ fn watch_active_window(writer: std::os::unix::net::UnixStream) {
     std::thread::spawn(move || {
         let mut line = String::new();
         for line_res in reader.lines() {
-            if let Ok(l) = line_res {
-                if let Some(pid_str) = l.trim().strip_prefix("ACTIVE_WINDOW_PID:") {
-                    if let Ok(pid) = pid_str.trim().parse::<u32>() {
-                        let msg = PluginMessage::ActiveWindow { pid: Some(pid) };
-                        if let Ok(json) = serde_json::to_string(&msg) {
-                            if writeln!(writer_clone, "{}", json).is_err() {
+            if let Ok(l) = line_res
+                && let Some(pid_str) = l.trim().strip_prefix("ACTIVE_WINDOW_PID:")
+                    && let Ok(pid) = pid_str.trim().parse::<u32>() {
+                        let msg = PluginMessage::ActiveWindow { pid: Some(Pid(pid)) };
+                        if let Ok(json) = serde_json::to_string(&msg)
+                            && writeln!(writer_clone, "{}", json).is_err() {
                                 break;
                             }
-                        }
                     }
-                }
-            }
             line.clear();
         }
         let _ = child.kill();

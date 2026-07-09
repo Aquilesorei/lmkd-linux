@@ -1,0 +1,51 @@
+=== mgd benchmark ===
+Scenario : C-mgd-full
+Build dir: /home/aquiles/WebstormProjects/project-feedack-tool/honestly
+Command  : docker compose build app
+Date     : Wed Jun 24 11:37:52 AM GMT 2026
+
+--- mgd status ---
+pressure=NORMAL    (some_avg10=0.00%) | avail=7537MB/15671MB | swap=35% | frozen=0 | checkpointed=0 | throttled=0
+
+--- /proc/meminfo (pre) ---
+MemTotal:       16046868 kB
+MemAvailable:    7718192 kB
+SwapTotal:      12582908 kB
+SwapFree:        8140384 kB
+
+--- /proc/pressure/memory (pre) ---
+some avg10=0.18 avg60=0.33 avg300=0.16 total=28824244
+full avg10=0.13 avg60=0.28 avg300=0.14 total=26742879
+
+--- mgd daemon RSS ---
+VmRSS:	    9288 kB
+
+=== RESULTS ===
+Build exit code : 0
+Build time      : 59s
+
+--- Memory ---
+MemAvailable pre  : 7537 MB
+MemAvailable post : 7514 MB
+MemAvailable min  : 5206 MB
+Delta             : -22 MB
+
+--- PSI stall (accumulated during build) ---
+some_total delta : 165 ms
+full_total delta : 158 ms
+
+--- mgd actions ---
+Max frozen       : 0
+
+--- /proc/meminfo (post) ---
+MemTotal:       16046868 kB
+MemAvailable:    7694700 kB
+SwapTotal:      12582908 kB
+SwapFree:        7934196 kB
+
+--- /proc/pressure/memory (post) ---
+some avg10=0.15 avg60=0.24 avg300=0.15 total=28989754
+full avg10=0.12 avg60=0.19 avg300=0.14 total=26901095
+
+Full samples: /home/aquiles/RustroverProjects/lmkd-linux/benchmark-results/C-mgd-full_20260624_113751/samples.csv
+Build log   : /home/aquiles/RustroverProjects/lmkd-linux/benchmark-results/C-mgd-full_20260624_113751/build.log

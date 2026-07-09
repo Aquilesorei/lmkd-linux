@@ -4,26 +4,39 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
-// Hot-reloadable config: wrapped in an Arc<RwLock> so SIGHUP can swap it.
-static CONFIG: std::sync::OnceLock<Arc<RwLock<CompiledConfig>>> = std::sync::OnceLock::new();
+// Hot-reloadable config: RwLock'd Arc so SIGHUP can swap it while readers
+// keep their cycle-scoped snapshot.
+static CONFIG: std::sync::OnceLock<RwLock<Arc<CompiledConfig>>> = std::sync::OnceLock::new();
 
 const BUILTIN_CONFIG: &str = include_str!("../../config/priorities.toml");
 
-pub fn get_arc() -> &'static Arc<RwLock<CompiledConfig>> {
-    CONFIG.get_or_init(|| Arc::new(RwLock::new(load())))
+fn config_cell() -> &'static RwLock<Arc<CompiledConfig>> {
+    CONFIG.get_or_init(|| RwLock::new(Arc::new(load())))
 }
 
-/// Convenience wrapper — borrows a read guard long enough for a single call.
-/// Most callers use this.
-pub fn get() -> std::sync::RwLockReadGuard<'static, CompiledConfig> {
-    get_arc().read().unwrap()
+/// Snapshot of the current config — a cheap Arc clone; no lock is held after
+/// return, so the snapshot may live across blocking work. Called once per
+/// cycle/request at composition roots (thread loop tops, IPC dispatch, main);
+/// everything below receives `&CompiledConfig`. After a reload the next
+/// snapshot sees the new config.
+pub fn get() -> Arc<CompiledConfig> {
+    config_cell().read().unwrap().clone()
 }
 
 /// Reload config from disk (called when SIGHUP received).
 pub fn reload() {
-    let new_cfg = load();
-    *get_arc().write().unwrap() = new_cfg;
+    let new_cfg = Arc::new(load());
+    *config_cell().write().unwrap() = new_cfg;
     mgd_common::output::locked_eprint("[config] Reloaded.");
+}
+
+/// Deterministic fixture for unit tests: built-in TOML with a fixed 15% target
+/// (the RAM-scaled fallback would depend on the test machine's RAM).
+#[cfg(test)]
+pub(crate) fn test_config() -> CompiledConfig {
+    let mut cfg = compile(BUILTIN_CONFIG).expect("built-in config must be valid");
+    cfg.target_available_pct = 15.0;
+    cfg
 }
 
 // ── raw TOML structs ─────────────────────────────────────────────────────────
@@ -255,6 +268,7 @@ fn default_idle_reclaim_important_pct() -> u64 { 10 }
 
 /// `[emergency]` — last-resort actions when pressure stays at Emergency level.
 #[derive(Deserialize)]
+#[derive(Default)]
 struct EmergencyConfig {
     /// Seconds of sustained Emergency before triggering `systemctl hibernate`.
     /// 0 (default) = disabled. Requires working hibernate (swap partition ≥ RAM).
@@ -262,11 +276,6 @@ struct EmergencyConfig {
     hibernate_after_sec: u64,
 }
 
-impl Default for EmergencyConfig {
-    fn default() -> Self {
-        EmergencyConfig { hibernate_after_sec: 0 }
-    }
-}
 
 #[derive(Deserialize)]
 struct SpikeMode {
@@ -456,11 +465,10 @@ impl CompiledConfig {
                 return *prio;
             }
         }
-        if let Some(exe) = exe_basename {
-            if let Some(&prio) = self.desktop_index.get(exe) {
+        if let Some(exe) = exe_basename
+            && let Some(&prio) = self.desktop_index.get(exe) {
                 return prio;
             }
-        }
         self.default_priority
     }
 
@@ -586,7 +594,7 @@ fn try_system_config() -> Option<(String, Option<PathBuf>)> {
 ///   > 32 GB  → 10%   (server/high-RAM — proportional guard is still ample)
 fn ram_scaled_target_pct() -> f64 {
     let total_kb = crate::monitor::meminfo::read_meminfo().total_kb;
-    let total_gb = total_kb as f64 / (1024.0 * 1024.0);
+    let total_gb = total_kb.0 as f64 / (1024.0 * 1024.0);
     if      total_gb < 8.0  { 20.0 }
     else if total_gb < 16.0 { 15.0 }
     else if total_gb < 32.0 { 12.0 }
@@ -607,8 +615,8 @@ fn load_calibrated_target_pct() -> Option<f64> {
 
 fn parse_calibrated_target_pct(content: &str) -> Option<f64> {
     for line in content.lines() {
-        if let Some(rest) = line.trim().strip_prefix("target_available_pct") {
-            if let Some(val) = rest.split('=').nth(1) {
+        if let Some(rest) = line.trim().strip_prefix("target_available_pct")
+            && let Some(val) = rest.split('=').nth(1) {
                 let num: String = val.trim().chars()
                     .take_while(|c| c.is_ascii_digit() || *c == '.')
                     .collect();
@@ -616,7 +624,6 @@ fn parse_calibrated_target_pct(content: &str) -> Option<f64> {
                     return Some(pct.clamp(5.0, 50.0));
                 }
             }
-        }
     }
     None
 }
@@ -773,7 +780,7 @@ fn scan_desktop_files(category_priorities: &HashMap<String, u8>) -> HashMap<Stri
     index
 }
 
-fn parse_desktop_file<'a>(path: &Path, category_priorities: &HashMap<String, u8>) -> Option<(String, u8)> {
+fn parse_desktop_file(path: &Path, category_priorities: &HashMap<String, u8>) -> Option<(String, u8)> {
     let content = std::fs::read_to_string(path).ok()?;
     let mut exe_basename: Option<String> = None;
     // Borrow slices directly from content — no String allocation per category.
@@ -795,8 +802,8 @@ fn parse_desktop_file<'a>(path: &Path, category_priorities: &HashMap<String, u8>
             let Some(binary) = rest.split_whitespace().next() else { continue };
             let Some(name) = Path::new(binary).file_name() else { continue };
             exe_basename = Some(name.to_string_lossy().into_owned());
-        } else if line.starts_with("Categories=") {
-            categories = line["Categories=".len()..]
+        } else if let Some(rest) = line.strip_prefix("Categories=") {
+            categories = rest
                 .split(';')
                 .filter(|s| !s.is_empty())
                 .collect();

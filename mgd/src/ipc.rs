@@ -13,6 +13,7 @@ use std::thread;
 use std::time::Duration;
 
 use std::collections::HashMap;
+use mgd_common::types::Pid;
 use crate::executor::registry::{CheckpointRegistry, FrozenRegistry};
 use crate::monitor;
 use crate::throttle::ThrottledState;
@@ -169,9 +170,10 @@ fn dispatch(
     let arg = parts.get(1).copied().unwrap_or("").trim();
 
     match cmd {
-        "status"   => cmd_status(frozen, checkpointed, throttle_snapshot),
+        // Config snapshot fetched per-arm, not up front — most commands don't need it.
+        "status"   => cmd_status(frozen, checkpointed, throttle_snapshot, spike_snapshot, &crate::config::get()),
         "list"     => cmd_list(frozen, checkpointed, throttle_snapshot),
-        "ps"       => cmd_ps(frozen, throttle_snapshot),
+        "ps"       => cmd_ps(frozen, throttle_snapshot, &crate::config::get()),
         "events"   => cmd_events(event_log),
         "reload"   => cmd_reload(),
         "unfreeze" => {
@@ -206,7 +208,7 @@ fn dispatch(
             if arg.is_empty() {
                 err("usage: info <pid|name>")
             } else {
-                cmd_info(arg, frozen, checkpointed, throttle_snapshot)
+                cmd_info(arg, frozen, checkpointed, throttle_snapshot, &crate::config::get())
             }
         }
         "gpu-info"      => cmd_gpu_info(),
@@ -221,10 +223,12 @@ fn cmd_status(
     frozen: &Arc<Mutex<FrozenRegistry>>,
     checkpointed: &Arc<Mutex<CheckpointRegistry>>,
     throttle_snapshot: &ThrottleSnapshot,
+    spike_snapshot: &Arc<Mutex<crate::spike_mode::SpikeSnapshot>>,
+    cfg: &crate::config::CompiledConfig,
 ) -> String {
     let pressure = monitor::psi::read_pressure()
         .map(|p| {
-            let level = monitor::psi::pressure_level(&p);
+            let level = monitor::psi::pressure_level_with(&p, &cfg.psi);
             format!("{level} (some_avg10={:.2}%)", p.some_avg10)
         })
         .unwrap_or_else(|_| "unavailable".into());
@@ -237,17 +241,65 @@ fn cmd_status(
         .filter(|s| **s != ThrottledState::None)
         .count();
 
-    let swap_str = if mem.swap_total_kb > 0 {
+    let swap_str = if mem.swap_total_kb.0 > 0 {
         format!(" | swap={:.0}%", mem.swap_used_pct())
     } else {
         " | swap=none".to_string()
     };
 
-    ok(&format!(
+    let mut out = format!(
         "pressure={pressure} | avail={:.0}MB/{:.0}MB{swap_str} | frozen={frozen_count} | checkpointed={cp_count} | throttled={throttle_count}",
-        mem.available_kb as f64 / 1024.0,
-        mem.total_kb as f64 / 1024.0,
-    ))
+        mem.available_kb.mib(),
+        mem.total_kb.mib(),
+    );
+
+    // Per-feature gate state: enabled? last fired? blocked by what?
+    let gates = crate::evictor::feature_gates();
+    let (last_reclaim, reclaim_disabled) = crate::maintenance::reclaim_gate();
+    let (spike_tracked, spike_victims) = {
+        let s = spike_snapshot.lock().unwrap();
+        (s.active.len(), s.victims.len())
+    };
+    let fired = |ts: u64| if ts == 0 { "never".to_string() } else { format!("last={}", format_ts(ts)) };
+
+    out.push_str("\nfeatures:");
+    out.push_str(&format!(
+        "\n  zram_compact       enabled={} {}{}",
+        cfg.compact_zram_on_elevated, fired(gates.last_zram_compact),
+        if gates.zram_compact_disabled { " [DISABLED: sysfs grant absent]" } else { "" },
+    ));
+    out.push_str(&format!(
+        "\n  cache_drop         enabled={} trigger={} {}",
+        cfg.cache_drop_enabled, cfg.cache_drop_trigger, fired(gates.last_cache_drop),
+    ));
+    out.push_str(&format!(
+        "\n  early_reclaim      always-on (Elevated) {}",
+        fired(gates.last_early_reclaim),
+    ));
+    out.push_str(&format!(
+        "\n  idle_reclaim       enabled={} important={} {}",
+        cfg.idle_reclaim_enabled, cfg.idle_reclaim_important_enabled, fired(gates.last_idle_reclaim),
+    ));
+    out.push_str(&format!(
+        "\n  proactive_reclaim  enabled={} {}{}",
+        cfg.proactive_swap_reclaim, fired(last_reclaim),
+        if reclaim_disabled { " [DISABLED: helper absent/uncapped]" } else { "" },
+    ));
+    out.push_str(&format!(
+        "\n  spike_mode         enabled={} tracked={} victims={}",
+        cfg.spike_mode_enabled, spike_tracked, spike_victims,
+    ));
+    out.push_str(&format!(
+        "\n  auto_kill_idle     rules={}",
+        cfg.auto_kill_rules.len(),
+    ));
+    out.push_str(&format!(
+        "\n  hibernate          {}",
+        if cfg.emergency_hibernate_after_sec == 0 { "disabled".to_string() }
+        else { format!("after {}s Emergency", cfg.emergency_hibernate_after_sec) },
+    ));
+
+    ok(&out)
 }
 
 fn cmd_list(
@@ -256,7 +308,7 @@ fn cmd_list(
     throttle_snapshot: &ThrottleSnapshot,
 ) -> String {
     let frozen_reg = frozen.lock().unwrap();
-    let frozen_pids: std::collections::HashSet<u32> =
+    let frozen_pids: std::collections::HashSet<Pid> =
         frozen_reg.frozen_pids().into_iter().collect();
     let throttle = throttle_snapshot.lock().unwrap();
     let procs = monitor::process::list_processes();
@@ -274,15 +326,15 @@ fn cmd_list(
     let cp_reg = checkpointed.lock().unwrap();
     let mut cp_entries = cp_reg.entries_lightest_first();
     cp_entries.sort_by_key(|(pid, _, _, _, _)| *pid);
-    for (pid, name, _, rss_kb, attempts) in &cp_entries {
+    for (pid, name, _, rss, attempts) in &cp_entries {
         lines.push(format!(
             "  pid={pid:<8} name={name:<24} rss_at_cp={:.0}MB restore_attempts={attempts} [CHECKPOINTED]",
-            *rss_kb as f64 / 1024.0,
+            rss.mib(),
         ));
     }
 
     // Running processes that are throttled
-    let mut throttled: Vec<(u32, &str, &str)> = procs
+    let mut throttled: Vec<(Pid, &str, &str)> = procs
         .iter()
         .filter(|p| !frozen_pids.contains(&p.pid))
         .filter_map(|p| {
@@ -309,14 +361,15 @@ fn cmd_list(
 
 fn cmd_reload() -> String {
     crate::config::reload();
+    crate::plugin_server::broadcast_config_reload();
     ok("config reloaded")
 }
 
 fn cmd_unfreeze(arg: &str, frozen: &Arc<Mutex<FrozenRegistry>>) -> String {
-    let target_pid: Option<u32> = arg.parse().ok();
+    let target_pid: Option<Pid> = arg.parse::<Pid>().ok();
     let arg_lower = arg.to_lowercase();
 
-    let pids_to_unfreeze: Vec<(u32, u64)> = {
+    let pids_to_unfreeze: Vec<(Pid, u64)> = {
         let reg = frozen.lock().unwrap();
         reg.frozen_pids()
             .into_iter()
@@ -352,7 +405,7 @@ fn cmd_unfreeze(arg: &str, frozen: &Arc<Mutex<FrozenRegistry>>) -> String {
 }
 
 fn cmd_freeze(arg: &str, frozen: &Arc<Mutex<FrozenRegistry>>) -> String {
-    let target_pid: Option<u32> = arg.parse().ok();
+    let target_pid: Option<Pid> = arg.parse::<Pid>().ok();
     let arg_lower = arg.to_lowercase();
 
     let procs = monitor::process::list_processes();
@@ -386,7 +439,7 @@ fn cmd_freeze(arg: &str, frozen: &Arc<Mutex<FrozenRegistry>>) -> String {
 }
 
 fn cmd_restore(arg: &str, checkpointed: &Arc<Mutex<CheckpointRegistry>>) -> String {
-    let target_pid: Option<u32> = arg.parse().ok();
+    let target_pid: Option<Pid> = arg.parse::<Pid>().ok();
     let arg_lower = arg.to_lowercase();
 
     let entries: Vec<_> = {
@@ -423,8 +476,9 @@ fn cmd_info(
     frozen: &Arc<Mutex<FrozenRegistry>>,
     checkpointed: &Arc<Mutex<CheckpointRegistry>>,
     throttle_snapshot: &ThrottleSnapshot,
+    cfg: &crate::config::CompiledConfig,
 ) -> String {
-    let target_pid: Option<u32> = arg.parse().ok();
+    let target_pid: Option<Pid> = arg.parse::<Pid>().ok();
     let arg_lower = arg.to_lowercase();
 
     let procs = monitor::process::list_processes();
@@ -463,21 +517,21 @@ fn cmd_info(
                 _                                => "normal".to_string(),
             }
         };
-        let priority = crate::engine::decision::get_priority(&p.name, p.exe_basename.as_deref());
+        let priority = crate::engine::decision::get_priority(&p.name, p.exe_basename.as_deref(), cfg);
         lines.push(format!(
             "pid={:<8} name={:<24} state={:<16} rss={:.0}MB swap={:.0}MB oom={} priority={} cgroup={}",
             p.pid, p.name, state,
-            p.rss_kb as f64 / 1024.0,
-            p.swap_kb as f64 / 1024.0,
+            p.rss_kb.mib(),
+            p.swap_kb.mib(),
             p.oom_score, priority,
             p.cgroup_path.as_deref().unwrap_or("none"),
         ));
     }
 
-    for (pid, name, _, rss_kb, attempts) in cp_entries {
+    for (pid, name, _, rss, attempts) in cp_entries {
         lines.push(format!(
             "pid={:<8} name={:<24} state=CHECKPOINTED      rss_at_cp={:.0}MB restore_attempts={attempts}",
-            pid, name, rss_kb as f64 / 1024.0,
+            pid, name, rss.mib(),
         ));
     }
 
@@ -487,6 +541,7 @@ fn cmd_info(
 fn cmd_ps(
     frozen: &Arc<Mutex<FrozenRegistry>>,
     throttle_snapshot: &ThrottleSnapshot,
+    cfg: &crate::config::CompiledConfig,
 ) -> String {
     let procs = monitor::process::list_processes();
     let frozen_reg = frozen.lock().unwrap();
@@ -498,7 +553,7 @@ fn cmd_ps(
 
     let mut lines = Vec::new();
     let mut sorted = procs;
-    sorted.sort_by(|a, b| b.rss_kb.cmp(&a.rss_kb));
+    sorted.sort_by_key(|p| std::cmp::Reverse(p.rss_kb));
 
     for p in &sorted {
         let state = if frozen_reg.is_frozen(p.pid) {
@@ -510,12 +565,12 @@ fn cmd_ps(
                 _                                => "normal",
             }
         };
-        let priority = crate::engine::decision::get_priority(&p.name, p.exe_basename.as_deref());
+        let priority = crate::engine::decision::get_priority(&p.name, p.exe_basename.as_deref(), cfg);
         lines.push(format!(
             "  pid={:<7} name={:<22} rss={:>6.0}MB swap={:>5.0}MB cpu={:>5.1}% prio={:<3} state={}",
             p.pid, p.name,
-            p.rss_kb as f64 / 1024.0,
-            p.swap_kb as f64 / 1024.0,
+            p.rss_kb.mib(),
+            p.swap_kb.mib(),
             p.cpu_pct,
             priority,
             state,
@@ -525,7 +580,7 @@ fn cmd_ps(
 }
 
 fn cmd_kill(arg: &str, event_log: &crate::events::EventLog) -> String {
-    let target_pid: Option<u32> = arg.parse().ok();
+    let target_pid: Option<Pid> = arg.parse::<Pid>().ok();
     let arg_lower = arg.to_lowercase();
 
     let procs = monitor::process::list_processes();
@@ -545,7 +600,7 @@ fn cmd_kill(arg: &str, event_log: &crate::events::EventLog) -> String {
     for p in candidates {
         let r = crate::executor::killer::sigkill(p.pid);
         if r.success {
-            crate::events::push(event_log, "KILL_MANUAL", p.pid, &p.name, "killed via mgctl");
+            crate::events::push(event_log, mgd_common::logger::LogAction::KillManual, p.pid, &p.name, "killed via mgctl");
             results.push(format!("✓ killed pid={} ({})", p.pid, p.name));
         } else {
             results.push(format!("✗ pid={} ({}): {}", p.pid, p.name, r.error.unwrap_or_default()));
@@ -555,9 +610,9 @@ fn cmd_kill(arg: &str, event_log: &crate::events::EventLog) -> String {
 }
 
 fn cmd_gpu_info() -> String {
-    let (pids, total_kb, newest_age) = crate::plugin_server::gpu_cache_snapshot();
+    let (pids, total, newest_age) = crate::plugin_server::gpu_cache_snapshot();
     let age_str = newest_age.map(|a| format!("{a}s ago")).unwrap_or_else(|| "none".to_string());
-    ok(&format!("gpu_pids={pids} total_kb={total_kb} newest_obs={age_str}"))
+    ok(&format!("gpu_pids={pids} total_kb={} newest_obs={age_str}", total.0))
 }
 
 fn cmd_spike_status(spike_snapshot: &Arc<Mutex<crate::spike_mode::SpikeSnapshot>>) -> String {
@@ -567,11 +622,11 @@ fn cmd_spike_status(spike_snapshot: &Arc<Mutex<crate::spike_mode::SpikeSnapshot>
         return ok("idle (no spike candidates active)");
     }
     let mut lines: Vec<String> = vec!["spike candidates:".to_string()];
-    for (pid, name, phase, rss_max_kb, samples, cpu_throttled) in &snap.active {
+    for (pid, name, phase, rss_max, samples, cpu_throttled) in &snap.active {
         let phase_str = if *phase == SpikePhase::Tracking { "tracking" } else { "observing" };
         lines.push(format!(
             "  pid={:<7} name={:<22} phase={:<10} rss_max={:.0}MB samples={} cpu_throttled={}",
-            pid, name, phase_str, *rss_max_kb as f64 / 1024.0, samples, cpu_throttled
+            pid, name, phase_str, rss_max.mib(), samples, cpu_throttled
         ));
     }
     if !snap.victims.is_empty() {
@@ -589,7 +644,7 @@ fn cmd_events(event_log: &crate::events::EventLog) -> String {
         return ok("(no events recorded)");
     }
     let lines: Vec<String> = q.iter().map(|e| {
-        format!("  {} {:<14} pid={:<7} name={:<22} {}", format_ts(e.timestamp), e.action, e.pid, e.name, e.detail)
+        format!("  {} {:<14} pid={:<7} name={:<22} {}", format_ts(e.timestamp), e.action.as_str(), e.pid, e.name, e.detail)
     }).collect();
     ok(&lines.join("\n"))
 }
@@ -649,6 +704,7 @@ mod tests {
             &empty_frozen(),
             &empty_checkpointed(),
             &empty_throttle(),
+            &crate::config::test_config(),
         );
         assert!(r.starts_with("ERR"), "expected ERR, got: {r}");
     }
@@ -668,7 +724,7 @@ mod tests {
     #[test]
     fn events_records_and_retrieves() {
         let log = empty_events();
-        events::push(&log, "FREEZE", 42, "test_proc", "frozen");
+        events::push(&log, mgd_common::logger::LogAction::Freeze, Pid(42), "test_proc", "frozen");
         let r = cmd_events(&log);
         assert!(r.contains("FREEZE"), "expected FREEZE in: {r}");
         assert!(r.contains("test_proc"), "expected test_proc in: {r}");
@@ -676,7 +732,7 @@ mod tests {
 
     #[test]
     fn ps_returns_ok() {
-        let r = cmd_ps(&empty_frozen(), &empty_throttle());
+        let r = cmd_ps(&empty_frozen(), &empty_throttle(), &crate::config::test_config());
         assert!(r.starts_with("OK"), "expected OK, got: {r}");
     }
 }

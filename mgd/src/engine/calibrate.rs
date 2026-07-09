@@ -1,47 +1,45 @@
-//! Passive PSI calibration (ROADMAP Phase D) — suggest-don't-apply.
+//! Passive PSI calibration — suggest-don't-apply threshold tuning.
 //!
-//! Accumulates seconds-weighted histograms of `some_avg10`, split by whether
-//! the machine was actually stalling (`full_avg10 ≥ 1%`), and suggests `[psi]`
-//! thresholds once enough untreated pressure has been observed. No active
-//! probing; samples taken while the daemon has an intervention in flight
-//! (frozen/checkpointed processes) are excluded so the daemon doesn't
-//! calibrate off its own effect on pressure.
+//! Builds seconds-weighted 1%-bin histograms of `some_avg10` split into benign
+//! vs stalling samples (`full_avg10 ≥ STALL_FULL_PCT`), plus a `full_avg10`
+//! histogram and a debounced stall-episode counter.
 //!
-//! Pure module: serialization in/out is string-based; all file I/O lives in
-//! `maintenance.rs`.
+//! Samples taken while the daemon is actively intervening (non-empty frozen or
+//! checkpoint registries) are excluded so the calibrator never builds a noise
+//! floor on pressure it is treating.
+//!
+//! After ≥ 24 h and ≥ 10 stall episodes, `suggest()` emits threshold values:
+//! `elevated_pct` = benign p95 + `ELEVATED_MARGIN_PCT`, capped by stall-onset
+//! p10; upper tiers are ratio-derived. Output is written commented-out to a
+//! suggestion TOML that the user pastes into their config.
 
 use serde::{Deserialize, Serialize};
 
 use crate::monitor::psi::PsiThresholds;
 
-/// 1%-wide bins over some_avg10/full_avg10 ∈ [0, 100).
+/// Number of 1%-wide bins covering [0, 100) for the `some_avg10` histograms.
 pub const BINS: usize = 100;
 
-/// full_avg10 at/above this counts as a real stall sample.
+/// `full_avg10` threshold above which a sample is classified as "stalling"
+/// rather than benign background noise.
 const STALL_FULL_PCT: f64 = 1.0;
 
-/// Headroom added above the benign noise ceiling for the elevated suggestion.
+/// Safety margin added on top of the benign p95 when deriving `elevated_pct`.
 const ELEVATED_MARGIN_PCT: f64 = 2.0;
 
-/// Data gates: don't suggest before a day of observation and 10 stall episodes.
 const MIN_OBSERVED_SECS: u64 = 24 * 3600;
 const MIN_STALL_EVENTS: u32 = 10;
 const MIN_STALL_SECS: u64 = 60;
 
-/// Aggregates persisted across daemon restarts (TOML via to_toml/from_toml).
+/// Serialisable accumulator persisted to `~/.local/share/mgd/calibration_state.toml`
+/// every 10 min and on clean daemon shutdown.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct CalibratorState {
-    /// Seconds observed per some_avg10 bin while full_avg10 < 1% (no stall).
     benign_secs: Vec<u64>,
-    /// Seconds observed per some_avg10 bin while full_avg10 ≥ 1% (stalling).
     stall_secs: Vec<u64>,
-    /// Seconds observed per full_avg10 bin during stall samples.
     full_secs: Vec<u64>,
-    /// Total accepted observation time (excludes intervention-tainted samples).
     pub observed_secs: u64,
-    /// Distinct stall episodes (full_avg10 crossing the 1% floor, debounced).
     pub stall_events: u32,
-    /// Highest full_avg10 ever seen (provenance only).
     pub max_full_avg10: f64,
 }
 
@@ -58,14 +56,9 @@ impl Default for CalibratorState {
     }
 }
 
-/// Threshold suggestion derived from the observed distributions.
 pub struct Suggestion {
-    /// Benign noise ceiling + margin: real signal, suggested as a live value.
     pub elevated_pct: f64,
-    /// p95 of full_avg10 during stalls: real signal, suggested as a live value.
     pub full_critical_pct: f64,
-    /// Upper tiers scaled from elevated_pct by the default ratios — biased
-    /// (the daemon's own actions truncate the distribution), emitted commented.
     pub high_pct: f64,
     pub critical_pct: f64,
     pub emergency_pct: f64,
@@ -78,9 +71,7 @@ pub struct Suggestion {
 
 pub struct Calibrator {
     state: CalibratorState,
-    /// Stall-episode debounce: inside an episode until full drops below 1%.
     in_stall: bool,
-    /// Unsaved changes since the last to_toml()/clear_dirty().
     dirty: bool,
 }
 
@@ -105,11 +96,6 @@ impl Calibrator {
         Calibrator { state, in_stall: false, dirty: false }
     }
 
-    /// Feed one PSI sample worth `weight_secs` of wall time.
-    /// `intervention_active` = the daemon currently has frozen/checkpointed
-    /// processes — pressure is "treated", so the sample is excluded from the
-    /// histograms (the stall debounce still tracks so episodes spanning an
-    /// intervention boundary aren't double-counted).
     pub fn observe(
         &mut self,
         some_avg10: f64,
@@ -154,7 +140,9 @@ impl Calibrator {
         &self.state
     }
 
-    /// Serialize the aggregates; clears the dirty flag (caller persists it).
+    // Takes &mut self: flushing serializes the state *and* clears the dirty flag,
+    // so callers can't forget to reset it after a successful write.
+    #[allow(clippy::wrong_self_convention)]
     pub fn to_toml(&mut self) -> String {
         self.dirty = false;
         toml::to_string(&self.state).unwrap_or_default()
@@ -164,7 +152,6 @@ impl Calibrator {
         toml::from_str::<CalibratorState>(s).ok().map(Self::from_state)
     }
 
-    /// Suggested `[psi]` thresholds, or None until the data gates pass.
     pub fn suggest(&self) -> Option<Suggestion> {
         let st = &self.state;
         let stall_total: u64 = st.stall_secs.iter().sum();
@@ -175,26 +162,22 @@ impl Calibrator {
             return None;
         }
 
-        // Benign noise ceiling: some_avg10 level that 95% of stall-free time
-        // stays under. Anything below it is noise, not a wake-up signal.
+
         let benign_p95 = percentile(&st.benign_secs, 95.0).unwrap_or(0.0);
         // Where real stalls begin: low percentile of some_avg10 during stalls.
         let stall_onset_p10 = percentile(&st.stall_secs, 10.0).unwrap_or(100.0);
 
         let mut elevated = (benign_p95 + ELEVATED_MARGIN_PCT).clamp(2.0, 15.0);
-        // Never set the wake threshold above where stalls demonstrably start.
         if stall_onset_p10 < elevated {
             elevated = stall_onset_p10.max(2.0);
         }
 
-        // full_avg10 level rarely exceeded even while stalling — exceeding it
-        // means this machine is in unusually deep trouble.
+
         let full_critical = percentile(&st.full_secs, 95.0)
             .unwrap_or(20.0)
             .clamp(5.0, 50.0);
 
-        // Upper tiers: keep the default 5/25/50/70 ratios relative to elevated,
-        // clamped to stay strictly increasing and ≤ 100.
+
         let scale = elevated / 5.0;
         let emergency = (70.0 * scale).min(100.0);
         let critical = (50.0 * scale).min(emergency - 1.0);
@@ -214,8 +197,7 @@ impl Calibrator {
     }
 }
 
-/// Seconds-weighted percentile over a 1%-bin histogram; returns the upper edge
-/// of the bin containing the requested mass, or None for an empty histogram.
+
 fn percentile(hist: &[u64], pct: f64) -> Option<f64> {
     let total: u64 = hist.iter().sum();
     if total == 0 {
@@ -232,8 +214,7 @@ fn percentile(hist: &[u64], pct: f64) -> Option<f64> {
     Some(BINS as f64)
 }
 
-/// Render a ready-to-paste suggestion file. The two values with real observed
-/// signal are live; the daemon-biased upper tiers are commented out.
+
 pub fn render_suggestion(s: &Suggestion, current: &PsiThresholds, generated_unix_secs: u64) -> String {
     format!(
         "# Generated by mgd passive calibration (unix time {ts})\n\
@@ -276,8 +257,7 @@ pub fn render_suggestion(s: &Suggestion, current: &PsiThresholds, generated_unix
 mod tests {
     use super::*;
 
-    /// Calibrator with the data gates already satisfied: a day of benign time
-    /// concentrated at `benign_pct`, and stall time at `stall_some_pct`/`full_pct`.
+
     fn seeded(benign_pct: f64, stall_some_pct: f64, full_pct: f64) -> Calibrator {
         let mut c = Calibrator::new();
         // Benign bulk: one big sample is fine — percentile is mass-weighted.

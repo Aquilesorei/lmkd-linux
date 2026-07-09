@@ -1,28 +1,27 @@
-//! PSI source resolution shared by the daemon (`mgd`) and the diagnostic
-//! client (`mgctl doctor`), so both always agree on which file is in use.
-
 use std::fs;
 
-/// System-wide PSI — always present when CONFIG_PSI is enabled.
+/// The global kernel PSI memory pressure file. Always present when
+/// `CONFIG_PSI=y`; readable and writable without elevated privileges.
 pub const GLOBAL_PSI: &str = "/proc/pressure/memory";
 
-/// The per-session PSI file under the systemd user-manager cgroup.
-/// Pressure here reflects only this session, not system-wide noise.
+/// Per-session cgroup `memory.pressure` path for the current user. Preferred
+/// over the global file because it only reflects processes in this user session,
+/// avoiding noise from other users or system services.
 pub fn cgroup_psi_path() -> String {
     let uid = unsafe { libc::getuid() };
     format!("/sys/fs/cgroup/user.slice/user-{uid}.slice/user@{uid}.service/memory.pressure")
 }
 
-/// A PSI file is usable if it can be read and looks like PSI output.
-/// (A cgroup file may exist but return ENOTSUP when PSI is compiled out.)
-pub fn is_usable_psi_file(path: &str) -> bool {
+
+fn is_usable_psi_file(path: &str) -> bool {
     fs::read_to_string(path)
         .map(|c| c.starts_with("some "))
         .unwrap_or(false)
 }
 
-/// Resolve the PSI file to read: per-session cgroup first, global fallback
-/// (cgroup-v1 hosts or kernels without per-cgroup PSI).
+/// Returns the best available PSI source: the per-session cgroup file when
+/// readable, falling back to the global `/proc/pressure/memory`. This is
+/// resolved once at daemon startup and reused across cycles.
 pub fn resolve_pressure_source() -> String {
     let cgroup = cgroup_psi_path();
     if is_usable_psi_file(&cgroup) {
@@ -32,9 +31,10 @@ pub fn resolve_pressure_source() -> String {
     }
 }
 
-/// Whether a kernel PSI trigger can be armed on `path` (requires opening
-/// read-write; the cgroup file is root-owned on systemd < 254). Probes by
-/// opening only — no trigger is registered, and the fd is dropped here.
+/// Returns `true` if `path` can be opened read-write, which is the
+/// precondition for arming a kernel PSI trigger on it. The cgroup file is
+/// root-owned on systemd < 254; if this returns `false`, the daemon falls
+/// back to the epoll trigger or 5 s polling.
 pub fn trigger_armable(path: &str) -> bool {
     fs::OpenOptions::new()
         .read(true)
@@ -43,14 +43,12 @@ pub fn trigger_armable(path: &str) -> bool {
         .is_ok()
 }
 
-/// Walk the cgroup hierarchy upward from the calling process's own cgroup,
-/// returning the highest (broadest-scope) `memory.pressure` file that can be
-/// opened read-write (i.e. can have a PSI trigger armed on it).
-///
-/// On kernel 7.x+, `/proc/pressure/memory` triggers are broken (EINVAL) and
-/// the min trigger window rose from 1s to 2s. Cgroup PSI files owned by the
-/// user (e.g. `app.slice`) work; root-owned ancestors do not.
-/// Returns `None` if no writable PSI file is found (containers, etc.).
+/// Walks the cgroup hierarchy upward from `/proc/self/cgroup` and returns the
+/// highest-level `memory.pressure` file that is trigger-armable (read-write).
+/// On kernel 7.x, `/proc/pressure/memory` trigger writes return EINVAL
+/// unconditionally, so cgroup-level arming is the only working path.
+/// Returns `None` when no writable pressure file is found (daemon falls back
+/// to 5 s polling).
 pub fn find_trigger_path() -> Option<String> {
     let cgroup_content = fs::read_to_string("/proc/self/cgroup").ok()?;
     let rel = cgroup_content

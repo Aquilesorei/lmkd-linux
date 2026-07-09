@@ -12,13 +12,13 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use mgd_common::logger::{LogEntry, Logger};
+use mgd_common::logger::{LogAction, Logger};
+use mgd_common::types::Pid;
 use crate::engine::calibrate::{render_suggestion, Calibrator};
 use crate::executor::registry::{CheckpointRegistry, FrozenRegistry};
 use crate::monitor;
 use crate::monitor::psi::PressureLevel;
 use mgd_common::output::locked_print;
-use libc;
 
 const POLL_SECS: u64 = 60;
 
@@ -38,6 +38,11 @@ static LAST_RECLAIM: AtomicU64 = AtomicU64::new(0);
 /// Set once when the reclaim helper is absent/uncapped, to log only once.
 static RECLAIM_DISABLED: AtomicBool = AtomicBool::new(false);
 
+/// (last_reclaim_unix_secs, disabled_for_session) — read by `mgctl status`.
+pub(crate) fn reclaim_gate() -> (u64, bool) {
+    (LAST_RECLAIM.load(Ordering::Relaxed), RECLAIM_DISABLED.load(Ordering::Relaxed))
+}
+
 pub fn run(
     log: Arc<Logger>,
     frozen: Arc<Mutex<FrozenRegistry>>,
@@ -47,7 +52,7 @@ pub fn run(
 ) {
     let mut last_calibration_flush = Instant::now();
     // (pid, start_time) → last instant we saw cpu_pct > 0
-    let mut auto_kill_last_active: HashMap<(u32, u64), Instant> = HashMap::new();
+    let mut auto_kill_last_active: HashMap<(Pid, u64), Instant> = HashMap::new();
 
     loop {
         if crate::should_shutdown() {
@@ -56,11 +61,14 @@ pub fn run(
 
         crate::plugin_server::check_and_restart_plugins();
 
+        // One config snapshot per cycle; everything below borrows it.
+        let cfg = crate::config::get();
+
         let pressure = monitor::psi::read_pressure().ok();
         // A PSI read error counts as not-calm.
         let calm = pressure
             .as_ref()
-            .map(|p| monitor::psi::pressure_level(p) == PressureLevel::Normal)
+            .map(|p| monitor::psi::pressure_level_with(p, &cfg.psi) == PressureLevel::Normal)
             .unwrap_or(false);
 
         // Check if evictor signalled that kills freed headroom.
@@ -74,10 +82,10 @@ pub fn run(
 
         let cycle_start = Instant::now();
         if calm {
-            check_auto_kill_idle(&mut auto_kill_last_active, &frozen, &log);
+            check_auto_kill_idle(&mut auto_kill_last_active, &frozen, &log, &cfg);
 
             if let Some(p) = pressure.as_ref() {
-                check_proactive_reclaim(p, &log, false);
+                check_proactive_reclaim(p, &log, false, &cfg);
 
                 
                 let intervention = frozen.lock().unwrap().count() > 0
@@ -93,15 +101,14 @@ pub fn run(
 
         if last_calibration_flush.elapsed().as_secs() >= CALIBRATION_FLUSH_SECS {
             last_calibration_flush = Instant::now();
-            flush_calibration(&calibrator, &log);
+            flush_calibration(&calibrator, &log, &cfg.psi);
         }
 
-        if kill_triggered && !calm {
-            if let Some(p) = pressure.as_ref() {
+        if kill_triggered && !calm
+            && let Some(p) = pressure.as_ref() {
                 mgd_common::sync_print!("[maintenance] Kill-triggered reclaim attempt (post-eviction headroom)");
-                check_proactive_reclaim(p, &log, true);
+                check_proactive_reclaim(p, &log, true, &cfg);
             }
-        }
 
         // Subtract time already spent (the idle sample) to hold the period at ~POLL_SECS.
         let spent = cycle_start.elapsed().as_secs();
@@ -137,7 +144,12 @@ pub fn load_calibrator() -> Calibrator {
 
 /// Persist aggregates if dirty, and (re)write the suggestion file once the
 /// data gates pass. Called periodically from the loop and at shutdown.
-pub fn flush_calibration(calibrator: &Arc<Mutex<Calibrator>>, log: &Logger) {
+/// `psi` comes from the caller's config snapshot (loop cycle or main).
+pub fn flush_calibration(
+    calibrator: &Arc<Mutex<Calibrator>>,
+    log: &Logger,
+    psi: &crate::monitor::psi::PsiThresholds,
+) {
     let (state_toml, suggestion) = {
         let mut cal = calibrator.lock().unwrap();
         if !cal.dirty() {
@@ -156,7 +168,7 @@ pub fn flush_calibration(calibrator: &Arc<Mutex<Calibrator>>, log: &Logger) {
     }
 
     let Some(s) = suggestion else { return };
-    let rendered = render_suggestion(&s, &crate::config::get().psi, now_secs());
+    let rendered = render_suggestion(&s, psi, now_secs());
     let sug_path = calibration_suggestion_path();
     // Rewrite only on change so the mtime stays meaningful and we log once
     // per actual revision, not every flush.
@@ -169,11 +181,9 @@ pub fn flush_calibration(calibrator: &Arc<Mutex<Calibrator>>, log: &Logger) {
                 "[calibrate] [psi] suggestion ready ({:.0}h observed, {} stalls) → {}",
                 s.observed_hours, s.stall_events, sug_path.display()
             );
-            log.log(&LogEntry::new(
-                "CALIBRATE", 0, "psi", s.elevated_pct,
+            log.log_system(LogAction::Calibrate, "psi", s.elevated_pct,
                 &format!("suggested elevated_pct={:.1} full_critical_pct={:.1}",
-                    s.elevated_pct, s.full_critical_pct),
-            ));
+                    s.elevated_pct, s.full_critical_pct));
         }
         Err(e) => mgd_common::sync_print!("[calibrate] cannot write suggestion to {}: {e}", sug_path.display()),
     }
@@ -185,18 +195,18 @@ fn now_secs() -> u64 {
 
 
 fn check_auto_kill_idle(
-    last_active: &mut HashMap<(u32, u64), Instant>,
+    last_active: &mut HashMap<(Pid, u64), Instant>,
     frozen: &Arc<Mutex<FrozenRegistry>>,
     log: &Logger,
+    cfg: &crate::config::CompiledConfig,
 ) {
-    let cfg = crate::config::get();
     if cfg.auto_kill_rules.is_empty() {
         return;
     }
     let procs = monitor::process::list_processes();
     let now = Instant::now();
 
-    let live_keys: HashMap<(u32, u64), &crate::monitor::process::Process> = procs.iter()
+    let live_keys: HashMap<(Pid, u64), &crate::monitor::process::Process> = procs.iter()
         .filter_map(|p| {
             crate::executor::read_start_time(p.pid).map(|st| ((p.pid, st), p))
         })
@@ -215,16 +225,12 @@ fn check_auto_kill_idle(
         let elapsed = now.duration_since(last_active[&key]).as_secs();
         if elapsed >= idle_secs {
             // Safety: normal SIGTERM, process may be ours or in our slice.
-            let _ = unsafe { libc::kill(p.pid as libc::pid_t, libc::SIGTERM) };
+            let _ = unsafe { libc::kill(p.pid.0 as libc::pid_t, libc::SIGTERM) };
             mgd_common::sync_print!(
                 "[auto-kill] {} (pid {}) idle {}s >= {}s threshold — SIGTERM",
                 p.name, p.pid, elapsed, idle_secs
             );
-            log.log(&LogEntry::new(
-                "KILL", p.pid, &p.name,
-                p.rss_kb as f64 / 1024.0,
-                "auto-kill-idle",
-            ));
+            log.log(LogAction::Kill, p.pid, &p.name, p.rss_kb.mib(), "auto-kill-idle");
             last_active.remove(&key);
         }
     }
@@ -284,23 +290,17 @@ fn check_proactive_reclaim(
     pressure: &monitor::psi::MemoryPressure,
     log: &Logger,
     skip_calm_gate: bool,
+    cfg: &crate::config::CompiledConfig,
 ) {
-    let (enabled, threshold_pct, cooldown_secs, min_used_mb, headroom_mult) = {
-        let cfg = crate::config::get();
-        if !cfg.proactive_swap_reclaim {
-            return;
-        }
-        (
-            cfg.proactive_swap_reclaim,
-            cfg.reclaim_threshold_pct,
-            cfg.reclaim_cooldown_secs,
-            cfg.reclaim_min_zram_used_mb,
-            cfg.reclaim_headroom_mult,
-        )
-    };
-    if !enabled || RECLAIM_DISABLED.load(Ordering::Relaxed) {
+    if !cfg.proactive_swap_reclaim || RECLAIM_DISABLED.load(Ordering::Relaxed) {
         return;
     }
+    let (threshold_pct, cooldown_secs, min_used_mb, headroom_mult) = (
+        cfg.reclaim_threshold_pct,
+        cfg.reclaim_cooldown_secs,
+        cfg.reclaim_min_zram_used_mb,
+        cfg.reclaim_headroom_mult,
+    );
 
     if !skip_calm_gate && pressure.some_avg60 >= 5.0 {
         return;
@@ -323,7 +323,7 @@ fn check_proactive_reclaim(
             "[reclaim] swap reclaim unavailable: mgd-zram-reclaim not found in \
              /usr/local/bin or /usr/bin — disabling for session. See docs/PRIVILEGE_DESIGN.md §2."
         );
-        log.log(&LogEntry::new("RECLAIM", 0, "zram", 0.0, "unavailable: helper absent"));
+        log.log_system(LogAction::Reclaim, "zram", 0.0, "unavailable: helper absent");
         return;
     };
 
@@ -332,14 +332,14 @@ fn check_proactive_reclaim(
         swap_used_pct: meminfo.swap_used_pct(),
         zram_used_mb: monitor::zram::zram_used_mb_total(),
         zram_orig_mb: monitor::zram::zram_orig_mb_total(),
-        mem_available_mb: meminfo.available_kb / 1024,
+        mem_available_mb: meminfo.available_kb.0 / 1024,
         threshold_pct,
         min_zram_used_mb: min_used_mb,
         headroom_mult,
     };
 
     if let Err(reason) = reclaim_gates_pass(&gates) {
-        log.log(&LogEntry::new("RECLAIM", 0, "zram", 0.0, &format!("skipped: {reason}")));
+        log.log_system(LogAction::Reclaim, "zram", 0.0, &format!("skipped: {reason}"));
         return;
     }
 
@@ -354,19 +354,15 @@ fn check_proactive_reclaim(
         Ok(()) => {
             LAST_RECLAIM.store(now, Ordering::Relaxed);
             let after = monitor::meminfo::read_meminfo();
-            log.log(&LogEntry::new(
-                "RECLAIM", 0, "zram", gates.zram_orig_mb as f64,
-                &format!(
-                    "reclaimed: swap {:.0}%→{:.0}%, avail {}MB→{}MB",
+            log.log_system(LogAction::Reclaim, "zram", gates.zram_orig_mb as f64,
+                &format!("reclaimed: swap {:.0}%→{:.0}%, avail {}MB→{}MB",
                     gates.swap_used_pct, after.swap_used_pct(),
-                    gates.mem_available_mb, after.available_kb / 1024
-                ),
-            ));
+                    gates.mem_available_mb, after.available_kb.0 / 1024));
         }
         Err((code, e)) => {
             // Don't arm the cooldown on failure.
             mgd_common::sync_print!("[reclaim] helper failed (exit {code:?}): {e}");
-            log.log(&LogEntry::new("RECLAIM", 0, "zram", 0.0, &format!("failed: {e}")));
+            log.log_system(LogAction::Reclaim, "zram", 0.0, &format!("failed: {e}"));
             // Exit 2 = uncapped binary (persistent); other codes are transient.
             if code == Some(2) {
                 RECLAIM_DISABLED.store(true, Ordering::Relaxed);

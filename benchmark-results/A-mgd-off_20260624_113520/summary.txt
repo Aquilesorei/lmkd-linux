@@ -1,0 +1,51 @@
+=== mgd benchmark ===
+Scenario : A-mgd-off
+Build dir: /home/aquiles/WebstormProjects/project-feedack-tool/honestly
+Command  : docker compose build app
+Date     : Wed Jun 24 11:35:20 AM GMT 2026
+
+--- mgd status ---
+(mgd not running)
+
+--- /proc/meminfo (pre) ---
+MemTotal:       16046868 kB
+MemAvailable:    7883824 kB
+SwapTotal:      12582908 kB
+SwapFree:        8343488 kB
+
+--- /proc/pressure/memory (pre) ---
+some avg10=0.00 avg60=0.00 avg300=0.00 total=28075976
+full avg10=0.00 avg60=0.00 avg300=0.00 total=26052758
+
+--- mgd daemon RSS ---
+(mgd not running)
+
+=== RESULTS ===
+Build exit code : 0
+Build time      : 74s
+
+--- Memory ---
+MemAvailable pre  : 7699 MB
+MemAvailable post : 7399 MB
+MemAvailable min  : 5144 MB
+Delta             : -300 MB
+
+--- PSI stall (accumulated during build) ---
+some_total delta : 551 ms
+full_total delta : 514 ms
+
+--- mgd actions ---
+Max frozen       : 0
+
+--- /proc/meminfo (post) ---
+MemTotal:       16046868 kB
+MemAvailable:    7576592 kB
+SwapTotal:      12582908 kB
+SwapFree:        8212024 kB
+
+--- /proc/pressure/memory (post) ---
+some avg10=0.43 avg60=0.51 avg300=0.14 total=28627151
+full avg10=0.40 avg60=0.49 avg300=0.14 total=26567635
+
+Full samples: /home/aquiles/RustroverProjects/lmkd-linux/benchmark-results/A-mgd-off_20260624_113520/samples.csv
+Build log   : /home/aquiles/RustroverProjects/lmkd-linux/benchmark-results/A-mgd-off_20260624_113520/build.log

@@ -6,6 +6,8 @@ use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use mgd_common::types::Pid;
+
 static HELPER_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
 static CHECKPOINT_DISABLED: AtomicBool = AtomicBool::new(false);
 static CHECKPOINT_FAILED_BINARIES: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
@@ -81,18 +83,18 @@ pub fn looks_like_privilege_error(stderr: &str) -> bool {
 #[derive(Debug)]
 #[allow(dead_code)]
 pub struct CheckpointResult {
-    pub pid: u32,
+    pub pid: Pid,
     pub success: bool,
     pub snapshot_dir: Option<PathBuf>,
     pub error: Option<String>,
 }
 
 impl CheckpointResult {
-    pub fn ok(pid: u32, snapshot_dir: PathBuf) -> Self {
+    pub fn ok(pid: Pid, snapshot_dir: PathBuf) -> Self {
         Self { pid, success: true, snapshot_dir: Some(snapshot_dir), error: None }
     }
 
-    pub fn err(pid: u32, error: impl Into<String>) -> Self {
+    pub fn err(pid: Pid, error: impl Into<String>) -> Self {
         Self { pid, success: false, snapshot_dir: None, error: Some(error.into()) }
     }
 }
@@ -119,7 +121,7 @@ impl RestoreResult {
 
 
 /// Checkpoint a process using the mgd-checkpoint helper wrapper, then SIGKILL on success.
-pub fn checkpoint(pid: u32, name: &str) -> CheckpointResult {
+pub fn checkpoint(pid: Pid, name: &str) -> CheckpointResult {
     // comm may contain '/' (prctl-set), which would escape the snapshot dir.
     let safe_name: String = name
         .chars()
@@ -159,7 +161,7 @@ pub fn checkpoint(pid: u32, name: &str) -> CheckpointResult {
     match output {
         Ok(out) if out.status.success() => {
             // State saved — kill the process.
-            let kill_ret = unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+            let kill_ret = unsafe { libc::kill(pid.0 as libc::pid_t, libc::SIGKILL) };
             if kill_ret != 0 {
                 let errno = io::Error::last_os_error().raw_os_error().unwrap_or(0);
                 if errno != libc::ESRCH { // ESRCH = already gone

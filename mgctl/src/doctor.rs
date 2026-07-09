@@ -157,23 +157,20 @@ fn get_version_from_proc(name: &str) -> Option<String> {
 
 // ── PSI availability ──────────────────────────────────────────────────────────
 
-use mgd_common::psi::{GLOBAL_PSI, resolve_pressure_source, trigger_armable};
+use mgd_common::psi::{GLOBAL_PSI, resolve_pressure_source, find_trigger_path};
 
-/// Parse "systemd 256 (...)" from `systemctl --version`. Relevant because
-/// systemd < 254 leaves the delegated cgroup's memory.pressure root-owned,
-/// so the daemon's kernel trigger falls back to the global file.
+/// Returns the running systemd version number, or `None` if it cannot be
+/// determined. Used to emit a diagnostic hint when PSI trigger arming fails —
+/// systemd < 254 leaves the delegated cgroup's `memory.pressure` root-owned.
 fn systemd_version() -> Option<u32> {
     let out = std::process::Command::new("systemctl")
         .arg("--version")
         .output()
         .ok()?;
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .next()?
-        .split_whitespace()
-        .nth(1)?
-        .parse()
-        .ok()
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // First line is "systemd NNN" or "systemd NNN (distro-tag)"
+    let first = stdout.lines().next()?;
+    first.split_whitespace().nth(1)?.parse().ok()
 }
 
 /// Report the PSI source exactly as the daemon resolves it, plus whether the
@@ -192,18 +189,19 @@ fn report_psi() {
         println!("  {}", ok(&format!("PSI monitoring ({source}, per-session cgroup)")));
     }
 
-    if trigger_armable(&source) {
-        println!("  {}", ok("PSI kernel trigger armable (zero-CPU idle)"));
-    } else if source != GLOBAL_PSI && trigger_armable(GLOBAL_PSI) {
-        let hint = match systemd_version() {
-            Some(v) if v < 254 => format!("systemd {v} < 254 leaves it root-owned"),
-            _ => "cgroup file not writable".to_string(),
-        };
-        println!("  {}", warn(&format!(
-            "cgroup PSI trigger not armable ({hint}) — daemon falls back to global trigger"
-        )));
-    } else {
-        println!("  {}", warn("PSI trigger not armable — daemon falls back to 5s polling"));
+    match find_trigger_path() {
+        Some(path) => println!("  {}", ok(&format!("PSI kernel trigger armable on {path} (zero-CPU idle)"))),
+        None => {
+            // Common cause: systemd < 254 leaves the delegated cgroup's
+            // memory.pressure root-owned, so the daemon cannot open it R/W.
+            // Upgrade systemd or run: sudo chown $USER
+            //   /sys/fs/cgroup/user.slice/user-$(id -u).slice/.../memory.pressure
+            let hint = systemd_version()
+                .filter(|&v| v < 254)
+                .map(|v| format!(" (systemd {v} < 254 — cgroup file is root-owned)"))
+                .unwrap_or_default();
+            println!("  {}", warn(&format!("PSI trigger not armable — daemon falls back to 5s polling{hint}")));
+        }
     }
 }
 
@@ -258,27 +256,25 @@ fn process_running(name: &str) -> bool {
 
 fn report_gpu_cache(daemon_running: bool, gpu_applicable: bool) {
     if !gpu_applicable || !daemon_running { return; }
-    match crate::query_socket("gpu-info", 3) {
-        Ok(resp) => {
-            // Parse "gpu_pids=<n> total_kb=<n> newest_obs=<s>"
-            let mut pids: Option<u64> = None;
-            let mut total_kb: Option<u64> = None;
-            let mut newest: Option<String> = None;
-            for part in resp.split_whitespace() {
-                if let Some(v) = part.strip_prefix("gpu_pids=")   { pids     = v.parse().ok(); }
-                if let Some(v) = part.strip_prefix("total_kb=")   { total_kb = v.parse().ok(); }
-                if let Some(v) = part.strip_prefix("newest_obs=") { newest   = Some(v.to_string()); }
-            }
-            let pids     = pids.unwrap_or(0);
-            let total_mb = total_kb.unwrap_or(0) / 1024;
-            let age      = newest.as_deref().unwrap_or("none");
-            if pids == 0 {
-                println!("  {}", warn("GPU cache empty — plugin connected but no observations yet"));
-            } else {
-                println!("  {}", ok(&format!("GPU cache: {pids} PID(s), {total_mb} MB resident, last obs {age}")));
-            }
+    // Err = daemon not reachable — already reported above.
+    if let Ok(resp) = crate::query_socket("gpu-info", 3) {
+        // Parse "gpu_pids=<n> total_kb=<n> newest_obs=<s>"
+        let mut pids: Option<u64> = None;
+        let mut total_kb: Option<u64> = None;
+        let mut newest: Option<String> = None;
+        for part in resp.split_whitespace() {
+            if let Some(v) = part.strip_prefix("gpu_pids=")   { pids     = v.parse().ok(); }
+            if let Some(v) = part.strip_prefix("total_kb=")   { total_kb = v.parse().ok(); }
+            if let Some(v) = part.strip_prefix("newest_obs=") { newest   = Some(v.to_string()); }
         }
-        Err(_) => {} // daemon not reachable — already reported above
+        let pids     = pids.unwrap_or(0);
+        let total_mb = total_kb.unwrap_or(0) / 1024;
+        let age      = newest.as_deref().unwrap_or("none");
+        if pids == 0 {
+            println!("  {}", warn("GPU cache empty — plugin connected but no observations yet"));
+        } else {
+            println!("  {}", ok(&format!("GPU cache: {pids} PID(s), {total_mb} MB resident, last obs {age}")));
+        }
     }
 }
 
@@ -305,25 +301,23 @@ fn read_calibration() -> CalibrationInfo {
     };
 
     // Read machine data from JSON
-    if let Ok(data) = fs::read_to_string(&json_path) {
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) {
+    if let Ok(data) = fs::read_to_string(&json_path)
+        && let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) {
             info.calibrated_at    = v["calibrated_at"].as_str().map(|s| s.to_string());
             info.swap_onset_mb    = v["swap_onset_mb"].as_u64();
             info.psi_recovery_secs= v["psi_recovery_secs"].as_u64();
         }
-    }
 
     // Read derived threshold from TOML suggestion
     if let Ok(data) = fs::read_to_string(&toml_path) {
         for line in data.lines() {
-            if let Some(rest) = line.trim().strip_prefix("target_available_pct") {
-                if let Some(val) = rest.split('=').nth(1) {
+            if let Some(rest) = line.trim().strip_prefix("target_available_pct")
+                && let Some(val) = rest.split('=').nth(1) {
                     let num: String = val.chars()
                         .take_while(|c| c.is_ascii_digit() || *c == ' ')
                         .collect();
                     info.target_available_pct = num.trim().parse().ok();
                 }
-            }
         }
     }
 

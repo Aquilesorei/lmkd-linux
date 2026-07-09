@@ -7,6 +7,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use mgd_common::protocol::{CoreMessage, PluginMessage, PluginAction};
+use mgd_common::types::{Kb, Pid};
 
 use crate::executor::registry::{FrozenRegistry, CheckpointRegistry};
 
@@ -17,25 +18,25 @@ const GPU_CACHE_TTL: Duration = Duration::from_secs(30);
 
 /// Cached GPU observations from plugins. Keyed by pid; entries expire after
 /// GPU_CACHE_TTL so dead processes don't accumulate stale data.
-static GPU_CACHE: LazyLock<Mutex<HashMap<u32, (mgd_common::gpu::SingleProcessGpuMemory, Instant)>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+static GPU_CACHE: LazyLock<Mutex<HashMap<Pid, (mgd_common::gpu::SingleProcessGpuMemory, Instant)>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Active foreground process PID reported by DE plugins
-static ACTIVE_FOREGROUND_PID: LazyLock<Mutex<Option<u32>>> = LazyLock::new(|| Mutex::new(None));
+static ACTIVE_FOREGROUND_PID: LazyLock<Mutex<Option<Pid>>> = LazyLock::new(|| Mutex::new(None));
 
 /// Tracked child processes for crash-restart watchdog. Keyed by plugin name.
 static PLUGIN_CHILDREN: LazyLock<Mutex<HashMap<String, (std::process::Child, Instant)>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-pub fn get_gpu_kb(pid: u32) -> u64 {
+pub fn get_gpu_kb(pid: Pid) -> Kb {
     let now = Instant::now();
     GPU_CACHE.lock().unwrap()
         .get(&pid)
         .filter(|(_, at)| now.duration_since(*at) < GPU_CACHE_TTL)
-        .map(|(s, _)| s.resident_kb)
-        .unwrap_or(0)
+        .map(|(s, _)| Kb(s.resident_kb))
+        .unwrap_or(Kb(0))
 }
 
-pub fn get_gpu_stats(pid: u32) -> mgd_common::gpu::SingleProcessGpuMemory {
+pub fn get_gpu_stats(pid: Pid) -> mgd_common::gpu::SingleProcessGpuMemory {
     let now = Instant::now();
     GPU_CACHE.lock().unwrap()
         .get(&pid)
@@ -45,7 +46,7 @@ pub fn get_gpu_stats(pid: u32) -> mgd_common::gpu::SingleProcessGpuMemory {
 }
 
 /// Upsert a single GPU metric field for `pid`. Refreshes TTL; prunes stale entries.
-pub fn set_gpu_observation(pid: u32, metric: &mgd_common::protocol::Metric, kb: u64) {
+pub fn set_gpu_observation(pid: Pid, metric: &mgd_common::protocol::Metric, kb: u64) {
     use mgd_common::protocol::Metric;
     let now = Instant::now();
     let mut cache = GPU_CACHE.lock().unwrap();
@@ -62,37 +63,37 @@ pub fn set_gpu_observation(pid: u32, metric: &mgd_common::protocol::Metric, kb: 
 }
 
 /// True GPU pressure KB: resident minus shared (deduplicates compositor dma-buf).
-pub fn get_total_gpu_kb() -> u64 {
+pub fn get_total_gpu_kb() -> Kb {
     let now = Instant::now();
     GPU_CACHE.lock().unwrap()
         .values()
         .filter(|(_, at)| now.duration_since(*at) < GPU_CACHE_TTL)
-        .map(|(s, _)| s.resident_kb.saturating_sub(s.shared_kb))
+        .map(|(s, _)| Kb(s.resident_kb.saturating_sub(s.shared_kb)))
         .sum()
 }
 
 /// Returns (pid_count, pressure_kb, newest_obs_age_secs) from the live GPU cache.
-pub fn gpu_cache_snapshot() -> (usize, u64, Option<u64>) {
+pub fn gpu_cache_snapshot() -> (usize, Kb, Option<u64>) {
     let now = Instant::now();
     let cache = GPU_CACHE.lock().unwrap();
     let live: Vec<_> = cache.values()
         .filter(|(_, at)| now.duration_since(*at) < GPU_CACHE_TTL)
         .collect();
     if live.is_empty() {
-        return (0, 0, None);
+        return (0, Kb(0), None);
     }
-    let pressure_kb: u64 = live.iter().map(|(s, _)| s.resident_kb.saturating_sub(s.shared_kb)).sum();
+    let pressure_kb: Kb = live.iter().map(|(s, _)| Kb(s.resident_kb.saturating_sub(s.shared_kb))).sum();
     let newest_age = live.iter()
         .map(|(_, at)| now.duration_since(*at).as_secs())
         .min();
     (live.len(), pressure_kb, newest_age)
 }
 
-pub fn get_active_foreground_pid() -> Option<u32> {
+pub fn get_active_foreground_pid() -> Option<Pid> {
     *ACTIVE_FOREGROUND_PID.lock().unwrap()
 }
 
-pub fn set_active_foreground_pid(pid: Option<u32>) {
+pub fn set_active_foreground_pid(pid: Option<Pid>) {
     *ACTIVE_FOREGROUND_PID.lock().unwrap() = pid;
 }
 
@@ -110,10 +111,11 @@ fn init_de_environment(){
     let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default().to_lowercase();
     if desktop.contains("kde") {
         spawn_plugin_binary("mgd-kde");
-    } else if desktop.contains("gnome") {
-        spawn_plugin_binary("mgd-gnome");
-    } else if desktop.contains("cosmic") {
-        spawn_plugin_binary("mgd-cosmic");
+    } else if desktop.contains("gnome") || desktop.contains("cosmic") {
+        // mgd-gnome / mgd-cosmic are todo!() scaffolds: they panic on startup and
+        // the watchdog would respawn them every 60s forever. Don't spawn until
+        // they're implemented.
+        mgd_common::sync_print!("[core] No working plugin for desktop '{}' yet — skipping", desktop);
     }
 }
 
@@ -213,6 +215,12 @@ pub fn broadcast_pressure(level: &str) {
     clients.retain(|tx| tx.send(msg.clone()).is_ok());
 }
 
+pub fn broadcast_config_reload() {
+    let msg = CoreMessage::ConfigReload;
+    let mut clients = PLUGIN_CLIENTS.lock().unwrap();
+    clients.retain(|tx| tx.send(msg.clone()).is_ok());
+}
+
 
 
 
@@ -237,11 +245,10 @@ pub fn serve_plugin_connection(
     // Spawn a writer thread to push CoreMessages to the socket
     thread::spawn(move || {
         while let Ok(msg) = rx.recv() {
-            if let Ok(json) = serde_json::to_string(&msg) {
-                if writeln!(writer, "{}", json).is_err() {
+            if let Ok(json) = serde_json::to_string(&msg)
+                && writeln!(writer, "{}", json).is_err() {
                     break;
                 }
-            }
         }
     });
 
@@ -262,11 +269,10 @@ fn process_plugin_line(line: &str, frozen: &Arc<Mutex<FrozenRegistry>>) {
         }
         PluginMessage::Observation { plugin: _, metric, pid, value } => {
             use mgd_common::protocol::Metric;
-            if let Some(p) = pid {
-                if matches!(metric, Metric::GpuResidentKb | Metric::GpuSharedKb | Metric::GpuTotalKb | Metric::GpuPurgeableKb) {
+            if let Some(p) = pid
+                && matches!(metric, Metric::GpuResidentKb | Metric::GpuSharedKb | Metric::GpuTotalKb | Metric::GpuPurgeableKb) {
                     set_gpu_observation(p, &metric, value as u64);
                 }
-            }
         }
         PluginMessage::ActionRequest { plugin, action, reason } => {
             mgd_common::sync_print!("[plugin] {} requested action {:?}: {}", plugin, action, reason);
@@ -276,14 +282,12 @@ fn process_plugin_line(line: &str, frozen: &Arc<Mutex<FrozenRegistry>>) {
 
             // Core could implement rate-limiting or policy checks here.
             // For now, we approve RestartProcess and KillPid natively.
-            match &action {
-                PluginAction::KillPid { pid } => {
-                    let pid = *pid;
-                    std::thread::spawn(move || {
-                        let _ = crate::executor::killer::sigterm(pid);
-                    });
-                }
-                _ => {} // Other actions (like RestartProcess) are delegated back to the plugin to execute
+            // Other actions (like RestartProcess) are delegated back to the plugin to execute.
+            if let PluginAction::KillPid { pid } = &action {
+                let pid = *pid;
+                std::thread::spawn(move || {
+                    let _ = crate::executor::killer::sigterm(pid);
+                });
             }
 
             // Send approval back so the plugin can execute its own specific logic (e.g. restarting a DE service)
@@ -300,10 +304,10 @@ fn process_plugin_line(line: &str, frozen: &Arc<Mutex<FrozenRegistry>>) {
             let stats = get_gpu_stats(pid);
             let response = CoreMessage::GpuObservation {
                 pid,
-                kb: stats.resident_kb,
-                shared_kb: stats.shared_kb,
-                total_kb: stats.total_kb,
-                purgeable_kb: stats.purgeable_kb,
+                kb: Kb(stats.resident_kb),
+                shared_kb: Kb(stats.shared_kb),
+                total_kb: Kb(stats.total_kb),
+                purgeable_kb: Kb(stats.purgeable_kb),
             };
             let mut clients = PLUGIN_CLIENTS.lock().unwrap();
             clients.retain(|tx| tx.send(response.clone()).is_ok());

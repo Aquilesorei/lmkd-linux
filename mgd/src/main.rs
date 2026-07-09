@@ -17,6 +17,7 @@ use std::thread;
 use executor::registry::{FrozenRegistry, CheckpointRegistry};
 use mgd_common::logger::Logger;
 use mgd_common::output::locked_print;
+use mgd_common::types::Pid;
 
 static SHUTDOWN:      AtomicBool = AtomicBool::new(false);
 static RELOAD_CONFIG: AtomicBool = AtomicBool::new(false);
@@ -36,7 +37,10 @@ fn main() {
         return;
     }
 
-    try_elevate_scheduler_priority();
+    // Scheduler elevation happens inside the evictor thread (evictor::run) so
+    // only the eviction hot path runs SCHED_RR; the IPC/recovery/maintenance
+    // threads stay at normal priority. mlockall is process-wide, so it runs here.
+    try_lock_memory();
 
     let frozen = Arc::new(Mutex::new(FrozenRegistry::load()));
     let checkpointed = Arc::new(Mutex::new(CheckpointRegistry::load()));
@@ -126,7 +130,7 @@ fn main() {
     shutdown_unfreeze(&frozen);
 
     // Persist calibration aggregates gathered since the last periodic flush.
-    maintenance::flush_calibration(&calibrator, &logger);
+    maintenance::flush_calibration(&calibrator, &logger, &config::get().psi);
 }
 
 /// Handle `mgd freeze <pid>` and `mgd unfreeze <pid>`.
@@ -137,8 +141,8 @@ fn handle_legacy_cli(args: &[String]) -> bool {
     }
     match args[1].as_str() {
         "freeze" if args.len() == 3 => {
-            let pid: u32 = match args[2].parse() {
-                Ok(p) => p,
+            let pid: Pid = match args[2].parse() {
+                Ok(p) => Pid(p),
                 Err(_) => { eprintln!("Error: PID must be a number"); return true; }
             };
             let r = executor::freezer::freeze(pid);
@@ -147,8 +151,8 @@ fn handle_legacy_cli(args: &[String]) -> bool {
             true
         }
         "unfreeze" if args.len() == 3 => {
-            let pid: u32 = match args[2].parse() {
-                Ok(p) => p,
+            let pid: Pid = match args[2].parse() {
+                Ok(p) => Pid(p),
                 Err(_) => { eprintln!("Error: PID must be a number"); return true; }
             };
             let r = executor::freezer::unfreeze(pid);
@@ -200,11 +204,10 @@ fn cleanup_orphaned_snapshots(checkpointed: &Arc<Mutex<CheckpointRegistry>>) {
     for entry in entries.flatten() {
         if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
             let path = entry.path();
-            if !active_dirs.contains(&path) {
-                if std::fs::remove_dir_all(&path).is_ok() {
+            if !active_dirs.contains(&path)
+                && std::fs::remove_dir_all(&path).is_ok() {
                     mgd_common::sync_print!("[startup] Removed orphaned snapshot: {:?}", path);
                 }
-            }
         }
     }
 }
@@ -212,7 +215,7 @@ fn cleanup_orphaned_snapshots(checkpointed: &Arc<Mutex<CheckpointRegistry>>) {
 /// Unfreeze all processes still in the registry after both actors have stopped.
 fn shutdown_unfreeze(frozen: &Arc<Mutex<FrozenRegistry>>) {
     let reg = frozen.lock().unwrap();
-    let entries: Vec<(u32, u64)> = reg.frozen_pids().into_iter()
+    let entries: Vec<(Pid, u64)> = reg.frozen_pids().into_iter()
         .map(|pid| (pid, reg.start_time(pid)))
         .collect();
     drop(reg); // release lock before I/O
@@ -241,24 +244,54 @@ extern "C" fn handle_sighup(_: libc::c_int) {
     RELOAD_CONFIG.store(true, Ordering::Relaxed);
 }
 
-fn try_elevate_scheduler_priority() {
+/// Check `CapEff` in /proc/self/status for CAP_IPC_LOCK (bit 14).
+fn has_cap_ipc_lock() -> bool {
+    let Ok(status) = std::fs::read_to_string("/proc/self/status") else { return false };
+    status.lines()
+        .find_map(|l| l.strip_prefix("CapEff:"))
+        .and_then(|hex| u64::from_str_radix(hex.trim(), 16).ok())
+        .map(|caps| caps & (1 << 14) != 0) // CAP_IPC_LOCK = 14
+        .unwrap_or(false)
+}
+
+/// Lock mgd's pages into RAM so the eviction hot path never takes a page fault
+/// while the system is already thrashing (a fault at that moment is unbounded
+/// latency). Process-wide — covers all threads.
+///
+/// MCL_FUTURE is only safe when the memlock budget is unbounded (CAP_IPC_LOCK
+/// or RLIMIT_MEMLOCK=infinity): under a finite rlimit, MCL_FUTURE makes later
+/// mmap/heap growth *fail* once the limit is hit, which would crash the daemon.
+/// So under a finite rlimit we lock current pages only. Degrades gracefully —
+/// a failure is logged and the daemon runs unlocked, per the privilege split.
+fn try_lock_memory() {
+    let unlimited = has_cap_ipc_lock() || unsafe {
+        let mut rl = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut rl) == 0
+            && rl.rlim_cur == libc::RLIM_INFINITY
+    };
+
     unsafe {
-        let mut param = libc::sched_param { sched_priority: 20 };
-        // Set policy to SCHED_RR (Real-Time Round Robin) with priority 20
-        if libc::sched_setscheduler(0, libc::SCHED_RR, &mut param) == 0 {
-            locked_print("[core] Successfully set scheduler policy to SCHED_RR (priority 20)");
-        } else {
-            let err = std::io::Error::last_os_error();
-            if err.raw_os_error() == Some(libc::EPERM) {
-                // If unprivileged and CAP_SYS_NICE is missing, fall back to setting highest normal priority (nice -20)
-                if libc::setpriority(libc::PRIO_PROCESS, 0, -20) == 0 {
-                    locked_print("[core] Set scheduler priority to nice -20 (highest normal priority)");
-                } else {
-                    locked_print("[core] Running with standard priority (CAP_SYS_NICE missing for RT/Nice elevation)");
-                }
-            } else {
-                mgd_common::sync_print!("[core] Warning: failed to set scheduler policy: {}", err);
+        if unlimited {
+            if libc::mlockall(libc::MCL_CURRENT | libc::MCL_FUTURE) == 0 {
+                locked_print("[core] mlockall(MCL_CURRENT|MCL_FUTURE): all pages locked in RAM");
+                return;
             }
+            mgd_common::sync_print!(
+                "[core] Warning: mlockall failed despite unlimited memlock: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        // Finite RLIMIT_MEMLOCK (no CAP_IPC_LOCK): lock current pages only.
+        if libc::mlockall(libc::MCL_CURRENT) == 0 {
+            locked_print(
+                "[core] mlockall(MCL_CURRENT): current pages locked; future allocations \
+                 unlocked (grant cap_ipc_lock on mgd for full locking — see install.sh)"
+            );
+        } else {
+            mgd_common::sync_print!(
+                "[core] Running without mlockall (RLIMIT_MEMLOCK too small, no CAP_IPC_LOCK): {}",
+                std::io::Error::last_os_error()
+            );
         }
     }
 }

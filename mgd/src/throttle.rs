@@ -1,4 +1,6 @@
 use std::collections::{HashMap, HashSet};
+use mgd_common::types::{Kb, Pid};
+use crate::config::CompiledConfig;
 use crate::monitor::process::Process;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -21,7 +23,8 @@ impl ThrottleManager {
         }
     }
 
-    pub(crate) fn update(&mut self, plan_procs: &[&Process], active_pid: Option<u32>, active: bool, exclude: &[regex::Regex]) {
+    pub(crate) fn update(&mut self, plan_procs: &[&Process], active_pid: Option<Pid>, active: bool, cfg: &CompiledConfig) {
+        let exclude = &cfg.throttle_exclude;
         if !active {
             for path in self.states.keys() {
                 restore_cgroup_cpu(path);
@@ -62,7 +65,7 @@ impl ThrottleManager {
             let mut min_priority = 100u8;
             let mut debug_name = String::new();
             for p in processes {
-                let prio = crate::engine::decision::get_priority(&p.name, p.exe_basename.as_deref());
+                let prio = crate::engine::decision::get_priority(&p.name, p.exe_basename.as_deref(), cfg);
                 if prio < min_priority {
                     min_priority = prio;
                     debug_name = p.name.clone();
@@ -197,13 +200,19 @@ impl MemCapManager {
         Self { capped: HashMap::new(), tracker: HashMap::new() }
     }
 
+    /// Number of cgroups currently holding a memory.max cap (for cycle attribution).
+    pub(crate) fn capped_count(&self) -> usize {
+        self.capped.len()
+    }
+
     /// Apply `memory.max` caps to eligible background cgroups at High+ pressure.
     /// No-op below High (caller is responsible for calling `restore_all` then).
     pub(crate) fn update(
         &mut self,
         plan_procs: &[&Process],
-        active_pid: Option<u32>,
+        active_pid: Option<Pid>,
         level: &crate::monitor::psi::PressureLevel,
+        cfg: &CompiledConfig,
     ) {
         use crate::monitor::psi::PressureLevel;
         if *level < PressureLevel::High {
@@ -212,11 +221,11 @@ impl MemCapManager {
 
         let foreground_cgroup = find_foreground_cgroup(plan_procs, active_pid);
 
-        let mut cgroup_groups: HashMap<String, (u8, u64)> = HashMap::new();
+        let mut cgroup_groups: HashMap<String, (u8, Kb)> = HashMap::new();
         for p in plan_procs {
             if let Some(path) = p.cgroup_path.as_ref() {
-                let prio = crate::engine::decision::get_priority(&p.name, p.exe_basename.as_deref());
-                let entry = cgroup_groups.entry(path.clone()).or_insert((100u8, 0u64));
+                let prio = crate::engine::decision::get_priority(&p.name, p.exe_basename.as_deref(), cfg);
+                let entry = cgroup_groups.entry(path.clone()).or_insert((100u8, Kb(0)));
                 entry.0 = entry.0.min(prio);
                 entry.1 = entry.1.saturating_add(p.rss_kb);
             }
@@ -226,7 +235,7 @@ impl MemCapManager {
         self.tracker.retain(|p, _| active_paths.contains(p));
         // Don't evict capped entries for dead paths — restore handles cleanup.
 
-        for (cgroup_path, (min_priority, total_rss_kb)) in &cgroup_groups {
+        for (cgroup_path, (min_priority, total_rss)) in &cgroup_groups {
             // Never cap foreground or system/critical tier
             if Some(cgroup_path) == foreground_cgroup.as_ref() || *min_priority < 60 {
                 if self.capped.remove(cgroup_path).is_some() {
@@ -252,7 +261,7 @@ impl MemCapManager {
             }
 
             // Cap = current RSS + 512 MB headroom (bytes)
-            let cap_bytes = (*total_rss_kb + 512 * 1024) * 1024;
+            let cap_bytes = (*total_rss + Kb(512 * 1024)).bytes();
             if write_memory_max(cgroup_path, cap_bytes).is_ok() {
                 self.capped.insert(cgroup_path.clone(), cap_bytes);
                 mgd_common::sync_print!(
@@ -275,11 +284,10 @@ impl MemCapManager {
 
 fn restore_cgroup_memory(path: &str) {
     let p = cgroup_sysfs_path(path, "memory.max");
-    if p.exists() {
-        if std::fs::write(&p, "max\n").is_ok() {
+    if p.exists()
+        && std::fs::write(&p, "max\n").is_ok() {
             mgd_common::sync_print!("[memcap] Restored memory.max for cgroup {}", path);
         }
-    }
 }
 
 fn write_memory_max(cgroup_path: &str, bytes: u64) -> Result<(), std::io::Error> {
@@ -291,7 +299,7 @@ fn write_memory_max(cgroup_path: &str, bytes: u64) -> Result<(), std::io::Error>
     Err(std::io::Error::new(std::io::ErrorKind::NotFound, "memory.max not found"))
 }
 
-fn find_foreground_cgroup(plan_procs: &[&Process], active_pid: Option<u32>) -> Option<String> {
+fn find_foreground_cgroup(plan_procs: &[&Process], active_pid: Option<Pid>) -> Option<String> {
     active_pid.and_then(|apid| {
         plan_procs.iter()
             .find(|p| p.pid == apid)
@@ -305,11 +313,11 @@ mod tests {
 
     fn make_proc(pid: u32, cgroup: Option<&str>) -> Process {
         Process {
-            pid,
+            pid: Pid(pid),
             name: format!("proc{pid}"),
             exe_basename: None,
-            rss_kb: 100_000,
-            swap_kb: 0,
+            rss_kb: Kb(100_000),
+            swap_kb: Kb(0),
             oom_score: 200,
             cgroup_path: cgroup.map(|s| s.to_string()),
             cpu_pct: 0.0,
@@ -335,7 +343,7 @@ mod tests {
         let b = make_proc(200, Some("user.slice/app-B.slice"));
         let procs = [&a, &b];
         assert_eq!(
-            find_foreground_cgroup(&procs, Some(100)).as_deref(),
+            find_foreground_cgroup(&procs, Some(Pid(100))).as_deref(),
             Some("user.slice/app-A.slice")
         );
     }
@@ -349,19 +357,19 @@ mod tests {
     #[test]
     fn find_foreground_cgroup_none_when_pid_not_in_list() {
         let a = make_proc(100, Some("user.slice/app-A.slice"));
-        assert!(find_foreground_cgroup(&[&a], Some(999)).is_none());
+        assert!(find_foreground_cgroup(&[&a], Some(Pid(999))).is_none());
     }
 
     #[test]
     fn find_foreground_cgroup_none_when_pid_has_no_cgroup() {
         let a = make_proc(100, None);
-        assert!(find_foreground_cgroup(&[&a], Some(100)).is_none());
+        assert!(find_foreground_cgroup(&[&a], Some(Pid(100))).is_none());
     }
 
     #[test]
     fn memcap_formula_adds_512mb_headroom() {
-        let rss_kb: u64 = 1_024 * 1_024; // 1 GB in KB
-        let cap_bytes = (rss_kb + 512 * 1024) * 1024;
+        let rss = Kb(1_024 * 1_024); // 1 GB in KB
+        let cap_bytes = (rss + Kb(512 * 1024)).bytes();
         // Should be 1.5 GB in bytes
         assert_eq!(cap_bytes, 1_610_612_736);
         assert_eq!(cap_bytes / 1024 / 1024, 1536); // 1536 MB

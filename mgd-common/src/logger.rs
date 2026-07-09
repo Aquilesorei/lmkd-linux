@@ -3,18 +3,56 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Structured log entry for a daemon action.
-pub struct LogEntry<'a> {
-    pub action: &'a str,
-    pub pid:    u32,
-    pub name:   &'a str,
-    pub rss_mb: f64,
-    pub result: &'a str,
+#[derive(Copy, Clone)]
+pub enum LogAction {
+    Freeze,
+    FreezeReclaim,
+    IdleFreeze,
+    Terminate,
+    Kill,
+    KillManual,
+    Checkpoint,
+    Unfreeze,
+    Restore,
+    RestoreAbandon,
+    RestoreFail,
+    Reclaim,
+    EarlyReclaim,
+    Zram,
+    Cache,
+    Calibrate,
+    SpikeFreeze,
+    SpikeUnfreeze,
+    SpikeUnfreezeTimeout,
+    SpikeUnfreezeOrphan,
+    Cycle,
 }
 
-impl<'a> LogEntry<'a> {
-    pub fn new(action: &'a str, pid: u32, name: &'a str, rss_mb: f64, result: &'a str) -> Self {
-        LogEntry { action, pid, name, rss_mb, result }
+impl LogAction {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Freeze               => "FREEZE",
+            Self::FreezeReclaim        => "FREEZE_RECLAIM",
+            Self::IdleFreeze           => "IDLE_FREEZE",
+            Self::Terminate            => "TERMINATE",
+            Self::Kill                 => "KILL",
+            Self::KillManual           => "KILL_MANUAL",
+            Self::Checkpoint           => "CHECKPOINT",
+            Self::Unfreeze             => "UNFREEZE",
+            Self::Restore              => "RESTORE",
+            Self::RestoreAbandon       => "RESTORE_ABANDON",
+            Self::RestoreFail          => "RESTORE_FAIL",
+            Self::Reclaim              => "RECLAIM",
+            Self::EarlyReclaim         => "EARLY_RECLAIM",
+            Self::Zram                 => "ZRAM",
+            Self::Cache                => "CACHE",
+            Self::Calibrate            => "CALIBRATE",
+            Self::SpikeFreeze          => "SPIKE_FREEZE",
+            Self::SpikeUnfreeze        => "SPIKE_UNFREEZE",
+            Self::SpikeUnfreezeTimeout => "SPIKE_UNFREEZE_TIMEOUT",
+            Self::SpikeUnfreezeOrphan  => "SPIKE_UNFREEZE_ORPHAN",
+            Self::Cycle                => "CYCLE",
+        }
     }
 }
 
@@ -40,21 +78,24 @@ impl Logger {
         Logger { log_path }
     }
 
+    /// Logger that discards everything — for unit tests exercising code paths
+    /// that take a `&Logger` without touching `~/memlogs`.
+    pub fn null() -> Self {
+        Logger { log_path: PathBuf::from("/dev/null") }
+    }
+
     /// Append a structured action entry to the session log.
-    pub fn log(&self, entry: &LogEntry) {
+    pub fn log(&self, action: LogAction, pid: crate::types::Pid, name: &str, rss_mb: f64, result: &str) {
         self.write_line(&format!(
             "[{}] {} pid={} name={} rss={:.0}MB result={}",
-            timestamp_now(), entry.action, entry.pid, entry.name, entry.rss_mb, entry.result,
+            timestamp_now(), action.as_str(), pid, name, rss_mb, result,
         ));
     }
 
-    /// Append a pressure snapshot entry to the session log.
-    #[allow(dead_code)]
-    pub fn log_pressure(&self, level: &str, avg10: f64, available_mb: f64) {
-        self.write_line(&format!(
-            "[{}] PRESSURE level={} avg10={:.2}% available={:.0}MB",
-            timestamp_now(), level, avg10, available_mb,
-        ));
+    /// Like `log()`, for entries with no associated process (zram, cache,
+    /// calibration, per-cycle summaries). Uses `Pid::NONE` as the pid sentinel.
+    pub fn log_system(&self, action: LogAction, name: &str, rss_mb: f64, result: &str) {
+        self.log(action, crate::types::Pid::NONE, name, rss_mb, result);
     }
 
     fn write_line(&self, line: &str) {

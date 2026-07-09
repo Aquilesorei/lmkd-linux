@@ -52,11 +52,10 @@ fn thermal_throttling() -> bool {
     let Ok(entries) = fs::read_dir("/sys/class/thermal") else { return false };
     for entry in entries.filter_map(|e| e.ok()) {
         let path = entry.path().join("throttle_count");
-        if let Ok(val) = fs::read_to_string(&path) {
-            if val.trim().parse::<u64>().unwrap_or(0) > 0 {
+        if let Ok(val) = fs::read_to_string(&path)
+            && val.trim().parse::<u64>().unwrap_or(0) > 0 {
                 return true;
             }
-        }
     }
     false
 }
@@ -81,7 +80,7 @@ fn read_psi() -> Option<PsiSnapshot> {
                 .and_then(|p| mgd_common::psi::parse_kv(p, prefix).ok())
                 .unwrap_or(0.0)
         };
-        match parts.get(0).copied() {
+        match parts.first().copied() {
             Some("some") => snap.some_avg10 = get("avg10="),
             Some("full") => snap.full_avg10 = get("avg10="),
             _ => {}
