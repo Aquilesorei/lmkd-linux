@@ -40,8 +40,6 @@ pub struct Decision {
     pub name: String,
     pub action: Action,
     pub rss: Kb,
-    #[allow(dead_code)]
-    pub swap: Kb,
     pub reason: String,
     pub prio: u8,
 }
@@ -53,7 +51,6 @@ impl Decision {
         name: impl Into<String>,
         action: Action,
         rss: Kb,
-        swap: Kb,
         reason: impl Into<String>,
         prio: u8,
     ) -> Self {
@@ -62,7 +59,6 @@ impl Decision {
             name: name.into(),
             action,
             rss,
-            swap,
             reason: reason.into(),
             prio,
         }
@@ -182,7 +178,6 @@ pub fn plan(
             &proc.name,
             action,
             proc.rss_kb,
-            proc.swap_kb,
             reason,
             prio,
         ));

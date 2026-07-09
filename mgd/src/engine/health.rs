@@ -1,5 +1,8 @@
 use mgd_common::types::Kb;
 
+/// Tracks an exponential moving average of available RAM during Normal pressure.
+/// Used by `RecoveryManager` to gate CRIU restores: restoring a large process
+/// when RAM is already borderline would immediately re-trigger eviction.
 pub struct HealthBaseline {
     avg_available_kb: f64,
     samples: u32,
@@ -10,6 +13,8 @@ impl HealthBaseline {
         HealthBaseline { avg_available_kb: 0.0, samples: 0 }
     }
 
+    /// Feed a calm-pressure sample into the EMA. Only called from
+    /// `RecoveryManager` while the system is at Normal pressure.
     pub fn observe(&mut self, available: Kb) {
         const ALPHA: f64 = 0.05; // converges over ~60 samples (~3 min at 3s tick)
         if self.samples == 0 {
@@ -22,6 +27,12 @@ impl HealthBaseline {
     }
 
 
+    /// Returns `true` when it is safe to restore `process_rss` worth of RAM
+    /// without immediately falling back into pressure. Cold baseline (< 10
+    /// samples) uses a conservative 10% of total RAM; warm baseline uses 85% of
+    /// the EMA to allow normal fluctuation without blocking all restores.
+    /// Intervention-tainted samples (evictor active) are excluded by the caller
+    /// so calibration never builds on pressure it is treating.
     pub fn safe_to_restore(&self, available: Kb, total: Kb, process_rss: Kb) -> bool {
         let after = available.saturating_sub(process_rss);
         if self.samples < 10 {

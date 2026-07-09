@@ -1,6 +1,12 @@
 use std::fs;
 
+/// The global kernel PSI memory pressure file. Always present when
+/// `CONFIG_PSI=y`; readable and writable without elevated privileges.
 pub const GLOBAL_PSI: &str = "/proc/pressure/memory";
+
+/// Per-session cgroup `memory.pressure` path for the current user. Preferred
+/// over the global file because it only reflects processes in this user session,
+/// avoiding noise from other users or system services.
 pub fn cgroup_psi_path() -> String {
     let uid = unsafe { libc::getuid() };
     format!("/sys/fs/cgroup/user.slice/user-{uid}.slice/user@{uid}.service/memory.pressure")
@@ -13,6 +19,9 @@ fn is_usable_psi_file(path: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Returns the best available PSI source: the per-session cgroup file when
+/// readable, falling back to the global `/proc/pressure/memory`. This is
+/// resolved once at daemon startup and reused across cycles.
 pub fn resolve_pressure_source() -> String {
     let cgroup = cgroup_psi_path();
     if is_usable_psi_file(&cgroup) {
@@ -22,6 +31,10 @@ pub fn resolve_pressure_source() -> String {
     }
 }
 
+/// Returns `true` if `path` can be opened read-write, which is the
+/// precondition for arming a kernel PSI trigger on it. The cgroup file is
+/// root-owned on systemd < 254; if this returns `false`, the daemon falls
+/// back to the epoll trigger or 5 s polling.
 pub fn trigger_armable(path: &str) -> bool {
     fs::OpenOptions::new()
         .read(true)
@@ -30,7 +43,12 @@ pub fn trigger_armable(path: &str) -> bool {
         .is_ok()
 }
 
-
+/// Walks the cgroup hierarchy upward from `/proc/self/cgroup` and returns the
+/// highest-level `memory.pressure` file that is trigger-armable (read-write).
+/// On kernel 7.x, `/proc/pressure/memory` trigger writes return EINVAL
+/// unconditionally, so cgroup-level arming is the only working path.
+/// Returns `None` when no writable pressure file is found (daemon falls back
+/// to 5 s polling).
 pub fn find_trigger_path() -> Option<String> {
     let cgroup_content = fs::read_to_string("/proc/self/cgroup").ok()?;
     let rel = cgroup_content

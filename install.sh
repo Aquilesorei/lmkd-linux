@@ -65,10 +65,14 @@ mkdir -p "$BIN_DIR"
 if [[ "$WITH_PRIVILEGED" == 1 ]]; then
     DAEMON_DEST="/usr/local/bin/mgd"
     sudo install -m 0755 target/release/mgd "$DAEMON_DEST"
-    if sudo setcap cap_sys_nice+ep "$DAEMON_DEST"; then
-        ok "Daemon binary installed + capped with CAP_SYS_NICE at $DAEMON_DEST"
+    # CAP_SYS_NICE: SCHED_RR for the evictor thread.
+    # CAP_IPC_LOCK: mlockall(MCL_CURRENT|MCL_FUTURE) — lock all daemon pages in
+    # RAM so the eviction hot path never page-faults under memory pressure.
+    # Without it, mlockall degrades to MCL_CURRENT under RLIMIT_MEMLOCK.
+    if sudo setcap cap_sys_nice,cap_ipc_lock+ep "$DAEMON_DEST"; then
+        ok "Daemon binary installed + capped with CAP_SYS_NICE,CAP_IPC_LOCK at $DAEMON_DEST"
     else
-        warn "Could not setcap CAP_SYS_NICE on daemon binary"
+        warn "Could not setcap CAP_SYS_NICE,CAP_IPC_LOCK on daemon binary"
     fi
     # Remove local unprivileged binary to avoid path confusion
     rm -f "$BIN_DIR/mgd"

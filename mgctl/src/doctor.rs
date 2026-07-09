@@ -159,6 +159,20 @@ fn get_version_from_proc(name: &str) -> Option<String> {
 
 use mgd_common::psi::{GLOBAL_PSI, resolve_pressure_source, find_trigger_path};
 
+/// Returns the running systemd version number, or `None` if it cannot be
+/// determined. Used to emit a diagnostic hint when PSI trigger arming fails —
+/// systemd < 254 leaves the delegated cgroup's `memory.pressure` root-owned.
+fn systemd_version() -> Option<u32> {
+    let out = std::process::Command::new("systemctl")
+        .arg("--version")
+        .output()
+        .ok()?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // First line is "systemd NNN" or "systemd NNN (distro-tag)"
+    let first = stdout.lines().next()?;
+    first.split_whitespace().nth(1)?.parse().ok()
+}
+
 /// Report the PSI source exactly as the daemon resolves it, plus whether the
 /// zero-CPU kernel trigger can be armed on it.
 fn report_psi() {
@@ -177,7 +191,17 @@ fn report_psi() {
 
     match find_trigger_path() {
         Some(path) => println!("  {}", ok(&format!("PSI kernel trigger armable on {path} (zero-CPU idle)"))),
-        None => println!("  {}", warn("PSI trigger not armable — daemon falls back to 5s polling")),
+        None => {
+            // Common cause: systemd < 254 leaves the delegated cgroup's
+            // memory.pressure root-owned, so the daemon cannot open it R/W.
+            // Upgrade systemd or run: sudo chown $USER
+            //   /sys/fs/cgroup/user.slice/user-$(id -u).slice/.../memory.pressure
+            let hint = systemd_version()
+                .filter(|&v| v < 254)
+                .map(|v| format!(" (systemd {v} < 254 — cgroup file is root-owned)"))
+                .unwrap_or_default();
+            println!("  {}", warn(&format!("PSI trigger not armable — daemon falls back to 5s polling{hint}")));
+        }
     }
 }
 

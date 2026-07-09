@@ -18,6 +18,13 @@ use serde::{Deserialize, Serialize};
 #[serde(transparent)]
 pub struct Pid(pub u32);
 
+impl Pid {
+    /// Sentinel for log entries with no associated process (zram compaction,
+    /// cache drop, calibration summaries, per-cycle lines). PID 0 is the
+    /// kernel idle task and is never a valid mgd target.
+    pub const NONE: Pid = Pid(0);
+}
+
 impl fmt::Display for Pid {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         // Delegate so width/alignment specifiers ({:<8}) keep working.

@@ -1,20 +1,38 @@
-//! Passive PSI calibration
-
+//! Passive PSI calibration — suggest-don't-apply threshold tuning.
+//!
+//! Builds seconds-weighted 1%-bin histograms of `some_avg10` split into benign
+//! vs stalling samples (`full_avg10 ≥ STALL_FULL_PCT`), plus a `full_avg10`
+//! histogram and a debounced stall-episode counter.
+//!
+//! Samples taken while the daemon is actively intervening (non-empty frozen or
+//! checkpoint registries) are excluded so the calibrator never builds a noise
+//! floor on pressure it is treating.
+//!
+//! After ≥ 24 h and ≥ 10 stall episodes, `suggest()` emits threshold values:
+//! `elevated_pct` = benign p95 + `ELEVATED_MARGIN_PCT`, capped by stall-onset
+//! p10; upper tiers are ratio-derived. Output is written commented-out to a
+//! suggestion TOML that the user pastes into their config.
 
 use serde::{Deserialize, Serialize};
 
 use crate::monitor::psi::PsiThresholds;
 
+/// Number of 1%-wide bins covering [0, 100) for the `some_avg10` histograms.
 pub const BINS: usize = 100;
 
+/// `full_avg10` threshold above which a sample is classified as "stalling"
+/// rather than benign background noise.
 const STALL_FULL_PCT: f64 = 1.0;
 
+/// Safety margin added on top of the benign p95 when deriving `elevated_pct`.
 const ELEVATED_MARGIN_PCT: f64 = 2.0;
 
 const MIN_OBSERVED_SECS: u64 = 24 * 3600;
 const MIN_STALL_EVENTS: u32 = 10;
 const MIN_STALL_SECS: u64 = 60;
 
+/// Serialisable accumulator persisted to `~/.local/share/mgd/calibration_state.toml`
+/// every 10 min and on clean daemon shutdown.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct CalibratorState {
     benign_secs: Vec<u64>,

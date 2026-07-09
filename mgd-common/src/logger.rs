@@ -93,18 +93,9 @@ impl Logger {
     }
 
     /// Like `log()`, for entries with no associated process (zram, cache,
-    /// calibration, per-cycle summaries).
+    /// calibration, per-cycle summaries). Uses `Pid::NONE` as the pid sentinel.
     pub fn log_system(&self, action: LogAction, name: &str, rss_mb: f64, result: &str) {
-        self.log(action, crate::types::Pid(0), name, rss_mb, result);
-    }
-
-    /// Append a pressure snapshot entry to the session log.
-    #[allow(dead_code)]
-    pub fn log_pressure(&self, level: &str, avg10: f64, available_mb: f64) {
-        self.write_line(&format!(
-            "[{}] PRESSURE level={} avg10={:.2}% available={:.0}MB",
-            timestamp_now(), level, avg10, available_mb,
-        ));
+        self.log(action, crate::types::Pid::NONE, name, rss_mb, result);
     }
 
     fn write_line(&self, line: &str) {

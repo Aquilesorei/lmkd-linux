@@ -23,7 +23,11 @@ struct PidCache {
 
 fn read_start_time(pid: u32) -> Option<u64> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    stat.split_whitespace().nth(21)?.parse().ok()
+    // Field 2 (comm) is wrapped in parens and may contain spaces or ')'.
+    // rsplit_once finds the *last* ") " so it is safe regardless of the name.
+    // After that, field 22 (starttime) is at index 19 of the remaining tokens.
+    let after_comm = stat.rsplit_once(") ")?.1;
+    after_comm.split_whitespace().nth(19)?.parse().ok()
 }
 
 fn resolve_pid(name: &str, cache: &mut Option<PidCache>) -> Option<u32> {

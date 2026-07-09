@@ -251,6 +251,30 @@ Operation: arm a kernel PSI pressure trigger for zero-CPU idle waiting.
 
 ---
 
+### 5. Memory locking (mlockall) — Tier A, **`CAP_IPC_LOCK` on `mgd` itself**
+
+Operation: `mlockall(MCL_CURRENT | MCL_FUTURE)` at daemon startup so mgd's own
+pages can never be swapped to zram. Without it, a page fault in the eviction
+hot path — while the system is already thrashing — is unbounded latency at
+exactly the moment the daemon must act.
+
+This is the one grant that lives on the `mgd` binary itself (alongside
+`CAP_SYS_NICE` for the evictor's SCHED_RR), because memory locking is
+process-wide and cannot be delegated to a helper. It slightly bends the
+"user service holds no caps" rule; the cap is inert — it only removes the
+`RLIMIT_MEMLOCK` bound on locking mgd's *own* pages and grants no access to
+other processes or system state.
+
+- Carrier: `mgd` (no helper possible — process-wide operation).
+- Capability: `CAP_IPC_LOCK` (+ `CAP_SYS_NICE` on the same binary).
+- Input: none.
+- Graceful degrade: without the cap, `RLIMIT_MEMLOCK` (8MB default) bounds
+  locking, and `MCL_FUTURE` under a finite rlimit would make future
+  allocations *fail* — so mgd detects this and locks current pages only
+  (`MCL_CURRENT`). If even that fails, it runs unlocked and logs once.
+
+---
+
 ## Capability cheat-sheet
 
 | Operation        | Carrier                        | Capability                                   | Input |
@@ -259,6 +283,8 @@ Operation: arm a kernel PSI pressure trigger for zero-CPU idle waiting.
 | swap reclaim     | `mgd-zram-reclaim`             | `CAP_SYS_ADMIN`                              | none  |
 | CRIU dump/restore| `mgd-checkpoint` wrapper       | `CAP_CHECKPOINT_RESTORE` + `CAP_SYS_PTRACE` + `CAP_NET_ADMIN` | PID + images-dir (both validated) |
 | PSI trigger      | `mgd-psi-trigger`              | `cap_perfmon+ep` (compat; not needed on 7.x) | stall_us from argv (validated) |
+| RT scheduling    | `mgd` (daemon binary)          | `CAP_SYS_NICE`                               | none  |
+| memory locking   | `mgd` (daemon binary)          | `CAP_IPC_LOCK`                               | none  |
 
 SIGSTOP/SIGCONT (freezer), SIGTERM/SIGKILL (killer), SIGUSR1 (Firefox GC), and
 fdinfo GPU reads all work on own-uid processes with **no** privilege and are not
@@ -312,6 +338,13 @@ sudo setcap cap_perfmon+ep /usr/local/bin/mgd-psi-trigger
 ```
 
 Note: on kernel 7.x the cap is not required (cgroup PSI files are user-owned). It is retained for compatibility.
+
+RT scheduling + memory locking (Operation 5, caps on the daemon binary itself):
+
+```bash
+sudo install -m 0755 target/release/mgd /usr/local/bin/mgd
+sudo setcap cap_sys_nice,cap_ipc_lock+ep /usr/local/bin/mgd
+```
 
 Each step is independent. Skipping one disables only that feature; mgd logs the
 capability as unavailable at startup and continues.

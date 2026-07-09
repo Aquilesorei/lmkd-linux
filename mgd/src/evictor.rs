@@ -165,7 +165,7 @@ impl ScoreTracker {
             .saturating_add(cur_pswpout.saturating_sub(self.last_pswpout));
         self.last_pswpin = cur_pswpin;
         self.last_pswpout = cur_pswpout;
-        let swap_io_kbs = if dt > 0.1 { (swap_io_pages * 4) as f64 / dt } else { 0.0 };
+        let swap_io_kbs = if dt > 0.1 { (swap_io_pages * 4) as f64 / dt } else { 0.0 }; // 4 KB/page — x86_64
         let swap_io_val = (swap_io_kbs / 51200.0).clamp(0.0, 1.0);
 
         let psi_val = (some_avg10 / 100.0).clamp(0.0, 1.0);
@@ -230,6 +230,35 @@ pub(crate) fn feature_gates() -> FeatureGates {
 }
 
 #[allow(clippy::too_many_arguments)] // one-shot thread entry point wired in main.rs; a params struct adds no clarity
+/// Elevate the *calling thread* to SCHED_RR prio 20 (falls back to nice -20).
+/// On Linux both `sched_setscheduler(0, ..)` and `setpriority(PRIO_PROCESS, 0, ..)`
+/// are per-thread, and spawned threads inherit policy — so this lives in the
+/// evictor and must only be called from inside `run()`, never before
+/// `thread::spawn` in main (that would put the blocking-I/O maintenance thread
+/// and IPC/recovery on the RT budget too).
+fn try_elevate_scheduler_priority() {
+    use mgd_common::output::locked_print;
+    unsafe {
+        let param = libc::sched_param { sched_priority: 20 };
+        // Set policy to SCHED_RR (Real-Time Round Robin) with priority 20
+        if libc::sched_setscheduler(0, libc::SCHED_RR, &param) == 0 {
+            locked_print("[responder] Evictor thread set to SCHED_RR (priority 20)");
+        } else {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EPERM) {
+                // If unprivileged and CAP_SYS_NICE is missing, fall back to setting highest normal priority (nice -20)
+                if libc::setpriority(libc::PRIO_PROCESS, 0, -20) == 0 {
+                    locked_print("[responder] Set scheduler priority to nice -20 (highest normal priority)");
+                } else {
+                    locked_print("[responder] Running with standard priority (CAP_SYS_NICE missing for RT/Nice elevation)");
+                }
+            } else {
+                mgd_common::sync_print!("[responder] Warning: failed to set scheduler policy: {}", err);
+            }
+        }
+    }
+}
+
 pub fn run(
     frozen: Arc<Mutex<FrozenRegistry>>,
     checkpointed: Arc<Mutex<CheckpointRegistry>>,
@@ -241,6 +270,11 @@ pub fn run(
     event_log: crate::events::EventLog,
     spike_snapshot: Arc<Mutex<crate::spike_mode::SpikeSnapshot>>,
 ) {
+    // RT priority for this thread only. Called here (not in main) so the
+    // IPC/recovery/maintenance threads don't inherit SCHED_RR — maintenance
+    // does blocking disk I/O and must not burn RT budget.
+    try_elevate_scheduler_priority();
+
     mgd_common::sync_print!("[responder] PSI source: {}", monitor::psi::pressure_source());
 
     // Try subprocess trigger first (mgd-psi-trigger with cap_perfmon+ep).
