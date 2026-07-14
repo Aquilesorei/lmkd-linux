@@ -792,11 +792,11 @@ fn run_spike_cycle(
                             pid: proc.pid,
                             name: proc.name.clone(),
                             start_time: st,
-                            // unwrap_or(Pid(0)) is unreachable in practice: this arm only
+                            // unwrap_or(Pid::NONE) is unreachable in practice: this arm only
                             // runs for FreezeForHeadroom, which spike_mode only emits when
                             // sum_rss_max > 0, i.e. at least one Tracking-phase spike exists
                             // — so spike_pids is never empty here.
-                            frozen_for_spike_pid: spike_pids.iter().next().copied().unwrap_or(Pid(0)),
+                            frozen_for_spike_pid: spike_pids.iter().next().copied().unwrap_or(Pid::NONE),
                             frozen_at: std::time::Instant::now(),
                         });
                         // Push victim RSS to zram; SIGSTOP means no re-faults so 100% is safe.
@@ -1820,7 +1820,6 @@ mod tests {
             name: name.to_string(),
             action,
             rss: Kb(200 * 1024),
-            swap: Kb(0),
             reason: "test".into(),
             prio,
         }

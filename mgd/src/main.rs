@@ -80,7 +80,7 @@ fn main() {
     let spike_snapshot: Arc<Mutex<spike_mode::SpikeSnapshot>> =
         Arc::new(Mutex::new(spike_mode::SpikeSnapshot { active: vec![], victims: vec![] }));
 
-    let responder = {
+    let pressure_responder = {
         let f = Arc::clone(&frozen);
         let c = Arc::clone(&checkpointed);
         let l = Arc::clone(&logger);
@@ -93,7 +93,7 @@ fn main() {
         thread::spawn(move || evictor::run(f, c, l, w, rw, cal, ts, el, ss))
     };
 
-    let recovery = {
+    let recovery_manager = {
         let f = Arc::clone(&frozen);
         let c = Arc::clone(&checkpointed);
         let l = Arc::clone(&logger);
@@ -101,7 +101,7 @@ fn main() {
         thread::spawn(move || recovery::run(f, c, l, w))
     };
 
-    let ipc = {
+    let ipc_server = {
         let f = Arc::clone(&frozen);
         let c = Arc::clone(&checkpointed);
         let ts = Arc::clone(&throttle_snapshot);
@@ -110,7 +110,7 @@ fn main() {
         thread::spawn(move || ipc::run_server(f, c, ts, el, ss))
     };
 
-    let maintenance = {
+    let maintenance_manager = {
         let l = Arc::clone(&logger);
         let f = Arc::clone(&frozen);
         let c = Arc::clone(&checkpointed);
@@ -119,10 +119,10 @@ fn main() {
         thread::spawn(move || maintenance::run(l, f, c, cal, rw))
     };
 
-    let _ = responder.join();
-    let _ = recovery.join();
-    let _ = ipc.join();
-    let _ = maintenance.join();
+    let _ = pressure_responder.join();
+    let _ = recovery_manager.join();
+    let _ = ipc_server.join();
+    let _ = maintenance_manager.join();
 
     plugin_server::shutdown_plugins();
 
