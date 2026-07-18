@@ -15,6 +15,23 @@ pub(crate) struct ThrottleManager {
     tracker: HashMap<String, std::time::Instant>,
 }
 
+/// Below this raw PSI (`some_avg10`, percent) there is no active stall happening —
+/// a fixed safety-valve detail, not a user-tunable knob.
+const THROTTLE_RELEASE_PSI_FLOOR: f64 = 2.0;
+
+/// True once a cgroup has been continuously throttle-eligible for `max_duration_secs`
+/// while raw PSI shows no active stall (`psi_some_avg10 < psi_floor`). Guards against
+/// the composite pressure score (which residual swap% alone can keep pinned at
+/// Elevated long after a real event ends) throttling background daemons indefinitely.
+pub(crate) fn should_force_release(
+    background_duration_secs: u64,
+    psi_some_avg10: f64,
+    max_duration_secs: u64,
+    psi_floor: f64,
+) -> bool {
+    background_duration_secs >= max_duration_secs && psi_some_avg10 < psi_floor
+}
+
 impl ThrottleManager {
     pub(crate) fn new() -> Self {
         Self {
@@ -23,7 +40,7 @@ impl ThrottleManager {
         }
     }
 
-    pub(crate) fn update(&mut self, plan_procs: &[&Process], active_pid: Option<Pid>, active: bool, cfg: &CompiledConfig) {
+    pub(crate) fn update(&mut self, plan_procs: &[&Process], active_pid: Option<Pid>, active: bool, psi_some_avg10: f64, cfg: &CompiledConfig) {
         let exclude = &cfg.throttle_exclude;
         if !active {
             for path in self.states.keys() {
@@ -104,7 +121,13 @@ impl ThrottleManager {
                 .elapsed()
                 .as_secs();
 
-            let target = if background_duration >= 10 {
+            let force_release = should_force_release(
+                background_duration, psi_some_avg10, cfg.throttle_max_duration_sec, THROTTLE_RELEASE_PSI_FLOOR,
+            );
+
+            let target = if force_release {
+                ThrottledState::None
+            } else if background_duration >= 10 {
                 if min_priority >= 80 { ThrottledState::Full } else { ThrottledState::WeightOnly }
             } else {
                 ThrottledState::None
@@ -114,7 +137,14 @@ impl ThrottleManager {
                 match target {
                     ThrottledState::None => {
                         restore_cgroup_cpu(cgroup_path);
-                        mgd_common::sync_print!("[throttle] Unthrottled cgroup {}", cgroup_path);
+                        if force_release {
+                            mgd_common::sync_print!(
+                                "[throttle] Force-released cgroup {} — throttled {}s with no active stall (psi={:.1}%)",
+                                cgroup_path, background_duration, psi_some_avg10
+                            );
+                        } else {
+                            mgd_common::sync_print!("[throttle] Unthrottled cgroup {}", cgroup_path);
+                        }
                     }
                     ThrottledState::WeightOnly => {
                         if write_cgroup_cpu_weight(cgroup_path, 1).is_ok() {
@@ -379,5 +409,21 @@ mod tests {
     fn throttled_state_eq() {
         assert_eq!(ThrottledState::None, ThrottledState::None);
         assert_ne!(ThrottledState::WeightOnly, ThrottledState::Full);
+    }
+
+    #[test]
+    fn should_force_release_false_under_max_duration() {
+        assert!(!should_force_release(299, 0.0, 300, 2.0));
+    }
+
+    #[test]
+    fn should_force_release_false_when_psi_active() {
+        assert!(!should_force_release(600, 5.0, 300, 2.0));
+    }
+
+    #[test]
+    fn should_force_release_true_when_stale_and_calm() {
+        assert!(should_force_release(300, 0.0, 300, 2.0));
+        assert!(should_force_release(600, 1.9, 300, 2.0));
     }
 }

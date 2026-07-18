@@ -525,8 +525,11 @@ pub fn run(
                 .filter(|p| !frozen_set.contains(&p.pid))
                 .collect();
 
-            // Update CPU throttling (tiered, debounced) — only at Elevated+ pressure
-            throttle.update(&plan_procs, active_pid, effective_level >= PressureLevel::Elevated, &cfg);
+            // Update CPU throttling (tiered, debounced) — only at Elevated+ pressure.
+            // psi_some_avg10 lets ThrottleManager force-release a cgroup that's been
+            // throttled past cfg.throttle_max_duration_sec with no active stall, even
+            // if residual swap% alone is still keeping effective_level at Elevated.
+            throttle.update(&plan_procs, active_pid, effective_level >= PressureLevel::Elevated, pressure.some_avg10, &cfg);
             *throttle_snapshot.lock().unwrap() = throttle.snapshot();
 
             // Cap memory.max on expendable background cgroups at High+ pressure
