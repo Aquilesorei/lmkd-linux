@@ -71,11 +71,28 @@ struct RawConfig {
     throttle: ThrottleConfig,
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Deserialize)]
 struct ThrottleConfig {
     #[serde(default)]
     exclude: Vec<String>,
+    /// Force-release a throttled cgroup after this many continuous seconds
+    /// if raw PSI shows no active stall — prevents residual swap% alone
+    /// (via the composite pressure score) from pinning background daemons
+    /// throttled indefinitely after the real pressure event has passed.
+    #[serde(default = "default_throttle_max_duration_sec")]
+    max_duration_sec: u64,
 }
+
+impl Default for ThrottleConfig {
+    fn default() -> Self {
+        ThrottleConfig {
+            exclude: Vec::new(),
+            max_duration_sec: default_throttle_max_duration_sec(),
+        }
+    }
+}
+
+fn default_throttle_max_duration_sec() -> u64 { 300 }
 
 /// `[psi]` — pressure-tier boundaries (some_avg10 %) and the full_avg10
 /// accelerator floor. Defaults match the long-standing built-in values; an
@@ -447,6 +464,7 @@ pub struct CompiledConfig {
     pub spike_min_samples: usize,
     pub spike_max_victim_freeze_sec: u64,
     pub throttle_exclude: Vec<Regex>,
+    pub throttle_max_duration_sec: u64,
     /// (regex, priority, checkpoint_override)
     entries: Vec<(Regex, u8, Option<bool>)>,
     /// (regex, idle_secs) — SIGTERM after this many CPU-idle seconds at Normal pressure
@@ -746,6 +764,7 @@ fn compile(content: &str) -> Result<CompiledConfig, String> {
                 mgd_common::output::locked_eprint(&format!("[config] invalid throttle exclude pattern '{}': {e}", p));
             }).ok())
             .collect(),
+        throttle_max_duration_sec: raw.throttle.max_duration_sec,
         psi,
         entries,
         auto_kill_rules,
