@@ -39,9 +39,26 @@ impl ControlState {
     }
 }
 
+/// Below this raw swap I/O rate (KB/s) there's no meaningful swap churn happening.
+const SWAP_IO_LIVE_FLOOR_KBS: f64 = 1000.0;
+/// Below this raw PSI (`some_avg10`, percent) there's no active stall happening.
+const PSI_LIVE_FLOOR: f64 = 0.5;
+
 /// Map composite pressure score + trend to the target control state.
 /// A rising trend lowers the score needed to escalate.
-fn target_state_for(p_score: f64, trend: f64) -> ControlState {
+///
+/// Evicting/Critical/Emergency all require `p_score` past a floor that swap's
+/// max weight (0.20 of 1.0) cannot reach alone — only the Warning floor
+/// (0.15) is reachable by residual swap% by itself (once swap_used_pct >=
+/// 75%), with zero PSI/GPU/swap-I/O. Without a liveness check, a stable-but-
+/// high swap plateau pins Warning/Elevated forever, since target_state_for
+/// never returns Calm and the 12-tick Calm-recovery hysteresis never gets a
+/// chance to start counting down. Gate the Warning floor on PSI or swap I/O
+/// actually being live so a truly quiet plateau can recover. The genuinely
+/// dangerous near-full-swap case is handled separately by
+/// `apply_swap_overrides()` (forces Critical/Emergency at 95%/98% swap),
+/// independent of this function.
+fn target_state_for(p_score: f64, trend: f64, psi_some_avg10: f64, swap_io_kbs: f64) -> ControlState {
     if p_score >= 0.70 || (p_score >= 0.55 && trend > 0.05) {
         ControlState::Emergency
     } else if p_score >= 0.50 || (p_score >= 0.35 && trend > 0.03) {
@@ -49,7 +66,11 @@ fn target_state_for(p_score: f64, trend: f64) -> ControlState {
     } else if p_score >= 0.30 || (p_score >= 0.20 && trend > 0.02) {
         ControlState::Evicting
     } else if p_score >= 0.15 {
-        ControlState::Warning
+        if psi_some_avg10 > PSI_LIVE_FLOOR || swap_io_kbs > SWAP_IO_LIVE_FLOOR_KBS {
+            ControlState::Warning
+        } else {
+            ControlState::Calm
+        }
     } else {
         ControlState::Calm
     }
@@ -406,7 +427,7 @@ pub fn run(
         let now = std::time::Instant::now();
         let score = score_tracker.update(pressure.some_avg10, &meminfo, now);
 
-        let target_state = target_state_for(score.p_score, score.trend);
+        let target_state = target_state_for(score.p_score, score.trend, pressure.some_avg10, score.swap_io_kbs);
         if state_machine.advance(target_state, score.trend) {
             mgd_common::sync_print!("[controller] Instant escalation triggered due to rapid pressure spike (trend: {:.3})", score.trend);
         }
@@ -1469,22 +1490,50 @@ mod tests {
 
     #[test]
     fn target_state_thresholds() {
-        assert_eq!(target_state_for(0.0, 0.0), ControlState::Calm);
-        assert_eq!(target_state_for(0.15, 0.0), ControlState::Warning);
-        assert_eq!(target_state_for(0.30, 0.0), ControlState::Evicting);
-        assert_eq!(target_state_for(0.50, 0.0), ControlState::Critical);
-        assert_eq!(target_state_for(0.70, 0.0), ControlState::Emergency);
+        // psi_some_avg10 = 5.0 (clearly live) so the Warning-tier liveness
+        // gate doesn't interfere with these threshold checks.
+        assert_eq!(target_state_for(0.0, 0.0, 5.0, 0.0), ControlState::Calm);
+        assert_eq!(target_state_for(0.15, 0.0, 5.0, 0.0), ControlState::Warning);
+        assert_eq!(target_state_for(0.30, 0.0, 5.0, 0.0), ControlState::Evicting);
+        assert_eq!(target_state_for(0.50, 0.0, 5.0, 0.0), ControlState::Critical);
+        assert_eq!(target_state_for(0.70, 0.0, 5.0, 0.0), ControlState::Emergency);
     }
 
     #[test]
     fn target_state_rising_trend_lowers_bar() {
-        assert_eq!(target_state_for(0.21, 0.03), ControlState::Evicting);
-        assert_eq!(target_state_for(0.36, 0.04), ControlState::Critical);
-        assert_eq!(target_state_for(0.56, 0.06), ControlState::Emergency);
+        assert_eq!(target_state_for(0.21, 0.03, 5.0, 0.0), ControlState::Evicting);
+        assert_eq!(target_state_for(0.36, 0.04, 5.0, 0.0), ControlState::Critical);
+        assert_eq!(target_state_for(0.56, 0.06, 5.0, 0.0), ControlState::Emergency);
         // Same scores without the trend stay one tier lower
-        assert_eq!(target_state_for(0.21, 0.0), ControlState::Warning);
-        assert_eq!(target_state_for(0.36, 0.0), ControlState::Evicting);
-        assert_eq!(target_state_for(0.56, 0.0), ControlState::Critical);
+        assert_eq!(target_state_for(0.21, 0.0, 5.0, 0.0), ControlState::Warning);
+        assert_eq!(target_state_for(0.36, 0.0, 5.0, 0.0), ControlState::Evicting);
+        assert_eq!(target_state_for(0.56, 0.0, 5.0, 0.0), ControlState::Critical);
+    }
+
+    #[test]
+    fn warning_floor_needs_liveness() {
+        // Stale swap alone (p_score=0.15 from swap_val=0.75 * 0.20) with zero
+        // PSI and zero swap I/O — no longer stuck at Warning, recovers to Calm.
+        assert_eq!(target_state_for(0.15, 0.0, 0.0, 0.0), ControlState::Calm);
+    }
+
+    #[test]
+    fn warning_floor_fires_on_live_psi() {
+        assert_eq!(target_state_for(0.15, 0.0, 5.0, 0.0), ControlState::Warning);
+    }
+
+    #[test]
+    fn warning_floor_fires_on_live_swap_io() {
+        assert_eq!(target_state_for(0.15, 0.0, 0.0, 5000.0), ControlState::Warning);
+    }
+
+    #[test]
+    fn warning_floor_respects_psi_floor() {
+        // Just below both floors — still Calm, not Warning.
+        assert_eq!(
+            target_state_for(0.15, 0.0, PSI_LIVE_FLOOR - 0.1, SWAP_IO_LIVE_FLOOR_KBS - 1.0),
+            ControlState::Calm
+        );
     }
 
     #[test]
