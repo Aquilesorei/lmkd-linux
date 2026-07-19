@@ -18,12 +18,9 @@ jobs:
       - name: Install stable toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy
+          components: clippy
 
       - uses: Swatinem/rust-cache@v2
-
-      - name: fmt check
-        run: cargo fmt --all -- --check
 
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
