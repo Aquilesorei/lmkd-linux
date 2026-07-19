@@ -356,9 +356,11 @@ mod tests {
 
     #[test]
     fn test_from_state_rejects_wrong_histogram_width() {
-        let mut st = CalibratorState::default();
-        st.benign_secs = vec![0; 7];
-        st.observed_secs = 999;
+        let st = CalibratorState {
+            benign_secs: vec![0; 7],
+            observed_secs: 999,
+            ..Default::default()
+        };
         let c = Calibrator::from_state(st);
         assert_eq!(c.state().observed_secs, 0); // reset to fresh
     }

@@ -411,16 +411,22 @@ mod tests {
         assert!(PsiThresholds::default().valid());
 
         // Non-increasing tiers are invalid.
-        let mut t = PsiThresholds::default();
-        t.high_pct = t.elevated_pct;
+        let t = PsiThresholds {
+            high_pct: PsiThresholds::default().elevated_pct,
+            ..Default::default()
+        };
         assert!(!t.valid());
 
-        let mut t = PsiThresholds::default();
-        t.emergency_pct = 101.0;
+        let t = PsiThresholds {
+            emergency_pct: 101.0,
+            ..Default::default()
+        };
         assert!(!t.valid());
 
-        let mut t = PsiThresholds::default();
-        t.full_critical_pct = 0.0;
+        let t = PsiThresholds {
+            full_critical_pct: 0.0,
+            ..Default::default()
+        };
         assert!(!t.valid());
     }
 

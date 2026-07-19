@@ -280,6 +280,7 @@ fn try_elevate_scheduler_priority() {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     frozen: Arc<Mutex<FrozenRegistry>>,
     checkpointed: Arc<Mutex<CheckpointRegistry>>,
