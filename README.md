@@ -218,6 +218,7 @@ mgctl reload                  # hot-reload config without restarting daemon (SIG
 mgctl doctor                  # print environment diagnostic + feature support report
 mgctl calibrate [--dry-run]   # derive recommended PSI thresholds based on historic load
 mgctl calibrate --apply       # apply previously generated calibration settings
+mgctl calibrate --passive-apply  # apply daemon's passive [psi] suggestion (from 24h+ of background PSI sampling)
 
 mgctl restart                 # restart the mgd service
 mgctl start | stop            # start / stop the mgd service
@@ -234,6 +235,10 @@ down, which the socket commands cannot.
 
 > `mgctl status` is the daemon's live view (pressure, frozen counts); `mgctl
 > service` is the systemd unit view (active state, PID, uptime).
+
+> Passive calibration only ever *suggests* — it never rewrites your config on
+> its own. Run `mgctl calibrate --passive-apply` when you want the suggestion
+> applied, then `mgctl reload` to pick it up.
 
 ### Signals
 | Signal | Effect |
