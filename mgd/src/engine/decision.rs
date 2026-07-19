@@ -258,14 +258,14 @@ mod tests {
 
     #[test]
     fn normal_pressure_produces_no_decisions() {
-        let procs = vec![proc("firefox", 500_000, 0)];
+        let procs = [proc("firefox", 500_000, 0)];
         let decisions = plan(&PressureLevel::Normal, &procs.iter().collect::<Vec<_>>(), Kb(4_000_000), Kb(16_000_000), false, &CFG);
         assert!(decisions.is_empty());
     }
 
     #[test]
     fn elevated_freezes_low_priority_only() {
-        let procs = vec![proc("baloo_file_extractor", 200_000, 0)];
+        let procs = [proc("baloo_file_extractor", 200_000, 0)];
         let decisions = plan(&PressureLevel::Elevated, &procs.iter().collect::<Vec<_>>(), Kb(1_000_000), Kb(16_000_000), false, &CFG);
         assert_eq!(decisions.len(), 1);
         assert_eq!(decisions[0].action, Action::Freeze);
@@ -273,21 +273,21 @@ mod tests {
 
     #[test]
     fn elevated_skips_normal_tier_entirely() {
-        let procs = vec![proc("some_app", 500_000, 0)]; // default priority 50
+        let procs = [proc("some_app", 500_000, 0)]; // default priority 50
         let decisions = plan(&PressureLevel::Elevated, &procs.iter().collect::<Vec<_>>(), Kb(1_000_000), Kb(16_000_000), false, &CFG);
         assert!(decisions.is_empty());
     }
 
     #[test]
     fn critical_never_touches_system_tier() {
-        let procs = vec![proc("kwin_wayland", 300_000, 0)];
+        let procs = [proc("kwin_wayland", 300_000, 0)];
         let decisions = plan(&PressureLevel::Critical, &procs.iter().collect::<Vec<_>>(), Kb(500_000), Kb(16_000_000), false, &CFG);
         assert!(decisions.is_empty());
     }
 
     #[test]
     fn critical_kills_high_swap_ratio() {
-        let procs = vec![proc("msedge", 100_000, 200_000)];
+        let procs = [proc("msedge", 100_000, 200_000)];
         let decisions = plan(&PressureLevel::Critical, &procs.iter().collect::<Vec<_>>(), Kb(500_000), Kb(16_000_000), false, &CFG);
         assert_eq!(decisions.len(), 1);
         assert_eq!(decisions[0].action, Action::Kill);
@@ -295,7 +295,7 @@ mod tests {
 
     #[test]
     fn emergency_kills_everything_non_critical() {
-        let procs = vec![proc("firefox", 500_000, 0)];
+        let procs = [proc("firefox", 500_000, 0)];
         let decisions = plan(&PressureLevel::Emergency, &procs.iter().collect::<Vec<_>>(), Kb(500_000), Kb(16_000_000), false, &CFG);
         assert_eq!(decisions.len(), 1);
         assert_eq!(decisions[0].action, Action::Kill);
@@ -303,10 +303,7 @@ mod tests {
 
     #[test]
     fn stops_when_deficit_covered() {
-        let procs = vec![
-            proc("msedge", 2_000_000, 0),
-            proc("msedge", 2_000_000, 0),
-        ];
+        let procs = [proc("msedge", 2_000_000, 0), proc("msedge", 2_000_000, 0)];
         // deficit = 16M*0.15 - 1M = 1.4M KB; first 2M kill covers it.
         let decisions = plan(&PressureLevel::Emergency, &procs.iter().collect::<Vec<_>>(), Kb(1_000_000), Kb(16_000_000), false, &CFG);
         assert_eq!(decisions.len(), 1);
@@ -316,7 +313,7 @@ mod tests {
     fn freeze_does_not_count_toward_deficit() {
         // Freeze credits nothing, so a tiny deficit must not stop the loop short:
         // all 4 expendable procs freeze.
-        let procs = vec![
+        let procs = [
             proc("baloo_file_extractor", 200_000, 0),
             proc("baloo_file_extractor", 200_000, 0),
             proc("baloo_file_extractor", 200_000, 0),
@@ -330,7 +327,7 @@ mod tests {
 
     #[test]
     fn ignores_tiny_processes() {
-        let procs = vec![proc("tiny", 5_000, 0)];
+        let procs = [proc("tiny", 5_000, 0)];
         let decisions = plan(&PressureLevel::Emergency, &procs.iter().collect::<Vec<_>>(), Kb(500_000), Kb(16_000_000), false, &CFG);
         assert!(decisions.is_empty());
     }
@@ -339,10 +336,7 @@ mod tests {
     fn high_pressure_deficit_credits_rss_only() {
         // Guard: GPU ranking must not leak into the deficit. Synthetic pids have
         // no GPU mem, so High behaves as RSS-only.
-        let procs = vec![
-            proc("msedge", 2_000_000, 0),
-            proc("msedge", 2_000_000, 0),
-        ];
+        let procs = [proc("msedge", 2_000_000, 0), proc("msedge", 2_000_000, 0)];
         let decisions = plan(&PressureLevel::High, &procs.iter().collect::<Vec<_>>(), Kb(1_000_000), Kb(16_000_000), false, &CFG);
         assert_eq!(decisions.len(), 1);
         assert_eq!(decisions[0].action, Action::Terminate);
@@ -363,7 +357,7 @@ mod tests {
 
     #[test]
     fn swap_exhausted_escalates_expendable_to_kill() {
-        let procs = vec![proc("msedge", 500_000, 0)]; // priority 90 (EXPENDABLE)
+        let procs = [proc("msedge", 500_000, 0)]; // priority 90 (EXPENDABLE)
         // Deficit must be positive for plan to evaluate candidates (e.g. 15% target on 16M is 2.4M, avail is 1M, so deficit is 1.4M)
         let decisions = plan(&PressureLevel::Elevated, &procs.iter().collect::<Vec<_>>(), Kb(1_000_000), Kb(16_000_000), true, &CFG);
         assert_eq!(decisions.len(), 1);
