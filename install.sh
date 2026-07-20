@@ -33,7 +33,25 @@ die()  { echo -e "${RED}✗${NC} $*" >&2; exit 1; }
 # ── dependency checks ─────────────────────────────────────────────────────────
 echo "Checking dependencies..."
 
-command -v cargo   >/dev/null 2>&1 || die "cargo not found — install Rust: https://rustup.rs"
+# Two ways to run this script:
+#   1. Source checkout (git clone) — Cargo.toml present, builds from source, cargo required.
+#   2. Release tarball — no Cargo.toml, prebuilt binaries shipped in ./bin/, no cargo needed.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PREBUILT_DIR="$SCRIPT_DIR/bin"
+NEED_BUILD=1
+BIN_SRC="target/release"
+
+if [[ -f "$SCRIPT_DIR/Cargo.toml" ]]; then
+    command -v cargo >/dev/null 2>&1 || die "cargo not found — install Rust: https://rustup.rs"
+    NEED_BUILD=1
+    BIN_SRC="target/release"
+elif [[ -d "$PREBUILT_DIR" && -x "$PREBUILT_DIR/mgd" ]]; then
+    NEED_BUILD=0
+    BIN_SRC="$PREBUILT_DIR"
+else
+    die "no Cargo.toml and no ./bin/ directory with prebuilt binaries — this doesn't look like a source checkout or a valid release package"
+fi
+
 command -v systemctl >/dev/null 2>&1 || die "systemctl not found — systemd required"
 
 if ! command -v criu >/dev/null 2>&1; then
@@ -50,9 +68,13 @@ fi
 ok "Dependencies OK"
 
 # ── build ─────────────────────────────────────────────────────────────────────
-echo "Building release binaries..."
-cargo build --bin mgd --bin mgctl --bin mgd-zram-reclaim --bin mgd-checkpoint --bin mgd-psi-trigger --bin mgd-kde --bin mgd-gpu-intel --bin mgd-gpu-amd --release 2>&1 | tail -3
-ok "Build complete"
+if [[ "$NEED_BUILD" == 1 ]]; then
+    echo "Building release binaries..."
+    cargo build --bin mgd --bin mgctl --bin mgd-zram-reclaim --bin mgd-checkpoint --bin mgd-psi-trigger --bin mgd-kde --bin mgd-gpu-intel --bin mgd-gpu-amd --release 2>&1 | tail -3
+    ok "Build complete"
+else
+    ok "Using prebuilt binaries from $BIN_SRC"
+fi
 
 # ── stop existing service if running ─────────────────────────────────────────
 if systemctl --user is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
@@ -64,7 +86,7 @@ fi
 mkdir -p "$BIN_DIR"
 if [[ "$WITH_PRIVILEGED" == 1 ]]; then
     DAEMON_DEST="/usr/local/bin/mgd"
-    sudo install -m 0755 target/release/mgd "$DAEMON_DEST"
+    sudo install -m 0755 "$BIN_SRC/mgd" "$DAEMON_DEST"
     # CAP_SYS_NICE: SCHED_RR for the evictor thread.
     # CAP_IPC_LOCK: mlockall(MCL_CURRENT|MCL_FUTURE) — lock all daemon pages in
     # RAM so the eviction hot path never page-faults under memory pressure.
@@ -77,16 +99,16 @@ if [[ "$WITH_PRIVILEGED" == 1 ]]; then
     # Remove local unprivileged binary to avoid path confusion
     rm -f "$BIN_DIR/mgd"
 else
-    cp target/release/mgd   "$BIN_DIR/mgd"
+    cp "$BIN_SRC/mgd"   "$BIN_DIR/mgd"
     if [[ -f "/usr/local/bin/mgd" ]]; then
         sudo rm -f "/usr/local/bin/mgd"
     fi
 fi
-cp target/release/mgctl "$BIN_DIR/mgctl"
-cp target/release/mgd-checkpoint "$BIN_DIR/mgd-checkpoint"
-cp target/release/mgd-kde "$BIN_DIR/mgd-kde"
-cp target/release/mgd-gpu-intel "$BIN_DIR/mgd-gpu-intel"
-cp target/release/mgd-gpu-amd "$BIN_DIR/mgd-gpu-amd"
+cp "$BIN_SRC/mgctl" "$BIN_DIR/mgctl"
+cp "$BIN_SRC/mgd-checkpoint" "$BIN_DIR/mgd-checkpoint"
+cp "$BIN_SRC/mgd-kde" "$BIN_DIR/mgd-kde"
+cp "$BIN_SRC/mgd-gpu-intel" "$BIN_DIR/mgd-gpu-intel"
+cp "$BIN_SRC/mgd-gpu-amd" "$BIN_DIR/mgd-gpu-amd"
 chmod +x "$BIN_DIR"/mgd*
 ok "Binaries installed"
 
@@ -137,14 +159,14 @@ if [[ "$WITH_PRIVILEGED" == 1 ]]; then
     # Fix 2 — swap reclaim: capped helper (CAP_SYS_ADMIN, never SUID root).
     # The daemon looks for the helper in /usr/local/bin then /usr/bin; install.sh
     # uses /usr/local/bin (manual install convention). Distro packages use /usr/bin.
-    sudo install -m 0750 -o root -g mgd target/release/mgd-zram-reclaim "$HELPER_DEST"
+    sudo install -m 0750 -o root -g mgd "$BIN_SRC/mgd-zram-reclaim" "$HELPER_DEST"
     sudo setcap cap_sys_admin+ep "$HELPER_DEST"
     ok "swap reclaim helper installed + capped at $HELPER_DEST"
     warn "  reclaim stays OFF until you set [reclaim] proactive_swap_reclaim = true in priorities.toml"
 
     # Fix 3 — checkpoint helper: capped helper (CAP_CHECKPOINT_RESTORE, CAP_SYS_PTRACE, CAP_NET_ADMIN, never SUID root).
     CHECKPOINT_HELPER_DEST="/usr/local/bin/mgd-checkpoint"
-    sudo install -m 0750 -o root -g mgd target/release/mgd-checkpoint "$CHECKPOINT_HELPER_DEST"
+    sudo install -m 0750 -o root -g mgd "$BIN_SRC/mgd-checkpoint" "$CHECKPOINT_HELPER_DEST"
     if sudo setcap cap_checkpoint_restore,cap_sys_ptrace,cap_net_admin+ep "$CHECKPOINT_HELPER_DEST"; then
         ok "checkpoint helper installed + capped at $CHECKPOINT_HELPER_DEST"
     else
@@ -155,7 +177,7 @@ if [[ "$WITH_PRIVILEGED" == 1 ]]; then
     # file and proxies PSI events to the daemon via stdout. cap_perfmon+ep kept
     # for compatibility with older kernels that gate /proc/pressure/* on it.
     PSI_TRIGGER_DEST="/usr/local/bin/mgd-psi-trigger"
-    sudo install -m 0755 target/release/mgd-psi-trigger "$PSI_TRIGGER_DEST"
+    sudo install -m 0755 "$BIN_SRC/mgd-psi-trigger" "$PSI_TRIGGER_DEST"
     if sudo setcap cap_perfmon+ep "$PSI_TRIGGER_DEST"; then
         ok "PSI trigger helper installed + capped at $PSI_TRIGGER_DEST"
     else

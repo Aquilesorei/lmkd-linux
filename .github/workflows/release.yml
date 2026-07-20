@@ -1,0 +1,57 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+env:
+  CARGO_TERM_COLOR: always
+  # Same binary set install.sh builds — mgd-gnome/mgd-cosmic are scaffolds
+  # (todo!() on spawn) and are intentionally not shipped.
+  BINS: mgd mgctl mgd-checkpoint mgd-psi-trigger mgd-zram-reclaim mgd-kde mgd-gpu-intel mgd-gpu-amd
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binaries
+        run: |
+          cargo build --release \
+            --bin mgd --bin mgctl --bin mgd-zram-reclaim \
+            --bin mgd-checkpoint --bin mgd-psi-trigger \
+            --bin mgd-kde --bin mgd-gpu-intel --bin mgd-gpu-amd
+
+      - name: Strip binaries
+        run: |
+          for b in $BINS; do
+            strip "target/release/$b"
+          done
+
+      - name: Package release tarball
+        run: |
+          VERSION="${GITHUB_REF_NAME}"
+          PKG_DIR="mgd-${VERSION}-x86_64-linux"
+          mkdir -p "$PKG_DIR/bin"
+          for b in $BINS; do
+            cp "target/release/$b" "$PKG_DIR/bin/"
+          done
+          cp -r config "$PKG_DIR/config"
+          cp -r packaging "$PKG_DIR/packaging"
+          cp install.sh README.md CHANGELOG.md "$PKG_DIR/"
+          chmod +x "$PKG_DIR/install.sh"
+          tar czf "${PKG_DIR}.tar.gz" "$PKG_DIR"
+          echo "ASSET=${PKG_DIR}.tar.gz" >> "$GITHUB_ENV"
+
+      - name: Upload release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.ASSET }}
+          generate_release_notes: true
