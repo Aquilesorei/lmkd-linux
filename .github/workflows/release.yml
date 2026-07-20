@@ -45,7 +45,9 @@ jobs:
           done
           cp -r config "$PKG_DIR/config"
           cp -r packaging "$PKG_DIR/packaging"
-          cp install.sh README.md CHANGELOG.md "$PKG_DIR/"
+          cp install.sh README.md "$PKG_DIR/"
+          # CHANGELOG.md is optional — don't fail the release if it's absent.
+          [[ -f CHANGELOG.md ]] && cp CHANGELOG.md "$PKG_DIR/"
           chmod +x "$PKG_DIR/install.sh"
           tar czf "${PKG_DIR}.tar.gz" "$PKG_DIR"
           echo "ASSET=${PKG_DIR}.tar.gz" >> "$GITHUB_ENV"
