@@ -54,6 +54,7 @@ fn usage() {
     eprintln!("  mgctl calibrate --passive-apply  (apply daemon passive [psi] suggestion)");
     eprintln!("  mgctl doctor                  (environment + feature report)");
     eprintln!("  mgctl spike-status            (spike mode: tracked heavy processes + frozen victims)");
+    eprintln!("  mgctl leak-status             (leak guard: tracked process-family groups)");
 }
 
 fn main() {
@@ -84,6 +85,7 @@ fn main() {
         "events"        => "events".to_string(),
         "reload"        => "reload".to_string(),
         "spike-status"  => "spike-status".to_string(),
+        "leak-status"   => "leak-status".to_string(),
         "unfreeze" | "freeze" | "restore" | "info" | "kill" => {
             if args.len() < 3 {
                 eprintln!("Usage: mgctl {cmd} <pid|name>");

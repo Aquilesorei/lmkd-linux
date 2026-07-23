@@ -70,6 +70,7 @@ pub fn run_server(
     throttle_snapshot: ThrottleSnapshot,
     event_log: crate::events::EventLog,
     spike_snapshot: Arc<Mutex<crate::spike_mode::SpikeSnapshot>>,
+    leak_snapshot: Arc<Mutex<crate::leak_guard::LeakSnapshot>>,
 ) {
     let path = mgd_common::socket::socket_path();
 
@@ -95,11 +96,12 @@ pub fn run_server(
                 let t = Arc::clone(&throttle_snapshot);
                 let e = Arc::clone(&event_log);
                 let s = Arc::clone(&spike_snapshot);
+                let lk = Arc::clone(&leak_snapshot);
                 let a = Arc::clone(&active_conns);
                 a.fetch_add(1, Ordering::Relaxed);
                 thread::spawn(move || {
                     let _guard = ConnGuard(a); // decrements on drop, even on panic
-                    route_ipc_connection(stream, f, c, t, e, s);
+                    route_ipc_connection(stream, f, c, t, e, s, lk);
                 });
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -130,6 +132,7 @@ fn route_ipc_connection(
     throttle_snapshot: ThrottleSnapshot,
     event_log: crate::events::EventLog,
     spike_snapshot: Arc<Mutex<crate::spike_mode::SpikeSnapshot>>,
+    leak_snapshot: Arc<Mutex<crate::leak_guard::LeakSnapshot>>,
 ) {
     stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
 
@@ -153,7 +156,7 @@ fn route_ipc_connection(
         return;
     }
 
-    let response = dispatch(line.trim(), &frozen, &checkpointed, &throttle_snapshot, &event_log, &spike_snapshot);
+    let response = dispatch(line.trim(), &frozen, &checkpointed, &throttle_snapshot, &event_log, &spike_snapshot, &leak_snapshot);
     let _ = writeln!(stream, "{response}");
 }
 
@@ -164,6 +167,7 @@ fn dispatch(
     throttle_snapshot: &ThrottleSnapshot,
     event_log: &crate::events::EventLog,
     spike_snapshot: &Arc<Mutex<crate::spike_mode::SpikeSnapshot>>,
+    leak_snapshot: &Arc<Mutex<crate::leak_guard::LeakSnapshot>>,
 ) -> String {
     let parts: Vec<&str> = raw.splitn(2, ' ').collect();
     let cmd = parts[0];
@@ -171,7 +175,7 @@ fn dispatch(
 
     match cmd {
         // Config snapshot fetched per-arm, not up front — most commands don't need it.
-        "status"   => cmd_status(frozen, checkpointed, throttle_snapshot, spike_snapshot, &crate::config::get()),
+        "status"   => cmd_status(frozen, checkpointed, throttle_snapshot, spike_snapshot, leak_snapshot, &crate::config::get()),
         "list"     => cmd_list(frozen, checkpointed, throttle_snapshot),
         "ps"       => cmd_ps(frozen, throttle_snapshot, &crate::config::get()),
         "events"   => cmd_events(event_log),
@@ -213,6 +217,7 @@ fn dispatch(
         }
         "gpu-info"      => cmd_gpu_info(),
         "spike-status"  => cmd_spike_status(spike_snapshot),
+        "leak-status"   => cmd_leak_status(leak_snapshot),
         _ => err(&format!("unknown command: {cmd}")),
     }
 }
@@ -224,6 +229,7 @@ fn cmd_status(
     checkpointed: &Arc<Mutex<CheckpointRegistry>>,
     throttle_snapshot: &ThrottleSnapshot,
     spike_snapshot: &Arc<Mutex<crate::spike_mode::SpikeSnapshot>>,
+    leak_snapshot: &Arc<Mutex<crate::leak_guard::LeakSnapshot>>,
     cfg: &crate::config::CompiledConfig,
 ) -> String {
     let pressure = monitor::psi::read_pressure()
@@ -260,6 +266,10 @@ fn cmd_status(
         let s = spike_snapshot.lock().unwrap();
         (s.active.len(), s.victims.len())
     };
+    let (leak_tracked, leak_flagged) = {
+        let l = leak_snapshot.lock().unwrap();
+        (l.groups.len(), l.groups.iter().filter(|(_, _, _, leaking)| *leaking).count())
+    };
     let fired = |ts: u64| if ts == 0 { "never".to_string() } else { format!("last={}", format_ts(ts)) };
 
     out.push_str("\nfeatures:");
@@ -288,6 +298,10 @@ fn cmd_status(
     out.push_str(&format!(
         "\n  spike_mode         enabled={} tracked={} victims={}",
         cfg.spike_mode_enabled, spike_tracked, spike_victims,
+    ));
+    out.push_str(&format!(
+        "\n  leak_guard         enabled={} tracked={} leaking={}",
+        cfg.leak_guard_enabled, leak_tracked, leak_flagged,
     ));
     out.push_str(&format!(
         "\n  auto_kill_idle     rules={}",
@@ -634,6 +648,21 @@ fn cmd_spike_status(spike_snapshot: &Arc<Mutex<crate::spike_mode::SpikeSnapshot>
         for (pid, name, for_spike) in &snap.victims {
             lines.push(format!("  pid={:<7} name={:<22} frozen_for_spike={}", pid, name, for_spike));
         }
+    }
+    ok(&lines.join("\n"))
+}
+
+fn cmd_leak_status(leak_snapshot: &Arc<Mutex<crate::leak_guard::LeakSnapshot>>) -> String {
+    let snap = leak_snapshot.lock().unwrap();
+    if snap.groups.is_empty() {
+        return ok("idle (no tracked process groups)");
+    }
+    let mut lines: Vec<String> = vec!["tracked process groups:".to_string()];
+    for (name, count, total_rss, leaking) in &snap.groups {
+        lines.push(format!(
+            "  name={:<22} count={:<4} total_rss={:.0}MB leaking={}",
+            name, count, total_rss.mib(), leaking
+        ));
     }
     ok(&lines.join("\n"))
 }

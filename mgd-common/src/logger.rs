@@ -25,6 +25,7 @@ pub enum LogAction {
     SpikeUnfreeze,
     SpikeUnfreezeTimeout,
     SpikeUnfreezeOrphan,
+    LeakGuardKill,
     Cycle,
 }
 
@@ -51,6 +52,7 @@ impl LogAction {
             Self::SpikeUnfreeze        => "SPIKE_UNFREEZE",
             Self::SpikeUnfreezeTimeout => "SPIKE_UNFREEZE_TIMEOUT",
             Self::SpikeUnfreezeOrphan  => "SPIKE_UNFREEZE_ORPHAN",
+            Self::LeakGuardKill        => "LEAK_GUARD_KILL",
             Self::Cycle                => "CYCLE",
         }
     }

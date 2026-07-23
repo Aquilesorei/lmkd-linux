@@ -352,6 +352,7 @@ mod tests {
             cgroup_path: cgroup.map(|s| s.to_string()),
             cpu_pct: 0.0,
             majflt: 0,
+            cmdline: String::new(),
         }
     }
 

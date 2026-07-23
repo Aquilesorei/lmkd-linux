@@ -10,6 +10,7 @@ mod ipc;
 mod plugin_server;
 mod throttle;
 mod spike_mode;
+mod leak_guard;
 
 use std::sync::{Arc, Condvar, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -80,6 +81,10 @@ fn main() {
     let spike_snapshot: Arc<Mutex<spike_mode::SpikeSnapshot>> =
         Arc::new(Mutex::new(spike_mode::SpikeSnapshot { active: vec![], victims: vec![] }));
 
+    // Leak-guard snapshot: written by evictor each cycle, read by IPC for `mgctl leak-status`.
+    let leak_snapshot: Arc<Mutex<leak_guard::LeakSnapshot>> =
+        Arc::new(Mutex::new(leak_guard::LeakSnapshot { groups: vec![] }));
+
     let pressure_responder = {
         let f = Arc::clone(&frozen);
         let c = Arc::clone(&checkpointed);
@@ -90,7 +95,8 @@ fn main() {
         let ts = Arc::clone(&throttle_snapshot);
         let el = Arc::clone(&event_log);
         let ss = Arc::clone(&spike_snapshot);
-        thread::spawn(move || evictor::run(f, c, l, w, rw, cal, ts, el, ss))
+        let ls = Arc::clone(&leak_snapshot);
+        thread::spawn(move || evictor::run(f, c, l, w, rw, cal, ts, el, ss, ls))
     };
 
     let recovery_manager = {
@@ -107,7 +113,8 @@ fn main() {
         let ts = Arc::clone(&throttle_snapshot);
         let el = Arc::clone(&event_log);
         let ss = Arc::clone(&spike_snapshot);
-        thread::spawn(move || ipc::run_server(f, c, ts, el, ss))
+        let ls = Arc::clone(&leak_snapshot);
+        thread::spawn(move || ipc::run_server(f, c, ts, el, ss, ls))
     };
 
     let maintenance_manager = {

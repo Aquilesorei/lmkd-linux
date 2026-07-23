@@ -69,6 +69,8 @@ struct RawConfig {
     spike_mode: SpikeMode,
     #[serde(default)]
     throttle: ThrottleConfig,
+    #[serde(default)]
+    process_leak_guard: ProcessLeakGuard,
 }
 
 #[derive(Deserialize)]
@@ -358,6 +360,57 @@ fn default_spike_cpu_threshold_pct() -> f32 { 80.0 }
 fn default_spike_throttled_cpu_weight() -> u32 { 20 }
 fn default_spike_min_samples() -> usize { 6 }
 
+/// `[process_leak_guard]` — detects a process family (grouped by exact
+/// `/proc/PID/cmdline`) whose live-instance count only ever grows and is
+/// never reaped, independent of which binary it is. Opt-in, disabled by
+/// default. See `mgd/src/leak_guard.rs`.
+#[derive(Deserialize)]
+struct ProcessLeakGuard {
+    #[serde(default = "default_leak_guard_enabled")]
+    enabled: bool,
+    #[serde(default)]
+    exclude: Vec<String>,
+    #[serde(default = "default_leak_guard_window_sec")]
+    window_sec: u64,
+    #[serde(default = "default_leak_guard_min_group_count")]
+    min_group_count: usize,
+    #[serde(default = "default_leak_guard_min_group_rss_kb")]
+    min_group_rss_kb: u64,
+    #[serde(default = "default_leak_guard_growth_over_window")]
+    growth_over_window: usize,
+    #[serde(default = "default_leak_guard_min_samples")]
+    min_samples: usize,
+    #[serde(default = "default_leak_guard_keep_newest")]
+    keep_newest: usize,
+    #[serde(default = "default_leak_guard_cooldown_sec")]
+    cooldown_sec: u64,
+}
+
+impl Default for ProcessLeakGuard {
+    fn default() -> Self {
+        ProcessLeakGuard {
+            enabled: default_leak_guard_enabled(),
+            exclude: vec![],
+            window_sec: default_leak_guard_window_sec(),
+            min_group_count: default_leak_guard_min_group_count(),
+            min_group_rss_kb: default_leak_guard_min_group_rss_kb(),
+            growth_over_window: default_leak_guard_growth_over_window(),
+            min_samples: default_leak_guard_min_samples(),
+            keep_newest: default_leak_guard_keep_newest(),
+            cooldown_sec: default_leak_guard_cooldown_sec(),
+        }
+    }
+}
+
+fn default_leak_guard_enabled() -> bool { false }
+fn default_leak_guard_window_sec() -> u64 { 600 }
+fn default_leak_guard_min_group_count() -> usize { 8 }
+fn default_leak_guard_min_group_rss_kb() -> u64 { 256_000 }
+fn default_leak_guard_growth_over_window() -> usize { 5 }
+fn default_leak_guard_min_samples() -> usize { 4 }
+fn default_leak_guard_keep_newest() -> usize { 1 }
+fn default_leak_guard_cooldown_sec() -> u64 { 180 }
+
 #[derive(Deserialize)]
 struct Defaults {
     #[serde(default = "default_fifty")]
@@ -465,6 +518,15 @@ pub struct CompiledConfig {
     pub spike_max_victim_freeze_sec: u64,
     pub throttle_exclude: Vec<Regex>,
     pub throttle_max_duration_sec: u64,
+    pub leak_guard_enabled: bool,
+    pub leak_guard_exclude: Vec<Regex>,
+    pub leak_guard_window_sec: u64,
+    pub leak_guard_min_group_count: usize,
+    pub leak_guard_min_group_rss_kb: u64,
+    pub leak_guard_growth_over_window: usize,
+    pub leak_guard_min_samples: usize,
+    pub leak_guard_keep_newest: usize,
+    pub leak_guard_cooldown_sec: u64,
     /// (regex, priority, checkpoint_override)
     entries: Vec<(Regex, u8, Option<bool>)>,
     /// (regex, idle_secs) — SIGTERM after this many CPU-idle seconds at Normal pressure
@@ -765,6 +827,19 @@ fn compile(content: &str) -> Result<CompiledConfig, String> {
             }).ok())
             .collect(),
         throttle_max_duration_sec: raw.throttle.max_duration_sec,
+        leak_guard_enabled: raw.process_leak_guard.enabled,
+        leak_guard_exclude: raw.process_leak_guard.exclude.iter()
+            .filter_map(|p| Regex::new(p).map_err(|e| {
+                mgd_common::output::locked_eprint(&format!("[config] invalid process_leak_guard exclude pattern '{}': {e}", p));
+            }).ok())
+            .collect(),
+        leak_guard_window_sec: raw.process_leak_guard.window_sec,
+        leak_guard_min_group_count: raw.process_leak_guard.min_group_count,
+        leak_guard_min_group_rss_kb: raw.process_leak_guard.min_group_rss_kb,
+        leak_guard_growth_over_window: raw.process_leak_guard.growth_over_window,
+        leak_guard_min_samples: raw.process_leak_guard.min_samples,
+        leak_guard_keep_newest: raw.process_leak_guard.keep_newest,
+        leak_guard_cooldown_sec: raw.process_leak_guard.cooldown_sec,
         psi,
         entries,
         auto_kill_rules,

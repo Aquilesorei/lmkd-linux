@@ -253,7 +253,7 @@ mod tests {
     static CFG: LazyLock<CompiledConfig> = LazyLock::new(crate::config::test_config);
 
     fn proc(name: &str, rss_kb: u64, swap_kb: u64) -> Process {
-        Process { pid: Pid(1000), name: name.to_string(), exe_basename: None, rss_kb: Kb(rss_kb), swap_kb: Kb(swap_kb), oom_score: 0, cgroup_path: None, cpu_pct: 0.0, majflt: 0 }
+        Process { pid: Pid(1000), name: name.to_string(), exe_basename: None, rss_kb: Kb(rss_kb), swap_kb: Kb(swap_kb), oom_score: 0, cgroup_path: None, cpu_pct: 0.0, majflt: 0, cmdline: String::new() }
     }
 
     #[test]

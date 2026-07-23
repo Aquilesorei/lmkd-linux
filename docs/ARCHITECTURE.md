@@ -632,6 +632,63 @@ frozen victims:
 
 ---
 
+## 8.10 Process leak guard — process-family fork/leak detector (`leak_guard.rs`, evictor thread)
+
+Where spike mode tracks one PID's RSS oscillation, `leak_guard` tracks a
+*process family*: a group of live processes sharing the exact same
+`/proc/PID/cmdline`, grouped this way instead of by `exe_basename` because
+basename alone is too coarse (every python-based daemon on the box would
+collapse into one bucket). The failure mode it catches: a supervisor that
+forks a fresh worker instead of reusing one persistent connection, and never
+reaps the old ones — count only ever grows, never shrinks.
+
+Every evictor cycle, before the Normal-pressure `continue` (same placement
+rationale as spike mode — this must catch the leak *before* pressure ever
+builds, not after): candidates are filtered to exclude priority ≤19 and
+`[[protect]]`-matched processes (never candidates, same hard rule as
+`plan()`), grouped by cmdline, and any group at or above `min_group_count`
+gets a count sample pushed into a rolling `window_sec` window. A group is
+flagged "leaking" once four things are simultaneously true: enough samples
+collected (`min_samples`), the count has never decreased within the window,
+it has grown by at least `growth_over_window` since the window's oldest
+sample, and total group RSS clears `min_group_rss_kb`. A shrink anywhere in
+the window clears the flag — this is what protects legitimately elastic
+multi-process apps (browsers, IDE worker pools) that grow *and* shrink on
+their own, as opposed to a leak that only ever grows.
+
+On a leaking group, all members except the `keep_newest` highest-PID
+instances (Linux allocates PIDs monotonically within a session, so highest
+PID ≈ most recently spawned — this avoids a real `/proc/PID/stat` read
+inside otherwise-pure decision logic, matching how spike mode's own
+`update()` stays free of I/O) get `SIGTERM`'d via `killer::sigterm`, and the
+group enters a `cooldown_sec` cooldown so the async terminate doesn't cause
+a redundant re-fire before the kill visibly lands.
+
+### Configuration (`[process_leak_guard]` in `priorities.toml`)
+
+```toml
+[process_leak_guard]
+enabled              = false     # off by default
+exclude              = []        # name/exe_basename regexes — never tracked at all
+window_sec           = 600       # rolling count-growth window
+min_group_count      = 8         # floor before a group is even tracked
+min_group_rss_kb     = 256000    # 250 MB combined — floor so tiny groups never trigger
+growth_over_window   = 5         # must grow by at least this many instances within window_sec
+min_samples          = 4         # observations required before a verdict
+keep_newest          = 1         # spare this many most-recently-spawned instances
+cooldown_sec         = 180       # wait this long after acting before re-evaluating the group
+```
+
+### `mgctl leak-status`
+
+```
+$ mgctl leak-status
+OK tracked process groups:
+  name=chroma-mcp             count=42   total_rss=6120MB leaking=true
+```
+
+---
+
 ## 9. Privilege model (summary)
 
 Full treatment in [`PRIVILEGE_DESIGN.md`](PRIVILEGE_DESIGN.md). The core

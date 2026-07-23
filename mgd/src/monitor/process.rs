@@ -22,6 +22,10 @@ pub struct Process {
     /// CPU usage percent over the last sample interval (0.0 on first observation).
     pub cpu_pct: f32,
     pub majflt: u64,
+    /// Joined /proc/PID/cmdline (NUL→space, trimmed), "" if unreadable. Used by
+    /// leak_guard to group process families by exact invocation rather than by
+    /// exe_basename alone (which collapses unrelated same-interpreter processes).
+    pub cmdline: String,
 }
 
 /// pid → (total_ticks, unix_timestamp_secs) from previous list_processes() call.
@@ -92,7 +96,18 @@ fn read_process(pid: Pid, path: &Path) -> Result<Process, MgdError> {
     let (ticks, majflt) = mgd_common::process::read_proc_stat(pid.0);
     let cpu_pct = compute_cpu_pct(pid, ticks);
 
-    Ok(Process { pid, name, exe_basename, rss_kb, swap_kb, oom_score, cgroup_path, cpu_pct, majflt })
+    let cmdline = fs::read(path.join("cmdline"))
+        .map(|bytes| {
+            bytes
+                .split(|&b| b == 0)
+                .filter(|s| !s.is_empty())
+                .map(|s| String::from_utf8_lossy(s).into_owned())
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .unwrap_or_default();
+
+    Ok(Process { pid, name, exe_basename, rss_kb, swap_kb, oom_score, cgroup_path, cpu_pct, majflt, cmdline })
 }
 
 

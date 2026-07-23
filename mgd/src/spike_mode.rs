@@ -496,6 +496,7 @@ fn make_process(pid: u32, name: &str, rss_kb: u64, cpu_pct: f32, majflt: u64) ->
         cgroup_path: Some(format!("/user.slice/app-{pid}.scope")),
         cpu_pct,
         majflt,
+        cmdline: String::new(),
     }
 }
 

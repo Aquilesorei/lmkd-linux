@@ -291,6 +291,7 @@ pub fn run(
     throttle_snapshot: Arc<Mutex<HashMap<String, crate::throttle::ThrottledState>>>,
     event_log: crate::events::EventLog,
     spike_snapshot: Arc<Mutex<crate::spike_mode::SpikeSnapshot>>,
+    leak_snapshot: Arc<Mutex<crate::leak_guard::LeakSnapshot>>,
 ) {
     // RT priority for this thread only. Called here (not in main) so the
     // IPC/recovery/maintenance threads don't inherit SCHED_RR — maintenance
@@ -331,6 +332,7 @@ pub fn run(
     let mut sustained_emergency_start: Option<std::time::Instant> = None;
     let mut hibernate_triggered = false;
     let mut spike_tracker = crate::spike_mode::SpikeTracker::new();
+    let mut leak_tracker = crate::leak_guard::LeakTracker::new();
 
     loop {
         if crate::should_shutdown() {
@@ -571,6 +573,11 @@ pub fn run(
 
         // ── Spike mode: runs every cycle, even at Normal PSI ─────────────────
         run_spike_cycle(&cfg, &mut spike_tracker, &frozen, &log, meminfo.available_kb, &spike_snapshot);
+
+        // ── Leak guard: runs every cycle too, before the Normal-continue —
+        // the whole point is catching a runaway process family before pressure
+        // ever builds, not after. ─────────────────────────────────────────────
+        run_leak_guard_cycle(&cfg, &mut leak_tracker, &log, &event_log, &leak_snapshot);
 
         if effective_level == PressureLevel::Normal {
             continue;
@@ -844,6 +851,40 @@ fn run_spike_cycle(
         }
     }
     *spike_snapshot.lock().unwrap() = spike_tracker.snapshot();
+}
+
+/// Leak-guard cycle: filter out critical/protected processes (never candidates,
+/// same hard rule as `plan()`), feed the remainder to the tracker, and SIGTERM
+/// anything it flags. Runs every cycle, even at Normal PSI — see the call site
+/// comment in `run()`.
+fn run_leak_guard_cycle(
+    cfg: &CompiledConfig,
+    leak_tracker: &mut crate::leak_guard::LeakTracker,
+    log: &Logger,
+    event_log: &crate::events::EventLog,
+    leak_snapshot: &Arc<Mutex<crate::leak_guard::LeakSnapshot>>,
+) {
+    if !cfg.leak_guard_enabled {
+        *leak_snapshot.lock().unwrap() = leak_tracker.snapshot();
+        return;
+    }
+
+    let procs = monitor::process::list_processes();
+    let candidates: Vec<Process> = procs.into_iter()
+        .filter(|p| get_priority(&p.name, p.exe_basename.as_deref(), cfg) > 19)
+        .filter(|p| !cfg.is_protected(&p.name))
+        .collect();
+
+    let decisions = leak_tracker.update(&candidates, &crate::leak_guard::Params::from_config(cfg));
+    for decision in decisions {
+        let crate::leak_guard::LeakDecision::TerminateStale { pid, name, group } = decision;
+        std::thread::spawn(move || { crate::executor::killer::sigterm(pid); });
+        let detail = format!("leaked process family '{group}' — stale instance reaped");
+        mgd_common::sync_print!("[leak_guard] Terminating {} (PID {}): {}", name, pid, detail);
+        log.log(LogAction::LeakGuardKill, pid, &name, 0.0, &detail);
+        crate::events::push(event_log, LogAction::LeakGuardKill, pid, &name, &detail);
+    }
+    *leak_snapshot.lock().unwrap() = leak_tracker.snapshot();
 }
 
 /// Execute the planned decisions. Returns the number of synchronous destructive
@@ -1474,6 +1515,7 @@ mod tests {
             cgroup_path: None,
             cpu_pct: 0.0,
             majflt: 0,
+            cmdline: String::new(),
         }
     }
 

@@ -558,3 +558,20 @@ max_victim_freeze_sec  = 0         # 0 = no limit on victim freeze duration
 # Processes matching these patterns are never CPU-throttled, even at Elevated+ pressure.
 # Protects build workers from cpu.weight=1 suppression during compilation.
 exclude = ["^(rustc|cc|cc1|ld|lld|cargo|make|cmake|ninja|gcc|g\\+\\+|clang|clang\\+\\+|javac|kotlinc)$"]
+
+[process_leak_guard]
+# Detects a process family (grouped by exact command line, not just name)
+# whose live-instance count only ever grows and is never reaped — e.g. a
+# supervisor that forks a fresh worker instead of reusing one persistent
+# connection. Disabled by default; see `mgctl leak-status`.
+enabled = false
+# exclude: never track — safety valve for legitimately elastic multi-process
+# apps (browsers, IDE worker pools) that grow AND shrink on their own.
+# exclude = ["^(firefox|chrome|chromium|electron)$"]
+window_sec          = 600     # rolling window for the count-growth check
+min_group_count     = 8       # a family must have at least this many live instances before it's even tracked
+min_group_rss_kb    = 256000  # 250 MB combined — floor so tiny groups never trigger
+growth_over_window  = 5       # must grow by at least this many instances within window_sec
+min_samples         = 4       # observations required before a verdict
+keep_newest         = 1       # spare this many most-recently-spawned instances (assumed to be in active use)
+cooldown_sec        = 180     # after acting on a group, wait this long before re-evaluating it
