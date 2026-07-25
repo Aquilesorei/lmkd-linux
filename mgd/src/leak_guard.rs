@@ -115,9 +115,6 @@ impl<'a> Params<'a> {
     }
 }
 
-/// Grouping key: exact joined cmdline, or a name-scoped fallback for
-/// processes whose cmdline was unreadable (rare — permission race, kernel
-/// thread slipping past the user-slice filter).
 fn group_key(proc: &Process) -> String {
     if proc.cmdline.is_empty() {
         format!("noargs:{}", proc.name)
@@ -127,14 +124,7 @@ fn group_key(proc: &Process) -> String {
 }
 
 impl LeakTracker {
-    /// Step 1: group live procs by cmdline signature (`p.exclude` applied per
-    /// group via its first member). Step 2: for groups at/above
-    /// `min_group_count`, push a count sample, evict samples older than
-    /// `window_sec`, and evaluate the never-shrinks-and-keeps-growing signal.
-    /// Step 3: drop tracking state for any group that fell back below the
-    /// floor or vanished entirely. Step 4: for a leaking group not in
-    /// cooldown, emit `TerminateStale` for every member except the
-    /// `keep_newest` most recently started, and arm the cooldown.
+
     pub(crate) fn update(&mut self, procs: &[Process], p: &Params) -> Vec<LeakDecision> {
         let now = Instant::now();
 
@@ -358,9 +348,7 @@ mod tests {
         assert!(t.snapshot().groups.is_empty());
     }
 
-    // T7 ─ two processes sharing exe_basename but different full cmdlines land
-    // in separate groups (the exact chroma-mcp-vs-firewalld-python problem
-    // this design solves — grouping by exe_basename alone would merge them).
+
     #[test]
     fn t7_different_cmdline_same_exe_not_grouped() {
         let mut t = LeakTracker::new();
@@ -411,12 +399,7 @@ mod tests {
         t.update(&procs, &p);
         std::thread::sleep(Duration::from_millis(5));
         let d = t.update(&procs, &p);
-        // With window_sec=0 the window can never accumulate >1 sample, so
-        // min_samples can never be satisfied — never flagged.
         assert!(d.is_empty());
     }
 
-    // T10 ─ protected/critical filtering is the caller's job (see evictor.rs),
-    // not this module's — documented via the module doc comment; nothing to
-    // assert here beyond update() not special-casing priority at all.
 }

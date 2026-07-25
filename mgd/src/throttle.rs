@@ -50,26 +50,36 @@ impl ThrottleManager {
             self.tracker.clear();
             return;
         }
-        let mut cgroup_groups: HashMap<String, Vec<&Process>> = HashMap::new();
+        let mut cgroup_groups: HashMap<&str, Vec<&Process>> = HashMap::new();
         for p in plan_procs {
-            if let Some(path) = p.cgroup_path.clone() {
+            if let Some(path) = p.cgroup_path.as_deref() {
                 cgroup_groups.entry(path).or_default().push(p);
             }
         }
 
         let foreground_cgroup = find_foreground_cgroup(plan_procs, active_pid);
 
-        let active_cgroups: HashSet<&String> = cgroup_groups.keys().collect();
-        self.tracker.retain(|p, _| active_cgroups.contains(p));
-        self.states.retain(|p, _| active_cgroups.contains(p));
+        let active_cgroups: HashSet<&str> = cgroup_groups.keys().copied().collect();
+        self.tracker.retain(|p, _| active_cgroups.contains(p.as_str()));
+        self.states.retain(|p, _| active_cgroups.contains(p.as_str()));
 
-        for (cgroup_path, processes) in &cgroup_groups {
-            let current = self.states.get(cgroup_path).copied().unwrap_or(ThrottledState::None);
+        use std::collections::hash_map::Entry;
 
-            if Some(cgroup_path) == foreground_cgroup.as_ref() {
+        for (&cgroup_path, processes) in &cgroup_groups {
+            // One hash lookup for the whole iteration: peek `current` without
+            // inserting, consume `entry` to write only on the branch that
+            // actually needs to (avoids get()+insert() double-hashing while
+            // never populating `self.states` for cgroups that stay untouched).
+            let entry = self.states.entry(cgroup_path.to_owned());
+            let current = match &entry {
+                Entry::Occupied(o) => *o.get(),
+                Entry::Vacant(_) => ThrottledState::None,
+            };
+
+            if Some(cgroup_path) == foreground_cgroup {
                 if current != ThrottledState::None {
                     restore_cgroup_cpu(cgroup_path);
-                    self.states.insert(cgroup_path.clone(), ThrottledState::None);
+                    set_entry(entry, ThrottledState::None);
                     mgd_common::sync_print!(
                         "[throttle] Restored foreground cgroup {} to normal CPU shares",
                         cgroup_path
@@ -80,19 +90,19 @@ impl ThrottleManager {
             }
 
             let mut min_priority = 100u8;
-            let mut debug_name = String::new();
+            let mut debug_name: &str = "";
             for p in processes {
                 let prio = crate::engine::decision::get_priority(&p.name, p.exe_basename.as_deref(), cfg);
                 if prio < min_priority {
                     min_priority = prio;
-                    debug_name = p.name.clone();
+                    debug_name = &p.name;
                 }
             }
 
             if min_priority < 60 {
                 if current != ThrottledState::None {
                     restore_cgroup_cpu(cgroup_path);
-                    self.states.insert(cgroup_path.clone(), ThrottledState::None);
+                    set_entry(entry, ThrottledState::None);
                     mgd_common::sync_print!(
                         "[throttle] Restored background cgroup {} to normal CPU shares (priority < 60)",
                         cgroup_path
@@ -109,14 +119,14 @@ impl ThrottleManager {
             if excluded {
                 if current != ThrottledState::None {
                     restore_cgroup_cpu(cgroup_path);
-                    self.states.insert(cgroup_path.clone(), ThrottledState::None);
+                    set_entry(entry, ThrottledState::None);
                 }
                 self.tracker.remove(cgroup_path);
                 continue;
             }
 
             let background_duration = self.tracker
-                .entry(cgroup_path.clone())
+                .entry(cgroup_path.to_owned())
                 .or_insert_with(std::time::Instant::now)
                 .elapsed()
                 .as_secs();
@@ -166,7 +176,7 @@ impl ThrottleManager {
                         }
                     }
                 }
-                self.states.insert(cgroup_path.clone(), target);
+                set_entry(entry, target);
             }
         }
     }
@@ -187,6 +197,15 @@ pub(crate) fn cgroup_sysfs_path(cgroup_path: &str, attr: &str) -> std::path::Pat
     std::path::Path::new("/sys/fs/cgroup")
         .join(cgroup_path.trim_start_matches('/'))
         .join(attr)
+}
+
+/// Write `value` into an already-hashed `Entry` — no second hash computation
+/// whether it was vacant or occupied.
+fn set_entry(entry: std::collections::hash_map::Entry<String, ThrottledState>, value: ThrottledState) {
+    match entry {
+        std::collections::hash_map::Entry::Occupied(mut o) => { o.insert(value); }
+        std::collections::hash_map::Entry::Vacant(v) => { v.insert(value); }
+    }
 }
 
 fn restore_cgroup_cpu(path: &str) {
@@ -251,23 +270,23 @@ impl MemCapManager {
 
         let foreground_cgroup = find_foreground_cgroup(plan_procs, active_pid);
 
-        let mut cgroup_groups: HashMap<String, (u8, Kb)> = HashMap::new();
+        let mut cgroup_groups: HashMap<&str, (u8, Kb)> = HashMap::new();
         for p in plan_procs {
-            if let Some(path) = p.cgroup_path.as_ref() {
+            if let Some(path) = p.cgroup_path.as_deref() {
                 let prio = crate::engine::decision::get_priority(&p.name, p.exe_basename.as_deref(), cfg);
-                let entry = cgroup_groups.entry(path.clone()).or_insert((100u8, Kb(0)));
+                let entry = cgroup_groups.entry(path).or_insert((100u8, Kb(0)));
                 entry.0 = entry.0.min(prio);
                 entry.1 = entry.1.saturating_add(p.rss_kb);
             }
         }
 
-        let active_paths: std::collections::HashSet<&String> = cgroup_groups.keys().collect();
-        self.tracker.retain(|p, _| active_paths.contains(p));
+        let active_paths: std::collections::HashSet<&str> = cgroup_groups.keys().copied().collect();
+        self.tracker.retain(|p, _| active_paths.contains(p.as_str()));
         // Don't evict capped entries for dead paths — restore handles cleanup.
 
-        for (cgroup_path, (min_priority, total_rss)) in &cgroup_groups {
+        for (&cgroup_path, (min_priority, total_rss)) in &cgroup_groups {
             // Never cap foreground or system/critical tier
-            if Some(cgroup_path) == foreground_cgroup.as_ref() || *min_priority < 60 {
+            if Some(cgroup_path) == foreground_cgroup || *min_priority < 60 {
                 if self.capped.remove(cgroup_path).is_some() {
                     restore_cgroup_memory(cgroup_path);
                 }
@@ -282,7 +301,7 @@ impl MemCapManager {
 
             // 10s debounce: don't cap a process that just moved to background
             let bg_secs = self.tracker
-                .entry(cgroup_path.clone())
+                .entry(cgroup_path.to_owned())
                 .or_insert_with(std::time::Instant::now)
                 .elapsed()
                 .as_secs();
@@ -293,7 +312,7 @@ impl MemCapManager {
             // Cap = current RSS + 512 MB headroom (bytes)
             let cap_bytes = (*total_rss + Kb(512 * 1024)).bytes();
             if write_memory_max(cgroup_path, cap_bytes).is_ok() {
-                self.capped.insert(cgroup_path.clone(), cap_bytes);
+                self.capped.insert(cgroup_path.to_owned(), cap_bytes);
                 mgd_common::sync_print!(
                     "[memcap] Set memory.max={} MB for background cgroup {}",
                     cap_bytes / 1024 / 1024, cgroup_path
@@ -329,11 +348,11 @@ fn write_memory_max(cgroup_path: &str, bytes: u64) -> Result<(), std::io::Error>
     Err(std::io::Error::new(std::io::ErrorKind::NotFound, "memory.max not found"))
 }
 
-fn find_foreground_cgroup(plan_procs: &[&Process], active_pid: Option<Pid>) -> Option<String> {
+fn find_foreground_cgroup<'a>(plan_procs: &'a [&Process], active_pid: Option<Pid>) -> Option<&'a str> {
     active_pid.and_then(|apid| {
         plan_procs.iter()
             .find(|p| p.pid == apid)
-            .and_then(|p| p.cgroup_path.clone())
+            .and_then(|p| p.cgroup_path.as_deref())
     })
 }
 
@@ -374,7 +393,7 @@ mod tests {
         let b = make_proc(200, Some("user.slice/app-B.slice"));
         let procs = [&a, &b];
         assert_eq!(
-            find_foreground_cgroup(&procs, Some(Pid(100))).as_deref(),
+            find_foreground_cgroup(&procs, Some(Pid(100))),
             Some("user.slice/app-A.slice")
         );
     }

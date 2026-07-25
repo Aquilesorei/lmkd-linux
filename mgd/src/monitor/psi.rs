@@ -180,7 +180,7 @@ pub struct MemoryPressure {
 
 /// Variants are declared in ascending severity order, so the derived
 /// `PartialOrd`/`Ord` lets callers gate on `level >= PressureLevel::Elevated`.
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone)]
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
 pub enum PressureLevel {
     Normal,
     Elevated,
@@ -200,6 +200,20 @@ impl PressureLevel {
             "critical" => Some(PressureLevel::Critical),
             "emergency" => Some(PressureLevel::Emergency),
             _ => None,
+        }
+    }
+}
+
+impl PressureLevel {
+    /// Canonical unpadded name, for wire protocols/comparisons — distinct from
+    /// `Display`'s fixed-width padding (which exists only for aligned log lines).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PressureLevel::Normal    => "Normal",
+            PressureLevel::Elevated  => "Elevated",
+            PressureLevel::High      => "High",
+            PressureLevel::Critical  => "Critical",
+            PressureLevel::Emergency => "Emergency",
         }
     }
 }

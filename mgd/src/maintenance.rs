@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use mgd_common::logger::{LogAction, Logger};
 use mgd_common::types::Pid;
-use crate::engine::calibrate::{render_suggestion, Calibrator};
+pub(crate) use crate::engine::calibrate::{render_suggestion, Calibrator};
 use crate::executor::registry::{CheckpointRegistry, FrozenRegistry};
 use crate::monitor;
 use crate::monitor::psi::PressureLevel;
@@ -55,7 +55,7 @@ pub fn run(
     let mut auto_kill_last_active: HashMap<(Pid, u64), Instant> = HashMap::new();
 
     loop {
-        if crate::should_shutdown() {
+        if crate::lifecycle::should_shutdown() {
             return;
         }
 

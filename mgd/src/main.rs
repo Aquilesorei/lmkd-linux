@@ -11,25 +11,13 @@ mod plugin_server;
 mod throttle;
 mod spike_mode;
 mod leak_guard;
+mod lifecycle;
+mod memlock;
+mod init;
 
-use std::sync::{Arc, Condvar, Mutex};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread;
-use executor::registry::{FrozenRegistry, CheckpointRegistry};
-use mgd_common::logger::Logger;
-use mgd_common::output::locked_print;
 use mgd_common::types::Pid;
-
-static SHUTDOWN:      AtomicBool = AtomicBool::new(false);
-static RELOAD_CONFIG: AtomicBool = AtomicBool::new(false);
-
-pub fn should_shutdown() -> bool {
-    SHUTDOWN.load(Ordering::Relaxed)
-}
-
-pub fn should_reload() -> bool {
-    RELOAD_CONFIG.swap(false, Ordering::Relaxed)
-}
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -38,91 +26,46 @@ fn main() {
         return;
     }
 
-    // Scheduler elevation happens inside the evictor thread (evictor::run) so
-    // only the eviction hot path runs SCHED_RR; the IPC/recovery/maintenance
-    // threads stay at normal priority. mlockall is process-wide, so it runs here.
-    try_lock_memory();
-
-    let frozen = Arc::new(Mutex::new(FrozenRegistry::load()));
-    let checkpointed = Arc::new(Mutex::new(CheckpointRegistry::load()));
-    spike_mode::SpikeTracker::load_and_unfreeze_victims();
-
-    cleanup_orphaned_snapshots(&checkpointed);
-    print_startup_banner();
-
-    plugin_server::init_plugins();
-
-    // Passive calibration aggregates survive restarts (suggestions need days
-    // of observation). Maintenance flushes periodically; main flushes at exit.
-    let calibrator = Arc::new(Mutex::new(maintenance::load_calibrator()));
-
-    let log_keep = config::get().log_keep;
-    let logger = Arc::new(Logger::new(log_keep));
-
-    // Signal handlers: async-signal-safe atomic stores only.
-    unsafe {
-        libc::signal(libc::SIGINT,  handle_sigterm as *const () as libc::sighandler_t);
-        libc::signal(libc::SIGTERM, handle_sigterm as *const () as libc::sighandler_t);
-        libc::signal(libc::SIGHUP,  handle_sighup  as *const () as libc::sighandler_t);
-    }
-
-
-    let recovery_wake: Arc<(Mutex<bool>, Condvar)> = Arc::new((Mutex::new(false), Condvar::new()));
-    let reclaim_wake: Arc<(Mutex<bool>, Condvar)> = Arc::new((Mutex::new(false), Condvar::new()));
-
-    // Throttle state snapshot: written by evictor, read by IPC for `mgctl list`.
-    let throttle_snapshot: Arc<Mutex<std::collections::HashMap<String, throttle::ThrottledState>>> =
-        Arc::new(Mutex::new(std::collections::HashMap::new()));
-
-    // Ring buffer of recent daemon actions (freeze/kill/checkpoint), readable via `mgctl events`.
-    let event_log = events::new_log();
-
-    // Spike mode snapshot: written by evictor each cycle, read by IPC for `mgctl spike-status`.
-    let spike_snapshot: Arc<Mutex<spike_mode::SpikeSnapshot>> =
-        Arc::new(Mutex::new(spike_mode::SpikeSnapshot { active: vec![], victims: vec![] }));
-
-    // Leak-guard snapshot: written by evictor each cycle, read by IPC for `mgctl leak-status`.
-    let leak_snapshot: Arc<Mutex<leak_guard::LeakSnapshot>> =
-        Arc::new(Mutex::new(leak_guard::LeakSnapshot { groups: vec![] }));
+    let state = init::initialize();
 
     let pressure_responder = {
-        let f = Arc::clone(&frozen);
-        let c = Arc::clone(&checkpointed);
-        let l = Arc::clone(&logger);
-        let w = Arc::clone(&recovery_wake);
-        let rw = Arc::clone(&reclaim_wake);
-        let cal = Arc::clone(&calibrator);
-        let ts = Arc::clone(&throttle_snapshot);
-        let el = Arc::clone(&event_log);
-        let ss = Arc::clone(&spike_snapshot);
-        let ls = Arc::clone(&leak_snapshot);
+        let f = Arc::clone(&state.frozen);
+        let c = Arc::clone(&state.checkpointed);
+        let l = Arc::clone(&state.logger);
+        let w = Arc::clone(&state.recovery_wake);
+        let rw = Arc::clone(&state.reclaim_wake);
+        let cal = Arc::clone(&state.calibrator);
+        let ts = Arc::clone(&state.throttle_snapshot);
+        let el = Arc::clone(&state.event_log);
+        let ss = Arc::clone(&state.spike_snapshot);
+        let ls = Arc::clone(&state.leak_snapshot);
         thread::spawn(move || evictor::run(f, c, l, w, rw, cal, ts, el, ss, ls))
     };
 
     let recovery_manager = {
-        let f = Arc::clone(&frozen);
-        let c = Arc::clone(&checkpointed);
-        let l = Arc::clone(&logger);
-        let w = Arc::clone(&recovery_wake);
+        let f = Arc::clone(&state.frozen);
+        let c = Arc::clone(&state.checkpointed);
+        let l = Arc::clone(&state.logger);
+        let w = Arc::clone(&state.recovery_wake);
         thread::spawn(move || recovery::run(f, c, l, w))
     };
 
     let ipc_server = {
-        let f = Arc::clone(&frozen);
-        let c = Arc::clone(&checkpointed);
-        let ts = Arc::clone(&throttle_snapshot);
-        let el = Arc::clone(&event_log);
-        let ss = Arc::clone(&spike_snapshot);
-        let ls = Arc::clone(&leak_snapshot);
+        let f = Arc::clone(&state.frozen);
+        let c = Arc::clone(&state.checkpointed);
+        let ts = Arc::clone(&state.throttle_snapshot);
+        let el = Arc::clone(&state.event_log);
+        let ss = Arc::clone(&state.spike_snapshot);
+        let ls = Arc::clone(&state.leak_snapshot);
         thread::spawn(move || ipc::run_server(f, c, ts, el, ss, ls))
     };
 
     let maintenance_manager = {
-        let l = Arc::clone(&logger);
-        let f = Arc::clone(&frozen);
-        let c = Arc::clone(&checkpointed);
-        let cal = Arc::clone(&calibrator);
-        let rw = Arc::clone(&reclaim_wake);
+        let l = Arc::clone(&state.logger);
+        let f = Arc::clone(&state.frozen);
+        let c = Arc::clone(&state.checkpointed);
+        let cal = Arc::clone(&state.calibrator);
+        let rw = Arc::clone(&state.reclaim_wake);
         thread::spawn(move || maintenance::run(l, f, c, cal, rw))
     };
 
@@ -133,15 +76,11 @@ fn main() {
 
     plugin_server::shutdown_plugins();
 
-    // Actors are done — no new freezes: safe to sweep.
-    shutdown_unfreeze(&frozen);
+    lifecycle::shutdown_unfreeze(&state.frozen);
 
-    // Persist calibration aggregates gathered since the last periodic flush.
-    maintenance::flush_calibration(&calibrator, &logger, &config::get().psi);
+    maintenance::flush_calibration(&state.calibrator, &state.logger, &config::get().psi);
 }
 
-/// Handle `mgd freeze <pid>` and `mgd unfreeze <pid>`.
-/// Returns `true` if a CLI command was handled, `false` otherwise.
 fn handle_legacy_cli(args: &[String]) -> bool {
     if args.len() < 2 {
         return false;
@@ -174,131 +113,6 @@ fn handle_legacy_cli(args: &[String]) -> bool {
         other => {
             eprintln!("mgd: unknown subcommand '{other}'\nUsage: mgd freeze <pid> | mgd unfreeze <pid>");
             true
-        }
-    }
-}
-
-fn print_startup_banner() {
-    println!("Memory Guardian v{}", env!("CARGO_PKG_VERSION"));
-    println!("  PressureResponder:  PSI epoll trigger (zero-CPU idle)");
-    println!("  RecoveryManager:    condvar sleep (wakes on freeze/checkpoint)");
-    println!("  MaintenanceManager: 60s poll (idle reaps, housekeeping)");
-    println!("  IPC socket:         {}", mgd_common::socket::socket_path().display());
-
-    match executor::checkpoint::helper_path() {
-        Some(p) => println!(
-            "  Checkpoint Helper:  {} (checkpoint enabled; checks permissions and runs criu)",
-            p.display()
-        ),
-        None => println!("  Checkpoint Helper:  not found (checkpoint disabled — will SIGKILL instead)"),
-    }
-    println!("Press Ctrl+C to stop\n");
-}
-
-/// Remove snapshot dirs not tracked in the persisted CheckpointRegistry.
-fn cleanup_orphaned_snapshots(checkpointed: &Arc<Mutex<CheckpointRegistry>>) {
-    let dir = mgd_common::util::home_dir().join(".local/share/mgd/snapshots");
-    let Ok(entries) = std::fs::read_dir(&dir) else { return };
-
-    let active_dirs: std::collections::HashSet<std::path::PathBuf> = {
-        let reg = checkpointed.lock().unwrap();
-        reg.entries_lightest_first()
-            .into_iter()
-            .map(|(_, _, path, _, _)| path)
-            .collect()
-    };
-
-    for entry in entries.flatten() {
-        if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-            let path = entry.path();
-            if !active_dirs.contains(&path)
-                && std::fs::remove_dir_all(&path).is_ok() {
-                    mgd_common::sync_print!("[startup] Removed orphaned snapshot: {:?}", path);
-                }
-        }
-    }
-}
-
-/// Unfreeze all processes still in the registry after both actors have stopped.
-fn shutdown_unfreeze(frozen: &Arc<Mutex<FrozenRegistry>>) {
-    let reg = frozen.lock().unwrap();
-    let entries: Vec<(Pid, u64)> = reg.frozen_pids().into_iter()
-        .map(|pid| (pid, reg.start_time(pid)))
-        .collect();
-    drop(reg); // release lock before I/O
-
-    if entries.is_empty() { return; }
-
-    locked_print("\n[shutdown] Unfreezing all frozen processes...");
-    for (pid, st) in &entries {
-        let r = executor::freezer::unfreeze_checked(*pid, *st);
-        if r.success {
-            mgd_common::sync_print!("  ✓ Unfroze PID {pid}");
-        } else {
-            mgd_common::sync_eprint!("  ✗ PID {pid}: {}", r.error.unwrap_or_default());
-        }
-    }
-    locked_print("[shutdown] Done.");
-}
-
-/// SIGINT / SIGTERM → graceful shutdown with unfreeze sweep
-extern "C" fn handle_sigterm(_: libc::c_int) {
-    SHUTDOWN.store(true, Ordering::Relaxed);
-}
-
-/// SIGHUP → reload config on next responder cycle
-extern "C" fn handle_sighup(_: libc::c_int) {
-    RELOAD_CONFIG.store(true, Ordering::Relaxed);
-}
-
-/// Check `CapEff` in /proc/self/status for CAP_IPC_LOCK (bit 14).
-fn has_cap_ipc_lock() -> bool {
-    let Ok(status) = std::fs::read_to_string("/proc/self/status") else { return false };
-    status.lines()
-        .find_map(|l| l.strip_prefix("CapEff:"))
-        .and_then(|hex| u64::from_str_radix(hex.trim(), 16).ok())
-        .map(|caps| caps & (1 << 14) != 0) // CAP_IPC_LOCK = 14
-        .unwrap_or(false)
-}
-
-/// Lock mgd's pages into RAM so the eviction hot path never takes a page fault
-/// while the system is already thrashing (a fault at that moment is unbounded
-/// latency). Process-wide — covers all threads.
-///
-/// MCL_FUTURE is only safe when the memlock budget is unbounded (CAP_IPC_LOCK
-/// or RLIMIT_MEMLOCK=infinity): under a finite rlimit, MCL_FUTURE makes later
-/// mmap/heap growth *fail* once the limit is hit, which would crash the daemon.
-/// So under a finite rlimit we lock current pages only. Degrades gracefully —
-/// a failure is logged and the daemon runs unlocked, per the privilege split.
-fn try_lock_memory() {
-    let unlimited = has_cap_ipc_lock() || unsafe {
-        let mut rl = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
-        libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut rl) == 0
-            && rl.rlim_cur == libc::RLIM_INFINITY
-    };
-
-    unsafe {
-        if unlimited {
-            if libc::mlockall(libc::MCL_CURRENT | libc::MCL_FUTURE) == 0 {
-                locked_print("[core] mlockall(MCL_CURRENT|MCL_FUTURE): all pages locked in RAM");
-                return;
-            }
-            mgd_common::sync_print!(
-                "[core] Warning: mlockall failed despite unlimited memlock: {}",
-                std::io::Error::last_os_error()
-            );
-        }
-        // Finite RLIMIT_MEMLOCK (no CAP_IPC_LOCK): lock current pages only.
-        if libc::mlockall(libc::MCL_CURRENT) == 0 {
-            locked_print(
-                "[core] mlockall(MCL_CURRENT): current pages locked; future allocations \
-                 unlocked (grant cap_ipc_lock on mgd for full locking — see install.sh)"
-            );
-        } else {
-            mgd_common::sync_print!(
-                "[core] Running without mlockall (RLIMIT_MEMLOCK too small, no CAP_IPC_LOCK): {}",
-                std::io::Error::last_os_error()
-            );
         }
     }
 }

@@ -26,10 +26,10 @@ pub fn run(
     let mut baseline = HealthBaseline::new();
 
     loop {
-        if crate::should_shutdown() { return; }
+        if crate::lifecycle::should_shutdown() { return; }
 
         wait_for_work(&frozen, &checkpointed, &wake);
-        if crate::should_shutdown() { return; }
+        if crate::lifecycle::should_shutdown() { return; }
 
         let pressure = match monitor::psi::read_pressure() {
             Ok(p) => p,
@@ -68,7 +68,7 @@ fn wait_for_work(
         while !*notified {
             let (guard, _) = cvar.wait_timeout(notified, Duration::from_secs(5)).unwrap();
             notified = guard;
-            if crate::should_shutdown() { return; }
+            if crate::lifecycle::should_shutdown() { return; }
         }
         *notified = false;
     }

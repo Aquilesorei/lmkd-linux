@@ -18,6 +18,14 @@ use crate::monitor::meminfo::MemInfo;
 use crate::monitor::process::Process;
 use crate::monitor::psi::PressureLevel;
 
+
+enum ReclaimOutcome {
+    Reclaimed,
+    Skipped,
+    Blocked,
+    Failed(std::io::Error),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum ControlState {
     Calm,
@@ -44,20 +52,22 @@ const SWAP_IO_LIVE_FLOOR_KBS: f64 = 1000.0;
 /// Below this raw PSI (`some_avg10`, percent) there's no active stall happening.
 const PSI_LIVE_FLOOR: f64 = 0.5;
 
-/// Map composite pressure score + trend to the target control state.
-/// A rising trend lowers the score needed to escalate.
-///
-/// Evicting/Critical/Emergency all require `p_score` past a floor that swap's
-/// max weight (0.20 of 1.0) cannot reach alone — only the Warning floor
-/// (0.15) is reachable by residual swap% by itself (once swap_used_pct >=
-/// 75%), with zero PSI/GPU/swap-I/O. Without a liveness check, a stable-but-
-/// high swap plateau pins Warning/Elevated forever, since target_state_for
-/// never returns Calm and the 12-tick Calm-recovery hysteresis never gets a
-/// chance to start counting down. Gate the Warning floor on PSI or swap I/O
-/// actually being live so a truly quiet plateau can recover. The genuinely
-/// dangerous near-full-swap case is handled separately by
-/// `apply_swap_overrides()` (forces Critical/Emergency at 95%/98% swap),
-/// independent of this function.
+/// Frozen + spike-victim PIDs (optionally + the spikes themselves) to exclude from
+/// `plan()`/candidate lists — their RSS is already accounted for or off-limits.
+fn excluded_pids(
+    frozen: &Arc<Mutex<FrozenRegistry>>,
+    spike_tracker: &crate::spike_mode::SpikeTracker,
+    include_spike_pids: bool,
+) -> HashSet<Pid> {
+    let base = frozen.lock().unwrap().frozen_pids().into_iter()
+        .chain(spike_tracker.victim_pids());
+    if include_spike_pids {
+        base.chain(spike_tracker.spike_pids()).collect()
+    } else {
+        base.collect()
+    }
+}
+
 fn target_state_for(p_score: f64, trend: f64, psi_some_avg10: f64, swap_io_kbs: f64) -> ControlState {
     if p_score >= 0.70 || (p_score >= 0.55 && trend > 0.05) {
         ControlState::Emergency
@@ -76,9 +86,7 @@ fn target_state_for(p_score: f64, trend: f64, psi_some_avg10: f64, swap_io_kbs: 
     }
 }
 
-/// Hysteresis state machine over `ControlState`. Escalation needs 2 consecutive
-/// ticks of the same target (instant on a sharp spike to Critical/Emergency);
-/// recovery needs 4–12 ticks depending on how far down the target is.
+
 struct StateMachine {
     current: ControlState,
     pending: ControlState,
@@ -250,13 +258,7 @@ pub(crate) fn feature_gates() -> FeatureGates {
     }
 }
 
-#[allow(clippy::too_many_arguments)] // one-shot thread entry point wired in main.rs; a params struct adds no clarity
-/// Elevate the *calling thread* to SCHED_RR prio 20 (falls back to nice -20).
-/// On Linux both `sched_setscheduler(0, ..)` and `setpriority(PRIO_PROCESS, 0, ..)`
-/// are per-thread, and spawned threads inherit policy — so this lives in the
-/// evictor and must only be called from inside `run()`, never before
-/// `thread::spawn` in main (that would put the blocking-I/O maintenance thread
-/// and IPC/recovery on the RT budget too).
+#[allow(clippy::too_many_arguments)]
 fn try_elevate_scheduler_priority() {
     use mgd_common::output::locked_print;
     unsafe {
@@ -293,16 +295,11 @@ pub fn run(
     spike_snapshot: Arc<Mutex<crate::spike_mode::SpikeSnapshot>>,
     leak_snapshot: Arc<Mutex<crate::leak_guard::LeakSnapshot>>,
 ) {
-    // RT priority for this thread only. Called here (not in main) so the
-    // IPC/recovery/maintenance threads don't inherit SCHED_RR — maintenance
-    // does blocking disk I/O and must not burn RT budget.
+
     try_elevate_scheduler_priority();
 
     mgd_common::sync_print!("[responder] PSI source: {}", monitor::psi::pressure_source());
 
-    // Try subprocess trigger first (mgd-psi-trigger with cap_perfmon+ep).
-    // Falls back to direct PsiTrigger (works without cap on older kernels),
-    // then 5s polling.
     let mut psi_elevated_pct = crate::config::get().psi.elevated_pct;
     let mut psi_subprocess = monitor::psi::PsiSubprocess::new(psi_elevated_pct);
     let mut psi_trigger = if psi_subprocess.is_none() {
@@ -335,7 +332,7 @@ pub fn run(
     let mut leak_tracker = crate::leak_guard::LeakTracker::new();
 
     loop {
-        if crate::should_shutdown() {
+        if crate::lifecycle::should_shutdown() {
             throttle.restore_all();
             memcap.restore_all();
             for cg in spike_tracker.throttled_cgroup_paths() {
@@ -350,17 +347,15 @@ pub fn run(
             return;
         }
 
-        if crate::should_reload() {
+        if crate::lifecycle::should_reload() {
             crate::config::reload();
             crate::plugin_server::broadcast_config_reload();
         }
 
-        // One config snapshot per cycle (cheap Arc clone, no lock held);
-        // a reload swaps the global and is picked up here next iteration.
+  
         let cfg = crate::config::get();
 
-        // Respawn PSI subprocess if elevated_pct changed on reload (new threshold
-        // needs a fresh fd — the kernel trigger can't be re-armed on an existing fd).
+        
         if (cfg.psi.elevated_pct - psi_elevated_pct).abs() > 0.001 {
             psi_elevated_pct = cfg.psi.elevated_pct;
             psi_subprocess = monitor::psi::PsiSubprocess::new(psi_elevated_pct);
@@ -369,9 +364,6 @@ pub fn run(
             }
         }
 
-        // Zero-CPU idle: if pressure was Normal last cycle, block on the kernel
-        // PSI trigger instead of doing expensive /proc/pid walks.
-        // Timeout 5s just to re-check shutdown flags and maintain the loop pulse.
         if last_level == PressureLevel::Normal {
             let helper_died = if let Some(sub) = &psi_subprocess {
                 match sub.wait(5000) {
@@ -397,9 +389,8 @@ pub fn run(
                 false
             };
             if helper_died {
-                // Helper death during shutdown is systemd killing the cgroup,
-                // not a crash — let the loop-top guard handle teardown.
-                if crate::should_shutdown() {
+               
+                if crate::lifecycle::should_shutdown() {
                     continue;
                 }
                 mgd_common::sync_print!("[psi] mgd-psi-trigger exited — attempting respawn");
@@ -438,12 +429,10 @@ pub fn run(
         let mut effective_level = state_machine.current.to_pressure_level();
 
         let swap_used_pct = meminfo.swap_used_pct();
-        // swap_exhausted (≥95%) is forwarded to plan() as a per-process Kill escalator for
-        // prio ≥80 (expendable tier). Distinct from apply_swap_overrides() which raises the
-        // *pressure level* — both run every cycle.
+  
         let swap_exhausted = meminfo.swap_total_kb.0 > 0 && swap_used_pct >= 95.0;
 
-        let prev_effective = effective_level.clone();
+        let prev_effective = effective_level;
         let prev_sustained = sustained_critical_swap_start;
         (effective_level, sustained_critical_swap_start) = apply_swap_overrides(
             effective_level,
@@ -473,7 +462,7 @@ pub fn run(
             }
         }
 
-        last_level = effective_level.clone();
+        last_level = effective_level;
 
         // Hibernate last-resort: if Emergency sustained beyond threshold (disabled by default)
         if effective_level >= PressureLevel::Emergency {
@@ -491,10 +480,6 @@ pub fn run(
             sustained_emergency_start = None;
         }
 
-        // Passive calibration (Phase D): feed the raw PSI sample before any
-        // action this cycle. Samples taken while interventions are in flight
-        // are excluded inside observe() — the daemon must not calibrate off
-        // pressure it is already treating.
         {
             let intervention = frozen.lock().unwrap().count() > 0
                 || checkpointed.lock().unwrap().count() > 0;
@@ -505,6 +490,9 @@ pub fn run(
                 5,
             );
         }
+
+  
+        let mut procs = monitor::process::list_processes();
 
         // Background CPU Throttling and Idle cgroup reclaim manager
         let active_pid = crate::plugin_server::get_active_foreground_pid();
@@ -541,72 +529,49 @@ pub fn run(
                     }
                 }
 
-            let procs = monitor::process::list_processes();
-            let frozen_set: HashSet<Pid> = frozen.lock().unwrap().frozen_pids().into_iter()
-                .chain(spike_tracker.victim_pids())
-                .collect();
+            let frozen_set = excluded_pids(&frozen, &spike_tracker, false);
             let plan_procs: Vec<&Process> = procs.iter()
                 .filter(|p| !frozen_set.contains(&p.pid))
                 .collect();
 
-            // Update CPU throttling (tiered, debounced) — only at Elevated+ pressure.
-            // psi_some_avg10 lets ThrottleManager force-release a cgroup that's been
-            // throttled past cfg.throttle_max_duration_sec with no active stall, even
-            // if residual swap% alone is still keeping effective_level at Elevated.
             throttle.update(&plan_procs, active_pid, effective_level >= PressureLevel::Elevated, pressure.some_avg10, &cfg);
             *throttle_snapshot.lock().unwrap() = throttle.snapshot();
 
-            // Cap memory.max on expendable background cgroups at High+ pressure
             memcap.update(&plan_procs, active_pid, &effective_level, &cfg);
 
-            // Idle cgroup reclaim: only runs at Normal/Calm pressure
             if effective_level == PressureLevel::Normal
                 && cfg.idle_reclaim_enabled {
                     check_idle_process_reclaim(&cfg, &plan_procs, active_pid, &mut idle_reclaim_pid_tracker, &mut idle_freeze_pid_tracker, &frozen, &log);
                 }
         }
 
-        // Restore memory caps when pressure drops below High
         if effective_level < PressureLevel::High {
             memcap.restore_all();
         }
 
-        // ── Spike mode: runs every cycle, even at Normal PSI ─────────────────
-        run_spike_cycle(&cfg, &mut spike_tracker, &frozen, &log, meminfo.available_kb, &spike_snapshot);
+        
+        run_spike_cycle(&cfg, &mut spike_tracker, &frozen, &log, meminfo.available_kb, &spike_snapshot, &procs);
 
-        // ── Leak guard: runs every cycle too, before the Normal-continue —
-        // the whole point is catching a runaway process family before pressure
-        // ever builds, not after. ─────────────────────────────────────────────
-        run_leak_guard_cycle(&cfg, &mut leak_tracker, &log, &event_log, &leak_snapshot);
+
+        run_leak_guard_cycle(&cfg, &mut leak_tracker, &log, &event_log, &leak_snapshot, &procs);
 
         if effective_level == PressureLevel::Normal {
             continue;
         }
 
-        let mut procs = monitor::process::list_processes();
         procs.sort_by_key(|p| std::cmp::Reverse(p.rss_kb));
 
         print_status(&pressure, &effective_level, &procs, &meminfo, &frozen, &cfg);
 
-        crate::plugin_server::broadcast_pressure(&effective_level.to_string());
+        crate::plugin_server::broadcast_pressure(effective_level.as_str());
 
-        // System pre-actions run before plan() so their freed RAM shrinks the
-        // deficit. zram compact (cheaper) first, then cache drop.
         compact_zram(&effective_level, &log, &cfg);
 
-        // Cleanup expired recently killed cgroups (cooldown = 45s)
         let now_inst = std::time::Instant::now();
         recently_killed_cgroups.retain(|_, time| now_inst.duration_since(*time).as_secs() < 45);
 
-        // Exclude frozen PIDs, spike PIDs (active build/IDE processes), and spike victims
-        // from plan() candidates. Spike processes are protected while tracked — killing
-        // them mid-build corrupts the output and defeats the whole point of spike mode.
-        let spike_pids_active = spike_tracker.spike_pids();
-        let spike_victim_pids = spike_tracker.victim_pids();
-        let frozen_set: HashSet<Pid> = frozen.lock().unwrap().frozen_pids().into_iter()
-            .chain(spike_pids_active)
-            .chain(spike_victim_pids)
-            .collect();
+        
+        let frozen_set = excluded_pids(&frozen, &spike_tracker, true);
         let plan_procs: Vec<&Process> = procs.iter()
             .filter(|p| !frozen_set.contains(&p.pid))
             .filter(|p| {
@@ -636,8 +601,6 @@ pub fn run(
             *lock.lock().unwrap() = true;
             cvar.notify_one();
 
-            // Kills/checkpoints freed RAM + zram slots — wake maintenance so it
-            // can attempt proactive swap reclaim while headroom still exists.
             if destructive_count > 0 {
                 let (lock, cvar) = &*reclaim_wake;
                 *lock.lock().unwrap() = true;
@@ -645,9 +608,7 @@ pub fn run(
             }
         }
 
-        // Cycle attribution: one grep-able line per active cycle tying the
-        // composite score inputs to what each feature did. The 3am question
-        // "which feature acted and why" is answered here, not by archaeology.
+
         {
             let frozen_n = frozen.lock().unwrap().count();
             let throttled_n = throttle_snapshot.lock().unwrap()
@@ -692,10 +653,7 @@ fn idle_timeout_reclaim(
     }
     *last_idle_reclaim_check = now_inst;
     let procs = monitor::process::list_processes();
-    let frozen_set: HashSet<Pid> =
-        frozen.lock().unwrap().frozen_pids().into_iter()
-            .chain(spike_tracker.victim_pids())
-            .collect();
+    let frozen_set = excluded_pids(frozen, spike_tracker, false);
     let plan_procs: Vec<&Process> =
         procs.iter().filter(|p| !frozen_set.contains(&p.pid)).collect();
     let active_pid = crate::plugin_server::get_active_foreground_pid();
@@ -717,8 +675,8 @@ fn run_spike_cycle(
     log: &Logger,
     available: Kb,
     spike_snapshot: &Arc<Mutex<crate::spike_mode::SpikeSnapshot>>,
+    spike_procs: &[Process],
 ) {
-    let spike_procs = monitor::process::list_processes();
     let live_pids: HashSet<Pid> = spike_procs.iter().map(|p| p.pid).collect();
 
     // Unfreeze victims when their spike process exits
@@ -783,20 +741,15 @@ fn run_spike_cycle(
 
     // Update tracker and execute decisions
     let spike_decisions = if cfg.spike_mode_enabled {
-        spike_tracker.update(&spike_procs, available, &crate::spike_mode::Params::from_config(cfg))
+        spike_tracker.update(spike_procs, available, &crate::spike_mode::Params::from_config(cfg))
     } else {
         vec![]
     };
     for decision in spike_decisions {
         match decision {
             crate::spike_mode::SpikeDecision::FreezeForHeadroom { needed } => {
-                let spike_pids  = spike_tracker.spike_pids();
-                let victim_pids = spike_tracker.victim_pids();
-                let exclude: HashSet<Pid> = frozen.lock().unwrap().frozen_pids()
-                    .into_iter()
-                    .chain(spike_pids.iter().copied())
-                    .chain(victim_pids.iter().copied())
-                    .collect();
+                let spike_pids = spike_tracker.spike_pids();
+                let exclude = excluded_pids(frozen, spike_tracker, true);
                 // Highest-priority (most expendable) first, then largest RSS
                 let mut candidates: Vec<&Process> = spike_procs.iter()
                     .filter(|p| !exclude.contains(&p.pid))
@@ -853,26 +806,23 @@ fn run_spike_cycle(
     *spike_snapshot.lock().unwrap() = spike_tracker.snapshot();
 }
 
-/// Leak-guard cycle: filter out critical/protected processes (never candidates,
-/// same hard rule as `plan()`), feed the remainder to the tracker, and SIGTERM
-/// anything it flags. Runs every cycle, even at Normal PSI — see the call site
-/// comment in `run()`.
 fn run_leak_guard_cycle(
     cfg: &CompiledConfig,
     leak_tracker: &mut crate::leak_guard::LeakTracker,
     log: &Logger,
     event_log: &crate::events::EventLog,
     leak_snapshot: &Arc<Mutex<crate::leak_guard::LeakSnapshot>>,
+    procs: &[Process],
 ) {
     if !cfg.leak_guard_enabled {
         *leak_snapshot.lock().unwrap() = leak_tracker.snapshot();
         return;
     }
 
-    let procs = monitor::process::list_processes();
-    let candidates: Vec<Process> = procs.into_iter()
+    let candidates: Vec<Process> = procs.iter()
         .filter(|p| get_priority(&p.name, p.exe_basename.as_deref(), cfg) > 19)
         .filter(|p| !cfg.is_protected(&p.name))
+        .cloned()
         .collect();
 
     let decisions = leak_tracker.update(&candidates, &crate::leak_guard::Params::from_config(cfg));
@@ -887,9 +837,7 @@ fn run_leak_guard_cycle(
     *leak_snapshot.lock().unwrap() = leak_tracker.snapshot();
 }
 
-/// Execute the planned decisions. Returns the number of synchronous destructive
-/// actions (Kill, Checkpoint) — Terminate is async (SIGTERM→5s→SIGKILL), its RAM
-/// isn't freed yet when the caller signals maintenance, so it doesn't count.
+
 #[allow(clippy::too_many_arguments)] // the sink is the 8th; bundling shared registries into a struct adds no clarity
 fn execute_plan(
     decisions: &[Decision],
@@ -909,9 +857,7 @@ fn execute_plan(
         let result_str = execute_decision(d, frozen, checkpointed, log, event_log, sink);
         mgd_common::sync_print!("  {:<10} {:<8} {:<22} {:>6.1}MB  {}", d.action, d.pid, d.name, d.rss.mib(), result_str);
 
-        // Post-freeze reclaim: push full RSS to zram while the process is immobile.
-        // SIGSTOP guarantees no re-faults, so 100% is safe (unlike active-process
-        // early reclaim which caps at 50% to preserve a working set).
+
         if d.action == Action::Freeze && result_str == "frozen"
             && let Some(cgroup_path) = plan_procs.iter()
                 .find(|p| p.pid == d.pid)
@@ -953,9 +899,7 @@ fn execute_plan(
     destructive_count
 }
 
-/// Pure: given current effective pressure + swap stats + sustained-start timer,
-/// returns the updated (effective_level, sustained_critical_swap_start).
-/// No I/O, no logging — caller owns those responsibilities.
+
 pub(crate) fn apply_swap_overrides(
     mut effective: PressureLevel,
     swap_used_pct: f64,
@@ -1000,8 +944,7 @@ pub(crate) struct IdleReclaimConfig {
     pub important_pct: u64,
 }
 
-/// Pure: returns (pid, reclaim_bytes) pairs for processes eligible for idle cgroup reclaim.
-/// Keyed by PID in background_tracker. No cgroup writes — caller handles I/O.
+
 pub(crate) fn select_idle_candidates(
     procs: &[&crate::monitor::process::Process],
     active_pid: Option<Pid>,
@@ -1040,9 +983,6 @@ pub(crate) fn select_idle_candidates(
 }
 
 
-/// Compact zram at Elevated+ to free fragmented pages before touching a process.
-/// No-op unless `[zram] compact_on_elevated = true`; skips pools < `min_used_mb`.
-/// EACCES (grant absent) disables the feature for the session.
 fn compact_zram(level: &PressureLevel, log: &Logger, cfg: &CompiledConfig) {
     if *level < PressureLevel::Elevated {
         return;
@@ -1089,8 +1029,7 @@ fn compact_zram(level: &PressureLevel, log: &Logger, cfg: &CompiledConfig) {
     }
 }
 
-/// Drop page cache for configured trees at the trigger level+, before freezing.
-/// No-op unless `[cache_drop] enabled` with non-empty `paths`. Cooldown-gated.
+
 fn check_cache_drop(level: &PressureLevel, log: &Logger, cfg: &CompiledConfig) {
     if !cfg.cache_drop_enabled || cfg.cache_drop_paths.is_empty() {
         return;
@@ -1196,10 +1135,7 @@ fn freeze_process(d: &Decision, frozen: &Arc<Mutex<FrozenRegistry>>, sink: &mut 
             "aborted: process vanished before fingerprint".into()
         }
     } else {
-        // "process vanished" is the benign PID-recycle race (not a real
-        // freeze failure) — keep it in the same "aborted:" bucket as the
-        // fingerprint-mismatch case above so log/event greps for "aborted:"
-        // vs "fail:" keep distinguishing races from real failures.
+
         let msg = r.error.unwrap_or_default();
         if msg.starts_with("process vanished") {
             format!("aborted: {msg}")
@@ -1231,12 +1167,9 @@ fn execute_checkpoint(d: &Decision, checkpointed: &Arc<Mutex<CheckpointRegistry>
             .add(d.pid, &d.name, dir.clone(), d.rss);
         (LogAction::Checkpoint, format!("checkpointed → {dir:?}"))
     } else {
-        // Dump failed — this binary is not safely checkpointable; record it so
-        // future cycles skip CRIU for it and route directly here.
+
         crate::executor::checkpoint::mark_binary_failed(&d.name);
-        // Fall back using the same prio logic as when cp_supported=false:
-        // prio >= 60 → Terminate (async, graceful); prio < 60 → Kill (protected process,
-        // dump likely failed due to complex state, don't wait for SIGTERM).
+
         if d.prio >= 60 {
             terminate_process(d, sink);
             (LogAction::Terminate, format!("terminating (CRIU failed: {})", r.error.unwrap_or_default()))
@@ -1288,6 +1221,18 @@ pub(crate) fn reclaim_cgroup(cgroup_path: &str, bytes_size: u64) -> Result<bool,
     Err(std::io::Error::new(std::io::ErrorKind::NotFound, "cgroup memory.reclaim not found"))
 }
 
+
+
+
+fn try_reclaim_cgroup(cgroup_path: &str, bytes_size: u64) -> ReclaimOutcome {
+    match reclaim_cgroup(cgroup_path, bytes_size) {
+        Ok(true) => ReclaimOutcome::Reclaimed,
+        Ok(false) => ReclaimOutcome::Skipped,
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => ReclaimOutcome::Blocked,
+        Err(e) => ReclaimOutcome::Failed(e),
+    }
+}
+
 fn check_early_process_reclaim(
     level: &PressureLevel,
     plan_procs: &[&Process],
@@ -1306,16 +1251,7 @@ fn check_early_process_reclaim(
     }
     LAST_EARLY_RECLAIM.store(now, Ordering::Relaxed);
 
-    // Filter candidate background processes:
-    // - Priority >= 50 (expendable/user apps)
-    // - RSS > 20MB
-    // - Not the active foreground process
-    // prio >= 60 processes are handled by plan() → Action::Freeze + post-freeze reclaim,
-    // which reclaims 100% RSS after SIGSTOP (no re-fault risk). Restricting to prio < 60
-    // here avoids a redundant memory.reclaim write on those same pids.
-    // Known edge: if swap_exhausted causes a Kill (prio>=80) to break the plan() loop
-    // before a prio[60,79] process is reached, that process misses both paths for that
-    // cycle. Accepted — swap_exhausted+Critical is already a crisis; next cycle corrects.
+
     let mut targets: Vec<&Process> = plan_procs
         .iter()
         .filter(|p| {
@@ -1333,24 +1269,23 @@ fn check_early_process_reclaim(
     targets.sort_by_key(|p| std::cmp::Reverse(p.rss_kb));
 
     for p in targets.iter().take(3) {
-        let reclaim_bytes_size = p.rss_kb.percent_of(50).bytes(); // reclaim 50% of RSS
+        let reclaim_kb = p.rss_kb.percent_of(50); // reclaim 50% of RSS
         let Some(cgroup) = p.cgroup_path.as_deref() else { continue };
-        match reclaim_cgroup(cgroup, reclaim_bytes_size) {
-            Ok(true) => {
+        match try_reclaim_cgroup(cgroup, reclaim_kb.bytes()) {
+            ReclaimOutcome::Reclaimed => {
                 mgd_common::sync_print!(
-                    "[reclaim] Proactively pushed ~{}MB of background PID {} ({}) to Zram",
-                    reclaim_bytes_size / (1024 * 1024),
+                    "[reclaim] Proactively pushed ~{:.0}MB of background PID {} ({}) to Zram",
+                    reclaim_kb.mib(),
                     p.pid,
                     p.name
                 );
                 log.log(LogAction::EarlyReclaim, p.pid, &p.name,
-                    (reclaim_bytes_size / (1024 * 1024)) as f64, "pushed to zram via cgroup reclaim");
+                    reclaim_kb.mib(), "pushed to zram via cgroup reclaim");
             }
-            Ok(false) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                // EAGAIN: nothing reclaimable right now, skip silently.
+            ReclaimOutcome::Skipped | ReclaimOutcome::Blocked => {
+                // Blocked = EAGAIN, nothing reclaimable right now — skip silently.
             }
-            Err(e) => {
+            ReclaimOutcome::Failed(e) => {
                 mgd_common::sync_print!(
                     "[reclaim] Early reclaim failed for PID {} ({}): {}",
                     p.pid, p.name, e
@@ -1418,30 +1353,30 @@ fn check_idle_process_reclaim(
             None => continue,
         };
 
-        match reclaim_cgroup(cgroup, *bytes_to_reclaim_size) {
-            Ok(true) => {
+        match try_reclaim_cgroup(cgroup, *bytes_to_reclaim_size) {
+            ReclaimOutcome::Reclaimed => {
+                let mib = Kb(*bytes_to_reclaim_size / 1024).mib();
                 mgd_common::sync_print!(
-                    "[reclaim] Proactively reclaimed ~{}MB from idle background process {} (PID {})",
-                    bytes_to_reclaim_size / (1024 * 1024),
+                    "[reclaim] Proactively reclaimed ~{:.0}MB from idle background process {} (PID {})",
+                    mib,
                     name,
                     pid
                 );
                 if let Some(p) = proc_entry {
                     log.log(LogAction::EarlyReclaim, p.pid, &p.name,
-                        (*bytes_to_reclaim_size / (1024 * 1024)) as f64,
-                        "proactively pushed idle process to zram");
+                        mib, "proactively pushed idle process to zram");
                 }
                 // Reset timer → serves as per-process cooldown
                 pid_tracker.insert(*pid, std::time::Instant::now());
                 LAST_IDLE_RECLAIM.store(unix_timestamp_secs(), Ordering::Relaxed);
             }
-            Ok(false) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+            ReclaimOutcome::Skipped => {}
+            ReclaimOutcome::Blocked => {
                 // EAGAIN: kernel has nothing reclaimable right now — not an error.
                 // Reset timer so we back off for a full idle_sec before retrying.
                 pid_tracker.insert(*pid, std::time::Instant::now());
             }
-            Err(e) => {
+            ReclaimOutcome::Failed(e) => {
                 mgd_common::sync_print!(
                     "[reclaim] Proactive idle reclaim failed for PID {} ({}): {}",
                     pid, name, e

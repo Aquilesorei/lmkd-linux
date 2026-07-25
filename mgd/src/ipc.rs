@@ -84,7 +84,7 @@ pub fn run_server(
 
     let active_conns = Arc::new(AtomicUsize::new(0));
 
-    while !crate::should_shutdown() {
+    while !crate::lifecycle::should_shutdown() {
         match listener.accept() {
             Ok((stream, _)) => {
                 if active_conns.load(Ordering::Relaxed) >= MAX_CONNECTIONS {

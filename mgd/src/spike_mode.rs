@@ -8,7 +8,6 @@ use regex::Regex;
 
 use crate::monitor::process::Process;
 
-// ── Public types ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum SpikePhase {
@@ -57,6 +56,25 @@ struct SpikeState {
     force_included: bool,
 }
 
+impl SpikeState {
+
+    fn new(pid: Pid, name: String, baseline: Kb, cgroup_path: Option<String>, force_included: bool) -> Self {
+        SpikeState {
+            pid,
+            name,
+            phase: SpikePhase::Observing,
+            samples: VecDeque::new(),
+            initial_rss: baseline,
+            rss_max: baseline,
+            has_peaked: false,
+            has_oscillated: false,
+            cpu_throttled: false,
+            cgroup_path,
+            force_included,
+        }
+    }
+}
+
 // ── Params — borrowed view of the `[spike_mode]` config fields ────────────────
 
 pub(crate) struct Params<'a> {
@@ -73,8 +91,7 @@ pub(crate) struct Params<'a> {
 }
 
 impl<'a> Params<'a> {
-    /// Borrow the spike-mode fields from a cycle-scoped config snapshot.
-    /// The caller gates on `cfg.spike_mode_enabled`.
+
     pub(crate) fn from_config(cfg: &'a crate::config::CompiledConfig) -> Params<'a> {
         Params {
             window_sec:              cfg.spike_window_sec,
@@ -142,10 +159,7 @@ impl SpikeTracker {
         }
     }
 
-    /// Update spike tracking and return decisions for this cycle.
-    /// RAM decisions come before CPU decisions in the returned Vec.
-    /// The caller builds `Params` via `Params::from_config()` from its
-    /// cycle-scoped config borrow (tests inject values directly).
+
     pub(crate) fn update(
         &mut self,
         procs: &[Process],
@@ -174,9 +188,11 @@ impl SpikeTracker {
 
         // ── Step 1: Register new candidates ──────────────────────────────────
         for proc in procs {
-            if self.spikes.contains_key(&proc.pid) {
-                continue;
-            }
+            use std::collections::hash_map::Entry;
+            let slot = match self.spikes.entry(proc.pid) {
+                Entry::Occupied(_) => continue,
+                Entry::Vacant(v) => v,
+            };
             if p.exclude.iter().any(|re| re.is_match(&proc.name)) {
                 continue;
             }
@@ -193,19 +209,7 @@ impl SpikeTracker {
                 // Use prev_rss as baseline so a process detected at its peak
                 // (large delta triggers registration) can still satisfy has_peaked.
                 let baseline = self.prev_rss.get(&proc.pid).copied().unwrap_or(proc.rss_kb);
-                self.spikes.insert(proc.pid, SpikeState {
-                    pid:            proc.pid,
-                    name:           proc.name.clone(),
-                    phase:          SpikePhase::Observing,
-                    samples:        VecDeque::new(),
-                    initial_rss:    baseline,
-                    rss_max:        baseline,
-                    has_peaked:     false,
-                    has_oscillated: false,
-                    cpu_throttled:  false,
-                    cgroup_path:    proc.cgroup_path.clone(),
-                    force_included,
-                });
+                slot.insert(SpikeState::new(proc.pid, proc.name.clone(), baseline, proc.cgroup_path.clone(), force_included));
             }
         }
 
@@ -307,19 +311,19 @@ impl SpikeTracker {
             if state.phase != SpikePhase::Tracking { continue; }
             if foreground_pid == Some(proc.pid) { continue; }
 
-            let Some(ref cg) = state.cgroup_path.clone() else { continue };
+            let Some(cg) = state.cgroup_path.as_deref() else { continue };
 
             if proc.cpu_pct >= p.cpu_threshold_pct && !state.cpu_throttled {
                 state.cpu_throttled = true;
                 decisions.push(SpikeDecision::ThrottleSpike {
                     spike_pid:   proc.pid,
-                    cgroup_path: cg.clone(),
+                    cgroup_path: cg.to_owned(),
                 });
             } else if proc.cpu_pct < p.cpu_threshold_pct && state.cpu_throttled {
                 state.cpu_throttled = false;
                 decisions.push(SpikeDecision::RestoreThrottle {
                     spike_pid:   proc.pid,
-                    cgroup_path: cg.clone(),
+                    cgroup_path: cg.to_owned(),
                 });
             }
         }
@@ -327,20 +331,7 @@ impl SpikeTracker {
         decisions
     }
 
-    /// Called when a spike PID exits. Returns victims to unfreeze.
-    ///
-    /// Releases victims whose `frozen_for_spike_pid` is no longer an active
-    /// spike — this correctly handles both the single-spike case and the case
-    /// where two unrelated processes (e.g. CLion + blender) are tracked
-    /// simultaneously: CLion's victims are freed when CLion exits even if
-    /// blender is still running.
-    ///
-    /// For co-session spikes (cargo + rustc): victims are assigned
-    /// frozen_for_spike_pid = whichever spike pid was first in the set.
-    /// Rustc typically exits before cargo, so cargo holds the victims until
-    /// the build is fully done. If cargo exits first the victims are freed
-    /// early; the evictor's reactive path re-freezes them if rustc still
-    /// needs headroom — acceptable minor churn.
+
     pub fn on_spike_exit(&mut self, spike_pid: Pid) -> Vec<SpikeVictim> {
         self.spikes.remove(&spike_pid);
         self.prev_rss.remove(&spike_pid);
@@ -353,9 +344,14 @@ impl SpikeTracker {
             return victims;
         }
 
-        // Other spikes still active: release only victims tied to the dead spike
-        // (frozen_for_spike_pid not in the remaining active set).
+
         let active: HashSet<Pid> = self.spikes.keys().copied().collect();
+        self.drain_orphans_not_in(&active)
+    }
+
+    /// Shared by `on_spike_exit` and `drain_orphaned_victims`: release every
+    /// victim whose `frozen_for_spike_pid` isn't in `active` anymore.
+    fn drain_orphans_not_in(&mut self, active: &HashSet<Pid>) -> Vec<SpikeVictim> {
         let to_release: Vec<Pid> = self.victims.values()
             .filter(|v| !active.contains(&v.frozen_for_spike_pid))
             .map(|v| v.pid)
@@ -383,8 +379,7 @@ impl SpikeTracker {
         self.persist_victims();
     }
 
-    /// Persist victim list so they can be unfrozen on daemon restart.
-    /// Only serializes {pid, name, start_time} — Instant is not serializable.
+
     fn persist_victims(&self) {
         let dir = state_dir();
         let _ = fs::create_dir_all(&dir);

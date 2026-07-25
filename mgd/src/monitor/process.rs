@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
@@ -78,7 +78,8 @@ fn read_process(pid: Pid, path: &Path) -> Result<Process, MgdError> {
     let status = fs::read_to_string(path.join("status"))?;
 
     let name = parse_status_field(&status, "Name:")
-        .unwrap_or_else(|| "unknown".to_string());
+        .unwrap_or("unknown")
+        .to_string();
 
     let rss_kb = Kb(parse_status_kb(&status, "VmRSS:").unwrap_or(0));
 
@@ -130,20 +131,20 @@ fn compute_cpu_pct(pid: Pid, ticks: Option<u64>) -> f32 {
 }
 
 fn prune_cpu_cache(live_pids: &[Process]) {
+    let live_set: HashSet<Pid> = live_pids.iter().map(|p| p.pid).collect();
     let mut cache = CPU_CACHE.lock().unwrap();
-    cache.retain(|pid, _| live_pids.iter().any(|p| p.pid == *pid));
+    cache.retain(|pid, _| live_set.contains(pid));
 }
 
 fn num_cpus() -> f32 {
     unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN).max(1) as f32 }
 }
 
-fn parse_status_field(status: &str, field: &str) -> Option<String> {
+fn parse_status_field<'a>(status: &'a str, field: &str) -> Option<&'a str> {
     status.lines()
         .find(|l| l.starts_with(field))?
         .split_whitespace()
         .nth(1)
-        .map(|s| s.to_string())
 }
 
 fn parse_status_kb(status: &str, field: &str) -> Option<u64> {
