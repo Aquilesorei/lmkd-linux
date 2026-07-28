@@ -197,13 +197,7 @@ impl LeakTracker {
 
             let in_cooldown = state.cooldown_until.is_some_and(|t| now < t);
             if leaking && !in_cooldown {
-                // Newest-first by PID: Linux allocates PIDs monotonically within
-                // a session (barring wraparound, which needs ~4M live processes
-                // to matter here), so highest PID == most recently spawned. This
-                // avoids a real /proc/PID/stat read inside otherwise-pure
-                // decision logic (kept this module free of I/O, same as
-                // spike_mode's update() — the PID-recycle guard belongs at
-                // execution time, not here).
+        
                 let mut ordered: Vec<&Process> = members.clone();
                 ordered.sort_by_key(|m| std::cmp::Reverse(m.pid.0));
 
@@ -280,8 +274,7 @@ mod tests {
         assert!(snap.groups.iter().all(|(_, _, _, leaking)| !leaking));
     }
 
-    // T3 ─ a shrink within the window clears never_shrunk — mirrors a legitimately
-    // elastic multi-process app (tabs/workers coming and going), not a leak.
+  
     #[test]
     fn t3_shrink_resets_never_shrunk() {
         let mut t = LeakTracker::new();
@@ -296,8 +289,7 @@ mod tests {
         }
     }
 
-    // T4 ─ strict monotonic growth past the gates flags leaking and emits
-    // TerminateStale for all but keep_newest.
+
     #[test]
     fn t4_monotonic_growth_flags_leaking() {
         let mut t = LeakTracker::new();
@@ -331,7 +323,7 @@ mod tests {
         assert_eq!(decisions.len(), 8 - 2);
     }
 
-    // T6 ─ excluded pattern (matched against name/exe_basename) never tracked
+  
     #[test]
     fn t6_excluded_pattern_never_tracked() {
         let mut t = LeakTracker::new();

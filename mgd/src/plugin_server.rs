@@ -280,9 +280,7 @@ fn process_plugin_line(line: &str, frozen: &Arc<Mutex<FrozenRegistry>>) {
             let approved = true;
             let denial_reason = None;
 
-            // Core could implement rate-limiting or policy checks here.
-            // For now, we approve RestartProcess and KillPid natively.
-            // Other actions (like RestartProcess) are delegated back to the plugin to execute.
+
             if let PluginAction::KillPid { pid } = &action {
                 let pid = *pid;
                 std::thread::spawn(move || {

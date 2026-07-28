@@ -11,8 +11,7 @@ use crate::monitor;
 
 const MAX_RESTORE_ATTEMPTS: u32 = 3;
 const MIN_FREEZE_AGE_SECS: u64 = 15;
-/// Max processes to unfreeze per recovery cycle. Staggering (vs. releasing all
-/// at once) lets PSI react between batches and avoids bouncing back into pressure.
+
 const MAX_UNFREEZE_PER_CYCLE: usize = 4;
 
 
