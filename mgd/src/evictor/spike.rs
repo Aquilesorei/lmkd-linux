@@ -8,18 +8,17 @@ use crate::engine::decision::get_priority;
 use crate::executor::registry::FrozenRegistry;
 use crate::monitor::process::Process;
 
-/// Spike-mode cycle: release victims (spike exited / timed out / orphaned), feed
-/// the tracker, and execute its decisions. Runs every cycle, even at Normal PSI —
-/// spike exit detection and proactive headroom management are independent of
-/// reactive eviction and must not be gated by the Normal continue.
-pub(crate) fn run_spike_cycle(
+/// Release victims (spike exited / timed out / orphaned / manually requested via
+/// `mgctl unfreeze`). Called both from the full cycle below and from
+/// `idle_timeout_reclaim`'s calm-tick path — release must not be gated behind a
+/// pressure event, or victims of a spike process that never exits (e.g. a browser
+/// tab) stay frozen forever once pressure drops back to Normal.
+pub(crate) fn release_victims(
     cfg: &CompiledConfig,
     spike_tracker: &mut crate::spike_mode::SpikeTracker,
-    frozen: &Arc<Mutex<FrozenRegistry>>,
     log: &Logger,
-    available: Kb,
-    spike_snapshot: &Arc<Mutex<crate::spike_mode::SpikeSnapshot>>,
     spike_procs: &[Process],
+    manual_release: &[Pid],
 ) {
     let live_pids: HashSet<Pid> = spike_procs.iter().map(|p| p.pid).collect();
 
@@ -82,6 +81,38 @@ pub(crate) fn run_spike_cycle(
             log.log(LogAction::SpikeUnfreezeOrphan, v.pid, &v.name, 0.0, "initiator exited");
         }
     }
+
+    // Release victims manually requested via `mgctl unfreeze` (queued by the IPC
+    // thread — it can't mutate spike_tracker directly, since only this thread owns it)
+    if !manual_release.is_empty() {
+        for v in spike_tracker.release_requested(manual_release) {
+            let r = crate::executor::freezer::unfreeze_checked(v.pid, v.start_time);
+            if r.success {
+                mgd_common::sync_print!(
+                    "[spike] Released victim {} (PID {}) on manual request",
+                    v.name, v.pid
+                );
+                log.log(LogAction::SpikeUnfreezeManual, v.pid, &v.name, 0.0, "mgctl unfreeze");
+            }
+        }
+    }
+}
+
+/// Spike-mode cycle: release victims, feed the tracker, and execute its decisions.
+/// Runs on every full cycle (a PSI event fired). `release_victims` above also runs
+/// standalone on PSI-timeout "calm" ticks via `idle_timeout_reclaim`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_spike_cycle(
+    cfg: &CompiledConfig,
+    spike_tracker: &mut crate::spike_mode::SpikeTracker,
+    frozen: &Arc<Mutex<FrozenRegistry>>,
+    log: &Logger,
+    available: Kb,
+    spike_snapshot: &Arc<Mutex<crate::spike_mode::SpikeSnapshot>>,
+    spike_procs: &[Process],
+    manual_release: &[Pid],
+) {
+    release_victims(cfg, spike_tracker, log, spike_procs, manual_release);
 
     // Update tracker and execute decisions
     let spike_decisions = if cfg.spike_mode_enabled {

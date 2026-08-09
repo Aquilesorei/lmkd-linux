@@ -446,6 +446,17 @@ impl SpikeTracker {
         victims
     }
 
+    /// Release specific victims on manual request (`mgctl unfreeze`), regardless
+    /// of timeout or spike-exit state. Returns drained victims for caller to unfreeze.
+    pub fn release_requested(&mut self, pids: &[Pid]) -> Vec<SpikeVictim> {
+        let victims: Vec<SpikeVictim> = pids.iter()
+            .filter_map(|pid| self.victims.remove(pid))
+            .collect();
+        if victims.is_empty() { return victims; }
+        self.persist_victims();
+        victims
+    }
+
     /// Cgroup paths of spike processes currently CPU-throttled by spike mode.
     pub fn throttled_cgroup_paths(&self) -> Vec<String> {
         self.spikes.values()

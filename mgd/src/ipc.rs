@@ -71,6 +71,7 @@ pub fn run_server(
     event_log: crate::events::EventLog,
     spike_snapshot: Arc<Mutex<crate::spike_mode::SpikeSnapshot>>,
     leak_snapshot: Arc<Mutex<crate::leak_guard::LeakSnapshot>>,
+    spike_release_requests: Arc<Mutex<Vec<Pid>>>,
 ) {
     let path = mgd_common::socket::socket_path();
 
@@ -97,11 +98,12 @@ pub fn run_server(
                 let e = Arc::clone(&event_log);
                 let s = Arc::clone(&spike_snapshot);
                 let lk = Arc::clone(&leak_snapshot);
+                let sr = Arc::clone(&spike_release_requests);
                 let a = Arc::clone(&active_conns);
                 a.fetch_add(1, Ordering::Relaxed);
                 thread::spawn(move || {
                     let _guard = ConnGuard(a); // decrements on drop, even on panic
-                    route_ipc_connection(stream, f, c, t, e, s, lk);
+                    route_ipc_connection(stream, f, c, t, e, s, lk, sr);
                 });
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -125,6 +127,7 @@ pub fn run_server(
 /// as a long-lived plugin session and handed off to `serve_plugin_connection`.
 /// Otherwise, it's treated as a short-lived `mgctl` command (e.g., `status`, `reload`), 
 /// which is processed synchronously before the connection is dropped.
+#[allow(clippy::too_many_arguments)]
 fn route_ipc_connection(
     mut stream: UnixStream,
     frozen: Arc<Mutex<FrozenRegistry>>,
@@ -133,6 +136,7 @@ fn route_ipc_connection(
     event_log: crate::events::EventLog,
     spike_snapshot: Arc<Mutex<crate::spike_mode::SpikeSnapshot>>,
     leak_snapshot: Arc<Mutex<crate::leak_guard::LeakSnapshot>>,
+    spike_release_requests: Arc<Mutex<Vec<Pid>>>,
 ) {
     stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
 
@@ -156,10 +160,11 @@ fn route_ipc_connection(
         return;
     }
 
-    let response = dispatch(line.trim(), &frozen, &checkpointed, &throttle_snapshot, &event_log, &spike_snapshot, &leak_snapshot);
+    let response = dispatch(line.trim(), &frozen, &checkpointed, &throttle_snapshot, &event_log, &spike_snapshot, &leak_snapshot, &spike_release_requests);
     let _ = writeln!(stream, "{response}");
 }
 
+#[allow(clippy::too_many_arguments)]
 fn dispatch(
     raw: &str,
     frozen: &Arc<Mutex<FrozenRegistry>>,
@@ -168,6 +173,7 @@ fn dispatch(
     event_log: &crate::events::EventLog,
     spike_snapshot: &Arc<Mutex<crate::spike_mode::SpikeSnapshot>>,
     leak_snapshot: &Arc<Mutex<crate::leak_guard::LeakSnapshot>>,
+    spike_release_requests: &Arc<Mutex<Vec<Pid>>>,
 ) -> String {
     let parts: Vec<&str> = raw.splitn(2, ' ').collect();
     let cmd = parts[0];
@@ -184,7 +190,7 @@ fn dispatch(
             if arg.is_empty() {
                 err("usage: unfreeze <pid|name>")
             } else {
-                cmd_unfreeze(arg, frozen)
+                cmd_unfreeze(arg, frozen, spike_snapshot, spike_release_requests)
             }
         }
         "freeze" => {
@@ -379,7 +385,12 @@ fn cmd_reload() -> String {
     ok("config reloaded")
 }
 
-fn cmd_unfreeze(arg: &str, frozen: &Arc<Mutex<FrozenRegistry>>) -> String {
+fn cmd_unfreeze(
+    arg: &str,
+    frozen: &Arc<Mutex<FrozenRegistry>>,
+    spike_snapshot: &Arc<Mutex<crate::spike_mode::SpikeSnapshot>>,
+    spike_release_requests: &Arc<Mutex<Vec<Pid>>>,
+) -> String {
     let target_pid: Option<Pid> = arg.parse::<Pid>().ok();
     let arg_lower = arg.to_lowercase();
 
@@ -401,21 +412,42 @@ fn cmd_unfreeze(arg: &str, frozen: &Arc<Mutex<FrozenRegistry>>) -> String {
             .collect()
     };
 
-    if pids_to_unfreeze.is_empty() {
+    if !pids_to_unfreeze.is_empty() {
+        let mut results = Vec::new();
+        for (pid, start_time) in pids_to_unfreeze {
+            let r = crate::executor::freezer::unfreeze_checked(pid, start_time);
+            if r.success {
+                frozen.lock().unwrap().remove(pid);
+                results.push(format!("✓ unfroze pid={pid}"));
+            } else {
+                results.push(format!("✗ pid={pid}: {}", r.error.unwrap_or_default()));
+            }
+        }
+        return ok(&results.join("\n"));
+    }
+
+    // Not in FrozenRegistry — check spike-mode victims (frozen for proactive
+    // headroom, tracked separately). This thread can't mutate SpikeTracker
+    // directly (the evictor thread owns it), so queue the pids and let the
+    // evictor release them on its next cycle (≤5s, including calm PSI ticks).
+    let spike_matches: Vec<Pid> = {
+        let snap = spike_snapshot.lock().unwrap();
+        snap.victims.iter()
+            .filter(|(pid, name, _)| {
+                target_pid.map(|t| *pid == t)
+                    .unwrap_or_else(|| name.to_lowercase().contains(&arg_lower))
+            })
+            .map(|(pid, ..)| *pid)
+            .collect()
+    };
+
+    if spike_matches.is_empty() {
         return err(&format!("no frozen process matching '{arg}'"));
     }
 
-    let mut results = Vec::new();
-    for (pid, start_time) in pids_to_unfreeze {
-        let r = crate::executor::freezer::unfreeze_checked(pid, start_time);
-        if r.success {
-            frozen.lock().unwrap().remove(pid);
-            results.push(format!("✓ unfroze pid={pid}"));
-        } else {
-            results.push(format!("✗ pid={pid}: {}", r.error.unwrap_or_default()));
-        }
-    }
-    ok(&results.join("\n"))
+    spike_release_requests.lock().unwrap().extend(&spike_matches);
+    let names: Vec<String> = spike_matches.iter().map(|p| format!("pid={p}")).collect();
+    ok(&format!("queued spike-victim release for {} (applies within ~5s)", names.join(", ")))
 }
 
 fn cmd_freeze(arg: &str, frozen: &Arc<Mutex<FrozenRegistry>>) -> String {

@@ -19,18 +19,29 @@ pub(super) fn gate_state() -> u64 {
     LAST_IDLE_RECLAIM.load(Ordering::Relaxed)
 }
 
-/// Idle-cycle work on PSI trigger timeout: no pressure event fired, so run idle
-/// cgroup reclaim on its cooldown. Shared by the subprocess and direct-trigger
-/// wait paths; the caller `continue`s afterwards to skip the full cycle.
+/// Idle-cycle work on PSI trigger timeout: no pressure event fired, so release any
+/// due spike victims and run idle cgroup reclaim on its cooldown. Shared by the
+/// subprocess and direct-trigger wait paths; the caller `continue`s afterwards to
+/// skip the full cycle — victim release must happen here too (not just in the full
+/// cycle), or spike victims of a process that never exits (e.g. a browser tab)
+/// never get released while pressure stays Normal.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn idle_timeout_reclaim(
     cfg: &CompiledConfig,
     frozen: &Arc<Mutex<FrozenRegistry>>,
-    spike_tracker: &crate::spike_mode::SpikeTracker,
+    spike_tracker: &mut crate::spike_mode::SpikeTracker,
+    spike_snapshot: &Arc<Mutex<crate::spike_mode::SpikeSnapshot>>,
     log: &Logger,
     idle_reclaim_pid_tracker: &mut HashMap<Pid, std::time::Instant>,
     idle_freeze_pid_tracker: &mut HashMap<Pid, std::time::Instant>,
     last_idle_reclaim_check: &mut std::time::Instant,
+    manual_release: &[Pid],
 ) {
+    let procs = monitor::process::list_processes();
+
+    super::spike::release_victims(cfg, spike_tracker, log, &procs, manual_release);
+    *spike_snapshot.lock().unwrap() = spike_tracker.snapshot();
+
     if !cfg.idle_reclaim_enabled {
         return;
     }
@@ -41,7 +52,6 @@ pub(crate) fn idle_timeout_reclaim(
         return;
     }
     *last_idle_reclaim_check = now_inst;
-    let procs = monitor::process::list_processes();
     let frozen_set = super::excluded_pids(frozen, spike_tracker, false);
     let plan_procs: Vec<&Process> =
         procs.iter().filter(|p| !frozen_set.contains(&p.pid)).collect();

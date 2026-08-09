@@ -287,11 +287,8 @@ checkpoint = false
 name    = "my-vpn"
 pattern = "^(openvpn|wg-quick)$"
 
-# Detect a process family whose live-instance count only ever grows and is
-# never reaped (e.g. a supervisor that forks a fresh worker instead of
-# reusing one persistent connection) — grouped by exact command line, not
-# just name, so unrelated same-binary processes are never conflated.
-# Disabled by default. See `mgctl leak-status`.
+
+
 [process_leak_guard]
 enabled = true
 ```

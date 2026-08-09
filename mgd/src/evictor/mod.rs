@@ -82,6 +82,7 @@ pub fn run(
     event_log: crate::events::EventLog,
     spike_snapshot: Arc<Mutex<crate::spike_mode::SpikeSnapshot>>,
     leak_snapshot: Arc<Mutex<crate::leak_guard::LeakSnapshot>>,
+    spike_release_requests: Arc<Mutex<Vec<Pid>>>,
 ) {
 
     try_elevate_scheduler_priority();
@@ -157,18 +158,20 @@ pub fn run(
                 match sub.wait(5000) {
                     monitor::psi::WaitResult::Event => false,
                     monitor::psi::WaitResult::Timeout => {
-                        idle_timeout_reclaim(&cfg, &frozen, &spike_tracker, &log,
+                        let manual: Vec<Pid> = std::mem::take(&mut *spike_release_requests.lock().unwrap());
+                        idle_timeout_reclaim(&cfg, &frozen, &mut spike_tracker, &spike_snapshot, &log,
                             &mut idle_reclaim_pid_tracker, &mut idle_freeze_pid_tracker,
-                            &mut last_idle_reclaim_check);
+                            &mut last_idle_reclaim_check, &manual);
                         continue; // no pressure event → skip full cycle
                     }
                     monitor::psi::WaitResult::HelperDied => true,
                 }
             } else if let Some(trigger) = &psi_trigger {
                 if !trigger.wait(5000) {
-                    idle_timeout_reclaim(&cfg, &frozen, &spike_tracker, &log,
+                    let manual: Vec<Pid> = std::mem::take(&mut *spike_release_requests.lock().unwrap());
+                    idle_timeout_reclaim(&cfg, &frozen, &mut spike_tracker, &spike_snapshot, &log,
                         &mut idle_reclaim_pid_tracker, &mut idle_freeze_pid_tracker,
-                        &mut last_idle_reclaim_check);
+                        &mut last_idle_reclaim_check, &manual);
                     continue;
                 }
                 false
@@ -338,7 +341,8 @@ pub fn run(
         }
 
 
-        spike::run_spike_cycle(&cfg, &mut spike_tracker, &frozen, &log, meminfo.available_kb, &spike_snapshot, &procs);
+        let manual_release: Vec<Pid> = std::mem::take(&mut *spike_release_requests.lock().unwrap());
+        spike::run_spike_cycle(&cfg, &mut spike_tracker, &frozen, &log, meminfo.available_kb, &spike_snapshot, &procs, &manual_release);
 
 
         leak::run_leak_guard_cycle(&cfg, &mut leak_tracker, &log, &event_log, &leak_snapshot, &procs);

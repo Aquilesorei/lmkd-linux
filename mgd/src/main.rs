@@ -39,7 +39,8 @@ fn main() {
         let el = Arc::clone(&state.event_log);
         let ss = Arc::clone(&state.spike_snapshot);
         let ls = Arc::clone(&state.leak_snapshot);
-        thread::spawn(move || evictor::run(f, c, l, w, rw, cal, ts, el, ss, ls))
+        let sr = Arc::clone(&state.spike_release_requests);
+        thread::spawn(move || evictor::run(f, c, l, w, rw, cal, ts, el, ss, ls, sr))
     };
 
     let recovery_manager = {
@@ -57,7 +58,8 @@ fn main() {
         let el = Arc::clone(&state.event_log);
         let ss = Arc::clone(&state.spike_snapshot);
         let ls = Arc::clone(&state.leak_snapshot);
-        thread::spawn(move || ipc::run_server(f, c, ts, el, ss, ls))
+        let sr = Arc::clone(&state.spike_release_requests);
+        thread::spawn(move || ipc::run_server(f, c, ts, el, ss, ls, sr))
     };
 
     let maintenance_manager = {

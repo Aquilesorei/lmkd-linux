@@ -1,6 +1,7 @@
 use crate::executor::registry::{CheckpointRegistry, FrozenRegistry};
 use crate::{config, events, executor, leak_guard, lifecycle, maintenance, memlock, plugin_server, spike_mode, throttle};
 use mgd_common::logger::Logger;
+use mgd_common::types::Pid;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Condvar, Mutex};
@@ -16,6 +17,10 @@ pub struct AppState {
     pub event_log: events::EventLog, // <- swap in the real type from new_log()
     pub spike_snapshot: Arc<Mutex<spike_mode::SpikeSnapshot>>,
     pub leak_snapshot: Arc<Mutex<leak_guard::LeakSnapshot>>,
+    /// Pids an IPC `unfreeze` call wants released early from `SpikeTracker.victims`
+    /// (owned solely by the evictor thread — IPC can't mutate it directly). Drained
+    /// by the evictor every cycle, including PSI-timeout calm ticks.
+    pub spike_release_requests: Arc<Mutex<Vec<Pid>>>,
 }
 
 pub fn initialize() -> AppState {
@@ -46,6 +51,7 @@ pub fn initialize() -> AppState {
         event_log: events::new_log(),
         spike_snapshot: Arc::new(Mutex::new(spike_mode::SpikeSnapshot { active: vec![], victims: vec![] })),
         leak_snapshot: Arc::new(Mutex::new(leak_guard::LeakSnapshot { groups: vec![] })),
+        spike_release_requests: Arc::new(Mutex::new(Vec::new())),
     }
 }
 
