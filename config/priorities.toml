@@ -553,6 +553,9 @@ cpu_threshold_pct      = 80.0
 throttled_cpu_weight   = 20
 min_samples            = 6         # 30s observation before acting
 max_victim_freeze_sec  = 0         # 0 = no limit on victim freeze duration
+idle_cpu_threshold_pct = 3.0       # CPU% below which a tick is considered idle
+idle_rss_delta_kb      = 20000     # 20 MB max RSS growth for an idle tick
+idle_ticks_required    = 10        # 10 consecutive idle ticks (50s) → demote to Observing and release victims
 
 [throttle]
 # Processes matching these patterns are never CPU-throttled, even at Elevated+ pressure.
