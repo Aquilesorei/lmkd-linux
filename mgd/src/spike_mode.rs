@@ -27,6 +27,7 @@ pub enum SpikeDecision {
     FreezeForHeadroom { needed: Kb },
     ThrottleSpike     { spike_pid: Pid, cgroup_path: String },
     RestoreThrottle   { spike_pid: Pid, cgroup_path: String },
+    ReleaseVictims    { victims: Vec<SpikeVictim> },
 }
 
 pub struct SpikeSnapshot {
@@ -51,6 +52,7 @@ struct SpikeState {
     has_peaked: bool,
     has_oscillated: bool,
     cpu_throttled: bool,
+    idle_ticks: u32,
     cgroup_path: Option<String>,
     #[allow(dead_code)] // read in test assertions
     force_included: bool,
@@ -69,6 +71,7 @@ impl SpikeState {
             has_peaked: false,
             has_oscillated: false,
             cpu_throttled: false,
+            idle_ticks: 0,
             cgroup_path,
             force_included,
         }
@@ -86,6 +89,9 @@ pub(crate) struct Params<'a> {
     pub min_samples:             usize,
     pub headroom_factor:         f64,
     pub cpu_threshold_pct:       f32,
+    pub idle_cpu_threshold_pct:  f32,
+    pub idle_rss_delta:          Kb,
+    pub idle_ticks_required:     u32,
     pub include:                 Vec<&'a Regex>,
     pub exclude:                 Vec<&'a Regex>,
 }
@@ -102,6 +108,9 @@ impl<'a> Params<'a> {
             min_samples:             cfg.spike_min_samples,
             headroom_factor:         cfg.spike_headroom_factor,
             cpu_threshold_pct:       cfg.spike_cpu_threshold_pct,
+            idle_cpu_threshold_pct:  cfg.spike_idle_cpu_threshold_pct,
+            idle_rss_delta:          Kb(cfg.spike_idle_rss_delta_kb),
+            idle_ticks_required:     cfg.spike_idle_ticks_required,
             include:                 cfg.spike_include.iter().collect(),
             exclude:                 cfg.spike_exclude.iter().collect(),
         }
@@ -120,6 +129,9 @@ impl<'a> Params<'a> {
             min_samples:             6,
             headroom_factor:         1.25,
             cpu_threshold_pct:       80.0,
+            idle_cpu_threshold_pct:  3.0,
+            idle_rss_delta:          Kb(20_000),
+            idle_ticks_required:     10,
             include:                 vec![],
             exclude:                 vec![],
         }
@@ -138,6 +150,7 @@ fn state_dir() -> PathBuf {
 pub struct SpikeTracker {
     spikes:           HashMap<Pid, SpikeState>,
     victims:          HashMap<Pid, SpikeVictim>,
+    victim_cooldowns: HashMap<Pid, Instant>,
     prev_rss:         HashMap<Pid, Kb>,    // for growth-signal on new candidates
     prev_majflt:      HashMap<Pid, u64>,   // for majflt-signal on new candidates
     // scratch buffers — cleared and reused every cycle
@@ -151,6 +164,7 @@ impl SpikeTracker {
         SpikeTracker {
             spikes:           HashMap::new(),
             victims:          HashMap::new(),
+            victim_cooldowns: HashMap::new(),
             prev_rss:         HashMap::new(),
             prev_majflt:      HashMap::new(),
             scratch_live:     HashSet::new(),
@@ -213,6 +227,9 @@ impl SpikeTracker {
             }
         }
 
+        let mut just_demoted: Vec<Pid> = Vec::new();
+        let mut decisions: Vec<SpikeDecision> = Vec::new();
+
         // ── Step 2: Update all tracked states ────────────────────────────────
         for proc in procs {
             let Some(state) = self.spikes.get_mut(&proc.pid) else { continue };
@@ -268,12 +285,44 @@ impl SpikeTracker {
                 && state.samples.len() >= p.min_samples
             {
                 state.phase = SpikePhase::Tracking;
+                state.idle_ticks = 0;
                 mgd_common::sync_print!(
                     "[spike] {} (PID {}) → Tracking (rss_max={:.0}MB, {} samples)",
                     state.name, state.pid,
                     state.rss_max.mib(),
                     state.samples.len()
                 );
+            } else if state.phase == SpikePhase::Tracking {
+                let rss_delta = self.scratch_rss_d.get(&proc.pid).copied().unwrap_or(Kb(0));
+                let is_idle_tick = proc.cpu_pct < p.idle_cpu_threshold_pct && rss_delta < p.idle_rss_delta;
+                if is_idle_tick {
+                    state.idle_ticks += 1;
+                    if state.idle_ticks >= p.idle_ticks_required {
+                        state.phase = SpikePhase::Observing;
+                        state.has_peaked = false;
+                        state.has_oscillated = false;
+                        state.idle_ticks = 0;
+                        state.samples.clear();
+                        state.initial_rss = proc.rss_kb;
+                        state.rss_max = proc.rss_kb;
+                        if state.cpu_throttled {
+                            state.cpu_throttled = false;
+                            if let Some(ref cg) = state.cgroup_path {
+                                decisions.push(SpikeDecision::RestoreThrottle {
+                                    spike_pid: state.pid,
+                                    cgroup_path: cg.clone(),
+                                });
+                            }
+                        }
+                        mgd_common::sync_print!(
+                            "[spike] {} (PID {}) idle for {} ticks → demoted to Observing",
+                            state.name, state.pid, p.idle_ticks_required
+                        );
+                        just_demoted.push(proc.pid);
+                    }
+                } else {
+                    state.idle_ticks = 0;
+                }
             }
         }
 
@@ -285,10 +334,20 @@ impl SpikeTracker {
         }
         self.prev_rss.retain(|pid, _| self.scratch_live.contains(pid));
         self.prev_majflt.retain(|pid, _| self.scratch_live.contains(pid));
+        self.victim_cooldowns.retain(|_, t| t.elapsed().as_secs() < 300);
 
         // ── Step 4: Collect decisions — RAM first, CPU after ─────────────────
 
-        let mut decisions: Vec<SpikeDecision> = Vec::new();
+        if !just_demoted.is_empty() {
+            let active_tracking: HashSet<Pid> = self.spikes.values()
+                .filter(|s| s.phase == SpikePhase::Tracking)
+                .map(|s| s.pid)
+                .collect();
+            let released = self.drain_orphans_not_in(&active_tracking);
+            if !released.is_empty() {
+                decisions.push(SpikeDecision::ReleaseVictims { victims: released });
+            }
+        }
 
         // RAM check: required headroom = sum of rss_max across Tracking states
         let sum_rss_max: Kb = self.spikes.values()
@@ -434,6 +493,7 @@ impl SpikeTracker {
     /// Release victims frozen beyond `max_secs`. Returns drained victims for caller to unfreeze.
     pub fn drain_timed_out_victims(&mut self, max_secs: u64) -> Vec<SpikeVictim> {
         if max_secs == 0 { return vec![]; }
+        let now = Instant::now();
         let timed_out: Vec<Pid> = self.victims.values()
             .filter(|v| v.frozen_at.elapsed().as_secs() >= max_secs)
             .map(|v| v.pid)
@@ -442,6 +502,9 @@ impl SpikeTracker {
         let victims: Vec<SpikeVictim> = timed_out.iter()
             .filter_map(|pid| self.victims.remove(pid))
             .collect();
+        for v in &victims {
+            self.victim_cooldowns.insert(v.pid, now);
+        }
         self.persist_victims();
         victims
     }
@@ -453,8 +516,18 @@ impl SpikeTracker {
             .filter_map(|pid| self.victims.remove(pid))
             .collect();
         if victims.is_empty() { return victims; }
+        let now = Instant::now();
+        for v in &victims {
+            self.victim_cooldowns.insert(v.pid, now);
+        }
         self.persist_victims();
         victims
+    }
+
+    pub fn is_victim_cooldown(&self, pid: Pid, cooldown_sec: u64) -> bool {
+        self.victim_cooldowns.get(&pid)
+            .map(|t| t.elapsed().as_secs() < cooldown_sec)
+            .unwrap_or(false)
     }
 
     /// Cgroup paths of spike processes currently CPU-throttled by spike mode.
@@ -533,6 +606,7 @@ mod tests {
             pid: Pid(pid), name: name.to_string(), phase: SpikePhase::Tracking,
             samples: VecDeque::new(), initial_rss: Kb(0), rss_max: Kb(rss_max_kb),
             has_peaked: true, has_oscillated: true, cpu_throttled: false,
+            idle_ticks: 0,
             cgroup_path: Some(format!("/user.slice/app-{pid}.scope")),
             force_included: false,
         }
@@ -785,5 +859,91 @@ mod tests {
         t.update(&[make_process(1, "ld", 600_000, 0.0, 250)], Kb(u64::MAX), &params);
         assert!(!t.spikes.is_empty(), "delta=200>100 should trigger tracking");
         assert_eq!(*t.prev_majflt.get(&Pid(1)).unwrap(), 250);
+    }
+
+    // T18 ─ idle-demotion transition: peak → oscillate → N idle ticks → back to Observing
+    #[test]
+    fn t18_idle_demotion_to_observing() {
+        let params = Params {
+            idle_ticks_required: 3,
+            idle_cpu_threshold_pct: 3.0,
+            idle_rss_delta: Kb(20_000),
+            ..p_fast()
+        };
+        // Reach Tracking: peak 4.2GB, valley 3.5GB
+        let mut t = feed(1, "gradle", &[500_000, 4_200_000, 3_500_000], &params);
+        assert_eq!(t.spikes.get(&Pid(1)).unwrap().phase, SpikePhase::Tracking);
+
+        // Tick 1: idle (CPU=0.0%, RSS flat)
+        t.update(&[make_process(1, "gradle", 3_500_000, 0.0, 0)], Kb(u64::MAX), &params);
+        assert_eq!(t.spikes.get(&Pid(1)).unwrap().phase, SpikePhase::Tracking);
+        assert_eq!(t.spikes.get(&Pid(1)).unwrap().idle_ticks, 1);
+
+        // Tick 2: still idle
+        t.update(&[make_process(1, "gradle", 3_500_000, 0.0, 0)], Kb(u64::MAX), &params);
+        assert_eq!(t.spikes.get(&Pid(1)).unwrap().phase, SpikePhase::Tracking);
+        assert_eq!(t.spikes.get(&Pid(1)).unwrap().idle_ticks, 2);
+
+        // Tick 3: idle_ticks reaches 3 → demoted to Observing
+        t.update(&[make_process(1, "gradle", 3_500_000, 0.0, 0)], Kb(u64::MAX), &params);
+        let s = t.spikes.get(&Pid(1)).unwrap();
+        assert_eq!(s.phase, SpikePhase::Observing);
+        assert_eq!(s.idle_ticks, 0);
+        assert!(!s.has_peaked);
+        assert!(!s.has_oscillated);
+    }
+
+    // T19 ─ headroom sum excludes demoted spike
+    #[test]
+    fn t19_headroom_excludes_demoted_spike() {
+        let params = Params {
+            idle_ticks_required: 2,
+            idle_cpu_threshold_pct: 3.0,
+            idle_rss_delta: Kb(20_000),
+            headroom_factor: 1.25,
+            ..p_fast()
+        };
+        let mut t = SpikeTracker::new();
+        t.spikes.insert(Pid(1), make_state_tracking(1, "gradle", 4_000_000));
+        let available = Kb(3_000_000); // 3GB < 4GB * 1.25 (5GB)
+
+        // Tick 1: idle tick 1 → still Tracking, emits FreezeForHeadroom
+        let d = t.update(&[make_process(1, "gradle", 4_000_000, 0.0, 0)], available, &params);
+        assert!(d.iter().any(|x| matches!(x, SpikeDecision::FreezeForHeadroom { .. })));
+
+        // Tick 2: idle tick 2 → reaches required 2 → demoted to Observing
+        let d = t.update(&[make_process(1, "gradle", 4_000_000, 0.0, 0)], available, &params);
+        // Demoted: sum_rss_max drops to 0, so NO FreezeForHeadroom should be emitted
+        assert!(!d.iter().any(|x| matches!(x, SpikeDecision::FreezeForHeadroom { .. })));
+        assert_eq!(t.spikes.get(&Pid(1)).unwrap().phase, SpikePhase::Observing);
+    }
+
+    // T20 ─ victim release triggered by idle demotion (not just spike exit)
+    #[test]
+    fn t20_victim_release_on_idle_demotion() {
+        let params = Params {
+            idle_ticks_required: 2,
+            idle_cpu_threshold_pct: 3.0,
+            idle_rss_delta: Kb(20_000),
+            ..p_fast()
+        };
+        let mut t = SpikeTracker::new();
+        t.spikes.insert(Pid(1), make_state_tracking(1, "gradle", 4_000_000));
+        t.victims.insert(Pid(10), make_victim(10, "firefox", 1));
+
+        // Tick 1: idle tick 1 → still tracking, victim remains
+        let d = t.update(&[make_process(1, "gradle", 4_000_000, 0.0, 0)], Kb(u64::MAX), &params);
+        assert!(!d.iter().any(|x| matches!(x, SpikeDecision::ReleaseVictims { .. })));
+        assert!(t.victims.contains_key(&Pid(10)));
+
+        // Tick 2: idle tick 2 → demoted! ReleaseVictims decision emitted and victim drained
+        let d = t.update(&[make_process(1, "gradle", 4_000_000, 0.0, 0)], Kb(u64::MAX), &params);
+        let rel = d.into_iter().find(|x| matches!(x, SpikeDecision::ReleaseVictims { .. }));
+        assert!(rel.is_some(), "expected ReleaseVictims decision");
+        if let Some(SpikeDecision::ReleaseVictims { victims }) = rel {
+            assert_eq!(victims.len(), 1);
+            assert_eq!(victims[0].pid, Pid(10));
+        }
+        assert!(t.victims.is_empty(), "victim should be drained from tracker");
     }
 }

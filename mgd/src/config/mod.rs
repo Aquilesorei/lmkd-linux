@@ -306,6 +306,12 @@ struct SpikeMode {
     min_samples: usize,
     #[serde(default)]
     max_victim_freeze_sec: u64,
+    #[serde(default = "default_spike_idle_cpu_threshold_pct")]
+    idle_cpu_threshold_pct: f32,
+    #[serde(default = "default_spike_idle_rss_delta_kb")]
+    idle_rss_delta_kb: u64,
+    #[serde(default = "default_spike_idle_ticks_required")]
+    idle_ticks_required: u32,
 }
 
 impl Default for SpikeMode {
@@ -325,6 +331,9 @@ impl Default for SpikeMode {
             throttled_cpu_weight: default_spike_throttled_cpu_weight(),
             min_samples: default_spike_min_samples(),
             max_victim_freeze_sec: 0,
+            idle_cpu_threshold_pct: default_spike_idle_cpu_threshold_pct(),
+            idle_rss_delta_kb: default_spike_idle_rss_delta_kb(),
+            idle_ticks_required: default_spike_idle_ticks_required(),
         }
     }
 }
@@ -339,6 +348,9 @@ fn default_spike_oscillation_drop_factor() -> f64 { 0.90 }
 fn default_spike_cpu_threshold_pct() -> f32 { 80.0 }
 fn default_spike_throttled_cpu_weight() -> u32 { 20 }
 fn default_spike_min_samples() -> usize { 6 }
+fn default_spike_idle_cpu_threshold_pct() -> f32 { 3.0 }
+fn default_spike_idle_rss_delta_kb() -> u64 { 20_000 }
+fn default_spike_idle_ticks_required() -> u32 { 10 }
 
 
 #[derive(Deserialize)]
@@ -483,6 +495,9 @@ pub struct CompiledConfig {
     pub spike_throttled_cpu_weight: u32,
     pub spike_min_samples: usize,
     pub spike_max_victim_freeze_sec: u64,
+    pub spike_idle_cpu_threshold_pct: f32,
+    pub spike_idle_rss_delta_kb: u64,
+    pub spike_idle_ticks_required: u32,
     pub throttle_exclude: Vec<Regex>,
     pub throttle_max_duration_sec: u64,
     pub leak_guard_enabled: bool,
@@ -668,6 +683,9 @@ fn compile(content: &str) -> Result<CompiledConfig, String> {
         spike_throttled_cpu_weight: raw.spike_mode.throttled_cpu_weight,
         spike_min_samples: raw.spike_mode.min_samples,
         spike_max_victim_freeze_sec: raw.spike_mode.max_victim_freeze_sec,
+        spike_idle_cpu_threshold_pct: raw.spike_mode.idle_cpu_threshold_pct,
+        spike_idle_rss_delta_kb: raw.spike_mode.idle_rss_delta_kb,
+        spike_idle_ticks_required: raw.spike_mode.idle_ticks_required,
         throttle_exclude: raw.throttle.exclude.iter()
             .filter_map(|p| Regex::new(p).map_err(|e| {
                 mgd_common::output::locked_eprint(&format!("[config] invalid throttle exclude pattern '{}': {e}", p));

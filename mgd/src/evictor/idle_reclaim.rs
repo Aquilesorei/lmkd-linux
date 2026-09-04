@@ -38,9 +38,9 @@ pub(crate) fn idle_timeout_reclaim(
     manual_release: &[Pid],
 ) {
     let procs = monitor::process::list_processes();
+    let meminfo = monitor::meminfo::read_meminfo();
 
-    super::spike::release_victims(cfg, spike_tracker, log, &procs, manual_release);
-    *spike_snapshot.lock().unwrap() = spike_tracker.snapshot();
+    super::spike::run_spike_cycle(cfg, spike_tracker, frozen, log, meminfo.available_kb, spike_snapshot, &procs, manual_release);
 
     if !cfg.idle_reclaim_enabled {
         return;

@@ -122,12 +122,36 @@ pub(crate) fn run_spike_cycle(
     };
     for decision in spike_decisions {
         match decision {
+            crate::spike_mode::SpikeDecision::ReleaseVictims { victims } => {
+                let mut total_released = 0usize;
+                for v in victims {
+                    let r = crate::executor::freezer::unfreeze_checked(v.pid, v.start_time);
+                    if r.success {
+                        mgd_common::sync_print!(
+                            "[spike] Unfroze {} (PID {}) — spike PID {} went idle",
+                            v.name, v.pid, v.frozen_for_spike_pid
+                        );
+                        log.log(LogAction::SpikeUnfreeze, v.pid, &v.name, 0.0, "spike idle demotion");
+                        total_released += 1;
+                    }
+                }
+                if total_released > 0 {
+                    let msg = format!("Build idle — {} process{} resumed",
+                        total_released, if total_released == 1 { "" } else { "es" });
+                    let _ = std::process::Command::new("notify-send")
+                        .args(["--urgency=low", "--app-name=mgd", "build", &msg])
+                        .spawn();
+                }
+            }
             crate::spike_mode::SpikeDecision::FreezeForHeadroom { needed } => {
                 let spike_pids = spike_tracker.spike_pids();
                 let exclude = super::excluded_pids(frozen, spike_tracker, true);
+                let active_pid = crate::plugin_server::get_active_foreground_pid();
                 // Highest-priority (most expendable) first, then largest RSS
                 let mut candidates: Vec<&Process> = spike_procs.iter()
                     .filter(|p| !exclude.contains(&p.pid))
+                    .filter(|p| active_pid != Some(p.pid))
+                    .filter(|p| !spike_tracker.is_victim_cooldown(p.pid, 60))
                     .filter(|p| get_priority(&p.name, p.exe_basename.as_deref(), cfg) >= 60)
                     .filter(|p| !cfg.spike_victim_exclude.iter().any(|re| re.is_match(&p.name)))
                     .collect();
