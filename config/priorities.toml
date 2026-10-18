@@ -540,9 +540,15 @@ priority = 88
 enabled                = false
 # include = ["^plasmashell$"]   # force-track even if below behavioral signals
 # exclude: never track as a spike orchestrator (false-positive suppression).
-# exclude = ["^firefox$"]
-# victim_exclude: never freeze as a victim — build workers spawned by the orchestrator.
-victim_exclude = ["^(rustc|cc|cc1|ld|lld|javac|kotlinc)$"]
+# Browsers/IDEs/shell oscillate naturally (GC, indexing) — tracking them as spikes
+# made them immune to the reactive evictor and froze dev tools on their behalf.
+# java/python left out on purpose: gradle daemons and python builds are real spikes.
+exclude = ["^(Isolated.*|Web Content|firefox|chrome|msedge|rustrover|pycharm|studio|soffice\\.bin|spotify|plasmashell|kwin_wayland|plasma-discover|cef_server)$"]
+# victim_exclude: never freeze as a victim — build workers spawned by the orchestrator,
+# plus gvfsd (frozen FUSE server hangs any process touching ~/gvfs in D state)
+# and fsnotifier (IDE file watching stalls).
+victim_exclude = ["^(rustc|cc|cc1|ld|lld|javac|kotlinc|cargo|make|ninja|gvfsd.*|fsnotifier)$"]
+victim_min_rss_kb      = 25600     # 25 MB (rss+swap) — smaller victims free nothing measurable
 window_sec             = 120
 headroom_factor        = 1.25
 min_rss_kb             = 524288    # 512 MB pre-filter (must be true before signals checked)
@@ -552,7 +558,7 @@ oscillation_drop_factor = 0.90     # 10% drop from peak → genuine valley
 cpu_threshold_pct      = 80.0
 throttled_cpu_weight   = 20
 min_samples            = 6         # 30s observation before acting
-max_victim_freeze_sec  = 0         # 0 = no limit on victim freeze duration
+max_victim_freeze_sec  = 300       # force-release victims after 5 min (0 = no limit)
 idle_cpu_threshold_pct = 3.0       # CPU% below which a tick is considered idle
 idle_rss_delta_kb      = 20000     # 20 MB max RSS growth for an idle tick
 idle_ticks_required    = 10        # 10 consecutive idle ticks (50s) → demote to Observing and release victims

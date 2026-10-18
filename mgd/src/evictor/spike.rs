@@ -152,6 +152,9 @@ pub(crate) fn run_spike_cycle(
                     .filter(|p| !exclude.contains(&p.pid))
                     .filter(|p| active_pid != Some(p.pid))
                     .filter(|p| !spike_tracker.is_victim_cooldown(p.pid, 60))
+                    // Tiny daemons free nothing measurable vs a multi-GB spike, and
+                    // freezing them (gvfsd, fsnotifier) can stall unrelated processes.
+                    .filter(|p| p.rss_kb + p.swap_kb >= Kb(cfg.spike_victim_min_rss_kb))
                     .filter(|p| get_priority(&p.name, p.exe_basename.as_deref(), cfg) >= 60)
                     .filter(|p| !cfg.spike_victim_exclude.iter().any(|re| re.is_match(&p.name)))
                     .collect();

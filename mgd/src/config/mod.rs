@@ -306,6 +306,8 @@ struct SpikeMode {
     min_samples: usize,
     #[serde(default)]
     max_victim_freeze_sec: u64,
+    #[serde(default = "default_spike_victim_min_rss_kb")]
+    victim_min_rss_kb: u64,
     #[serde(default = "default_spike_idle_cpu_threshold_pct")]
     idle_cpu_threshold_pct: f32,
     #[serde(default = "default_spike_idle_rss_delta_kb")]
@@ -331,6 +333,7 @@ impl Default for SpikeMode {
             throttled_cpu_weight: default_spike_throttled_cpu_weight(),
             min_samples: default_spike_min_samples(),
             max_victim_freeze_sec: 0,
+            victim_min_rss_kb: default_spike_victim_min_rss_kb(),
             idle_cpu_threshold_pct: default_spike_idle_cpu_threshold_pct(),
             idle_rss_delta_kb: default_spike_idle_rss_delta_kb(),
             idle_ticks_required: default_spike_idle_ticks_required(),
@@ -351,6 +354,7 @@ fn default_spike_min_samples() -> usize { 6 }
 fn default_spike_idle_cpu_threshold_pct() -> f32 { 3.0 }
 fn default_spike_idle_rss_delta_kb() -> u64 { 20_000 }
 fn default_spike_idle_ticks_required() -> u32 { 10 }
+fn default_spike_victim_min_rss_kb() -> u64 { 25_600 }
 
 
 #[derive(Deserialize)]
@@ -495,6 +499,7 @@ pub struct CompiledConfig {
     pub spike_throttled_cpu_weight: u32,
     pub spike_min_samples: usize,
     pub spike_max_victim_freeze_sec: u64,
+    pub spike_victim_min_rss_kb: u64,
     pub spike_idle_cpu_threshold_pct: f32,
     pub spike_idle_rss_delta_kb: u64,
     pub spike_idle_ticks_required: u32,
@@ -683,6 +688,7 @@ fn compile(content: &str) -> Result<CompiledConfig, String> {
         spike_throttled_cpu_weight: raw.spike_mode.throttled_cpu_weight,
         spike_min_samples: raw.spike_mode.min_samples,
         spike_max_victim_freeze_sec: raw.spike_mode.max_victim_freeze_sec,
+        spike_victim_min_rss_kb: raw.spike_mode.victim_min_rss_kb,
         spike_idle_cpu_threshold_pct: raw.spike_mode.idle_cpu_threshold_pct,
         spike_idle_rss_delta_kb: raw.spike_mode.idle_rss_delta_kb,
         spike_idle_ticks_required: raw.spike_mode.idle_ticks_required,
