@@ -339,11 +339,7 @@ impl SpikeTracker {
         // ── Step 4: Collect decisions — RAM first, CPU after ─────────────────
 
         if !just_demoted.is_empty() {
-            let active_tracking: HashSet<Pid> = self.spikes.values()
-                .filter(|s| s.phase == SpikePhase::Tracking)
-                .map(|s| s.pid)
-                .collect();
-            let released = self.drain_orphans_not_in(&active_tracking);
+            let released = self.drain_if_none_tracking();
             if !released.is_empty() {
                 decisions.push(SpikeDecision::ReleaseVictims { victims: released });
             }
@@ -395,32 +391,21 @@ impl SpikeTracker {
         self.spikes.remove(&spike_pid);
         self.prev_rss.remove(&spike_pid);
         self.prev_majflt.remove(&spike_pid);
-
-        if self.spikes.is_empty() {
-            // Last spike — release everything.
-            let victims: Vec<SpikeVictim> = self.victims.drain().map(|(_, v)| v).collect();
-            self.persist_victims();
-            return victims;
-        }
-
-
-        let active: HashSet<Pid> = self.spikes.keys().copied().collect();
-        self.drain_orphans_not_in(&active)
+        self.drain_if_none_tracking()
     }
 
-    /// Shared by `on_spike_exit` and `drain_orphaned_victims`: release every
-    /// victim whose `frozen_for_spike_pid` isn't in `active` anymore.
-    fn drain_orphans_not_in(&mut self, active: &HashSet<Pid>) -> Vec<SpikeVictim> {
-        let to_release: Vec<Pid> = self.victims.values()
-            .filter(|v| !active.contains(&v.frozen_for_spike_pid))
-            .map(|v| v.pid)
-            .collect();
-        if to_release.is_empty() {
+    /// Victims are frozen for the headroom *sum* of all Tracking spikes, not for
+    /// one initiator (`frozen_for_spike_pid` is informational only). So they are
+    /// held while any spike is still Tracking and released together once none is.
+    /// Releasing per-initiator freed headroom another live spike still counted on,
+    /// and the next cycle froze a fresh batch (churn).
+    fn drain_if_none_tracking(&mut self) -> Vec<SpikeVictim> {
+        if self.victims.is_empty()
+            || self.spikes.values().any(|s| s.phase == SpikePhase::Tracking)
+        {
             return vec![];
         }
-        let victims: Vec<SpikeVictim> = to_release.iter()
-            .filter_map(|pid| self.victims.remove(pid))
-            .collect();
+        let victims: Vec<SpikeVictim> = self.victims.drain().map(|(_, v)| v).collect();
         self.persist_victims();
         victims
     }
@@ -473,21 +458,10 @@ impl SpikeTracker {
         }
     }
 
-    /// Release victims whose initiator spike has already exited (orphaned victims).
+    /// Release victims left behind with no Tracking spike (orphaned victims).
     /// Called every cycle so orphans don't wait for the next spike exit event.
     pub fn drain_orphaned_victims(&mut self) -> Vec<SpikeVictim> {
-        if self.victims.is_empty() || self.spikes.is_empty() { return vec![]; }
-        let active: HashSet<Pid> = self.spikes.keys().copied().collect();
-        let to_release: Vec<Pid> = self.victims.values()
-            .filter(|v| !active.contains(&v.frozen_for_spike_pid))
-            .map(|v| v.pid)
-            .collect();
-        if to_release.is_empty() { return vec![]; }
-        let victims: Vec<SpikeVictim> = to_release.iter()
-            .filter_map(|pid| self.victims.remove(pid))
-            .collect();
-        self.persist_victims();
-        victims
+        self.drain_if_none_tracking()
     }
 
     /// Release victims frozen beyond `max_secs`. Returns drained victims for caller to unfreeze.
@@ -698,29 +672,25 @@ mod tests {
         assert!(!d.iter().any(|x| matches!(x, SpikeDecision::ThrottleSpike { .. })));
     }
 
-    // T8 ─ on_spike_exit releases per-initiator, not all-or-nothing
-    // Victim 10 is frozen_for spike 1 (cargo); victim 20 is frozen_for spike 2 (rustc).
-    // When cargo exits, its victim is freed immediately even though rustc still runs.
-    // When rustc exits (last spike), its victim is freed via the drain-all path.
+    // T8 ─ victims are held while any spike is still Tracking (headroom is a sum
+    // across spikes), then released together. Victim 10 is tagged with spike 1
+    // but must stay frozen when spike 1 exits, because spike 2 still needs room.
     #[test]
-    fn t8_per_initiator_release() {
+    fn t8_collective_release() {
         let mut t = SpikeTracker::new();
-        t.spikes.insert(Pid(1), make_state_tracking(1, "cargo", 1_000_000));
+        t.spikes.insert(Pid(1), make_state_tracking(1, "gradle", 1_000_000));
         t.spikes.insert(Pid(2), make_state_tracking(2, "rustc", 500_000));
-        t.victims.insert(Pid(10), make_victim(10, "firefox", 1)); // frozen_for cargo
-        t.victims.insert(Pid(20), make_victim(20, "spotify", 2)); // frozen_for rustc
+        t.victims.insert(Pid(10), make_victim(10, "spotify", 1));
+        t.victims.insert(Pid(20), make_victim(20, "discord", 2));
 
-        // cargo exits: only its victim (firefox) is released; rustc's (spotify) stays
-        let v = t.on_spike_exit(Pid(1));
-        assert_eq!(v.len(), 1, "cargo's victim released immediately");
-        assert_eq!(v[0].pid, Pid(10));
-        assert!(!t.victims.contains_key(&Pid(10)));
-        assert!(t.victims.contains_key(&Pid(20)), "spotify held for rustc");
+        // spike 1 exits, spike 2 still Tracking: nothing released
+        assert!(t.on_spike_exit(Pid(1)).is_empty());
+        assert!(t.drain_orphaned_victims().is_empty(), "tag of exited spike is not an orphan");
+        assert_eq!(t.victims.len(), 2);
 
-        // rustc exits (last spike): drain-all releases spotify
-        let v = t.on_spike_exit(Pid(2));
-        assert_eq!(v.len(), 1);
-        assert_eq!(v[0].pid, Pid(20));
+        // spike 2 demoted to Observing: no Tracking spike left → orphan sweep releases all
+        t.spikes.get_mut(&Pid(2)).unwrap().phase = SpikePhase::Observing;
+        assert_eq!(t.drain_orphaned_victims().len(), 2);
         assert!(t.victims.is_empty());
     }
 
