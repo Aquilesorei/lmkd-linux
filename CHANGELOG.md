@@ -4,7 +4,31 @@ All notable changes to mgd are recorded here.
 
 ---
 
-## [Unreleased] — feat/gpu-uma-stats
+## [0.2.0] — 2026-10-18
+
+### Added
+
+- **Process leak guard** (`[process_leak_guard]`, `mgctl leak-status`) — detects process families (grouped by exact `/proc/PID/cmdline`) whose live-instance count only ever grows and is never reaped, and terminates them. Motivated by a supervisor forking a fresh worker per request (0→120 procs / 8.4 GB in under an hour).
+- **Spike mode idle demotion** — a Tracking spike idle for `idle_ticks_required` ticks (`<idle_cpu_threshold_pct` CPU, RSS growth `<idle_rss_delta_kb`) is demoted back to Observing and its victims released.
+- `[spike_mode] victim_min_rss_kb` (default 25 MB rss+swap) — processes below it are never frozen as spike victims.
+- `mgctl unfreeze` can release spike-mode victims (queued to the evictor thread, applied within ≤5s).
+
+### Fixed
+
+- **Spike victims frozen indefinitely at Normal pressure** — release/timeout/exit logic only ran inside the full evictor cycle, skipped on calm PSI timeouts. Now also runs on every calm tick.
+- **Spike victim release churn** — victims were tagged with an arbitrary initiator spike and released when it exited, even while another spike still needed the headroom; the next cycle froze a fresh batch. Victims are now held while any spike is Tracking and released together.
+- Spike mode froze tiny daemons (`gvfsd-fuse`, `fsnotifier`, crash reporters) that freed nothing measurable; a frozen `gvfsd-fuse` can hang any process touching `~/gvfs` in D state.
+- Released victims are immune from re-freezing for 60s; the active foreground window is never frozen for headroom.
+
+### Changed
+
+- Built-in config: browsers, IDEs, `plasmashell`/`kwin_wayland` are excluded from spike tracking — they oscillate naturally (GC, indexing), and being tracked made them immune to the reactive evictor while dev tools were frozen on their behalf. `victim_exclude` extended with `cargo|make|ninja|gvfsd.*|fsnotifier`. `max_victim_freeze_sec` defaults to `300` (was `0` = unlimited).
+- Internal: `config.rs` split into a `config/` module; `evictor.rs` split into an `evictor/` directory module; daemon startup moved to `init`/`lifecycle`/`memlock` with shared `AppState`.
+- Added GPL-2.0 `LICENSE`.
+
+---
+
+## [0.1.0] — 2026-07-20
 
 ### Fixed
 
