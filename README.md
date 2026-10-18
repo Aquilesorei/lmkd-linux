@@ -348,7 +348,7 @@ falls back to SIGKILL when checkpoint fails. See the opt-in setup below.
 
 ## Tested on
 
-Fedora 44 · kernel 7.0.9 · HP Spectre x360 · i7-13700H · 16GB · KDE Plasma 6.6 Wayland
+Fedora 44 · kernel 7.2.11 · HP Spectre x360 · i7-13700H · 16GB · KDE Plasma 6.6 Wayland
 
 ## License
 
